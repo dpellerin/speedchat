@@ -26,6 +26,31 @@ extension AppDelegate {
     for sub in view.subviews {found += findProse(sub)}
     return found
    }
+   func renderedLinkHoverMatches() -> Bool {
+    guard let content=panel.contentView,
+          let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) else {return false}
+    content.cacheDisplay(in:content.bounds,to:bitmap)
+    let probes=findProse(content)
+    var hits=0,misses=0
+    // Use actual blue link pixels as an independent oracle, rather than testing
+    // TextKit rectangles against themselves. Convert through the hosting view
+    // so this also exercises flipped coordinates and transcript positioning.
+    for y in 0..<bitmap.pixelsHigh {
+     for x in 0..<bitmap.pixelsWide {
+      guard let color=bitmap.colorAt(x:x,y:y)?.usingColorSpace(.deviceRGB),
+            color.blueComponent > color.redComponent+0.2,
+            color.blueComponent > color.greenComponent+0.1 else {continue}
+      let pixelY=(CGFloat(y)+0.5)*content.bounds.height/CGFloat(bitmap.pixelsHigh)
+      let point=NSPoint(x:(CGFloat(x)+0.5)*content.bounds.width/CGFloat(bitmap.pixelsWide),y:content.isFlipped ? pixelY : content.bounds.height-pixelY)
+      for prose in probes {
+       let local=prose.convert(point,from:content)
+       guard prose.bounds.contains(local) else {continue}
+       if prose.linkURL(at:local)?.absoluteString == "https://example.com" {hits += 1} else {misses += 1}
+      }
+     }
+    }
+    return hits > 0 && misses == 0
+   }
    let proseViews=panel.contentView.map(findProse) ?? []
    let linkCursorConfigured=proseViews.contains {prose in
     let storage=prose.storage
@@ -76,10 +101,25 @@ extension AppDelegate {
     try? await Task.sleep(for:.milliseconds(400))
     self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
     checks.append(["name":"Layout changes preserve transcript following","passed":self.store.followBottom])
+    check("Link hover matches visible link glyphs after multiple paragraphs",renderedLinkHoverMatches())
     let path=CommandLine.arguments.firstIndex(of:"--smoke-output").flatMap {i in i+1<CommandLine.arguments.count ? CommandLine.arguments[i+1] : nil} ?? "/tmp/speedchat-ui-smoke"
     try? FileManager.default.createDirectory(atPath:path,withIntermediateDirectories:true)
     if let view=self.panel.contentView,let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds) {view.cacheDisplay(in:view.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/panel.png"))}
     if let settingsView=self.settingsWindow?.contentView,let bitmap=settingsView.bitmapImageRepForCachingDisplay(in:settingsView.bounds) {settingsView.cacheDisplay(in:settingsView.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/settings.png"))}
+    let linkFixtures=[
+     ("single-line","Read the [example source](https://example.com) here."),
+     ("wrapped","A **bold** introduction with *emphasis* and `inline code` before a link. "+String(repeating:"More prose before the source. ",count:6)+"[A long example source label that wraps across multiple lines and keeps every visible word clickable](https://example.com)"),
+     ("heading","## A [heading source](https://example.com)\n\nPlain prose below the heading.")
+    ]
+    for width in [580.0,790.0] {
+     self.panel.setContentSize(NSSize(width:width,height:740))
+     for (name,text) in linkFixtures {
+      self.store.session.receive(BridgeEvent(type:"ready",messages:[ChatMessage(id:"link-fixture",role:"assistant",text:text)]))
+      try? await Task.sleep(for:.milliseconds(100))
+      self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+      check("Link hover matches \(name) text at width \(Int(width))",renderedLinkHoverMatches())
+     }
+    }
     let failures=checks.filter{($0["passed"] as? Bool) != true}.count
     let report:[String:Any]=["checks":checks,"passed":checks.count-failures,"failed":failures,"note":"Fixture UI harness. Does not verify physical hotkey, all Spaces, login-item changes, or live response rendering." ]
     if let data=try? JSONSerialization.data(withJSONObject:report,options:[.prettyPrinted,.sortedKeys]) {try? data.write(to:URL(fileURLWithPath:path+"/report.json"))}

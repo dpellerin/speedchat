@@ -14,13 +14,14 @@ SpeedChat is verified through two automated native layers:
    - **Session & Keyboard State Machine**: Verifies `ChatSession` busy gating, `modelsUpdated` hot-reloading, `ChatModel.isOpenRouter` classification, and `KeyboardPolicy` (`↵` send, `⇧↵` newline, `Esc` stop/dismiss, `⌘W` dismiss without interrupting active streams, `⌘N`/`⌃N` new chat, `Page Up`/`Page Down`).
    - **Subprocess & Preferences Integration**: Tests cooperative Codex subprocess close timing, server tool refusal over stdio, symlinked executable discovery, and `Preferences` OpenRouter configuration persistence with `0600` permissions.
 
-2. **Native UI Fixture Smoke (`18/18 passing` in Light & Dark Mode)** — `scripts/smoke-ui.sh`
+2. **Native UI Fixture Smoke (`25/25 passing` in Light & Dark Mode)** — `scripts/smoke-ui.sh`
    - Launches `dist/SpeedChat.app` in fixture mode (`--ui-smoke`) and verifies:
      - Automatic focus of the editable `ComposerTextView` on panel open before backend readiness.
      - Compact draggable header, normal window level, resizability, and all-Spaces/fullscreen behavior flags.
      - Focus-loss dismissal and warm backend reuse on reopen.
      - `Shift + Enter` newline insertion, `Enter` single-request dispatch, busy gating during streaming, `Stop` interrupt dispatch, and post-completion `New Chat`.
      - Pointing-hand cursor configuration (`NSCursor.pointingHand`) and validated URL attachment on rendered prose links.
+     - Pixel-based link hover alignment against actual SwiftUI-rendered glyphs after multiple paragraphs, plus single-line, wrapped, and heading links at panel widths of 580 and 790 points. The regression caught TextKit line-height drift and mismatched heading font/padding; it does not synthesize a physical mouse click or open a browser.
      - Native clipboard copy (`NSPasteboard`, preserving/restoring user clipboard contents) and rejection of unsafe file URLs.
      - Non-scrolling Settings window fitting content cleanly and `Edit → Paste` (`⌘V`) menu wiring.
 

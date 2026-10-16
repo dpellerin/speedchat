@@ -14,7 +14,11 @@ import ChatCore
   let result=NSMutableAttributedString()
   let paragraph=NSMutableParagraphStyle()
   paragraph.lineSpacing=3
-  let baseSize:CGFloat=heading ? 16 : 15
+  let baseFont=heading ? NSFont.preferredFont(forTextStyle:.headline) : NSFont.systemFont(ofSize:15)
+  let baseSize=baseFont.pointSize
+  // SwiftUI rounds ascent and descent separately. TextKit's default rounds
+  // their sum, losing a point per line and moving later link targets upward.
+  paragraph.minimumLineHeight=ceil(baseFont.ascender)-floor(baseFont.descender)+ceil(baseFont.leading)
   let parsed=inline(text.isEmpty ? " " : text)
   for run in parsed.runs {
    let slice=String(parsed[run.range].characters)
@@ -23,7 +27,7 @@ import ChatCore
    if intents.contains(.code) {
     font=NSFont.monospacedSystemFont(ofSize:baseSize-1.5,weight:heading ? .semibold : .regular)
    } else if heading || intents.contains(.stronglyEmphasized) {
-    let bold=NSFont.systemFont(ofSize:baseSize,weight:.semibold)
+    let bold=heading ? baseFont : NSFont.systemFont(ofSize:baseSize,weight:.semibold)
     font=intents.contains(.emphasized) ? NSFontManager.shared.convert(bold,toHaveTrait:.italicFontMask) : bold
    } else if intents.contains(.emphasized) {
     font=NSFontManager.shared.convert(NSFont.systemFont(ofSize:baseSize),toHaveTrait:.italicFontMask)
@@ -136,8 +140,8 @@ struct ProseView:View {
   VStack(alignment:.leading,spacing:5) {
    ForEach(Array(ProseBlocks.parse(text).enumerated()),id:\.offset) { _,block in
     if block.heading {
-     Text(NativeActions.inline(block.text)).font(.headline).padding(.top,5).textSelection(.enabled)
-      .overlay(LinkCursorProbe(text:block.text,heading:true))
+     Text(NativeActions.inline(block.text)).font(.headline).textSelection(.enabled)
+      .overlay(LinkCursorProbe(text:block.text,heading:true)).padding(.top,5)
     } else {
      Text(NativeActions.inline(block.text.isEmpty ? " " : block.text)).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading)
       .overlay(LinkCursorProbe(text:block.text,heading:false))
