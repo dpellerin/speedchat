@@ -1,8 +1,5 @@
 .build/
 .swiftpm/
-.pnpm-store/
-backend/node_modules/
-backend/docs/
 dist/
 .DS_Store
 .env

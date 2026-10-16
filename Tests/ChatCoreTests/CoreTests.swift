@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 @testable import ChatCore
+
 @Test func jsonlAcrossUTF8ChunksAndEOF() throws {
  var reader = JSONLFramer()
  let bytes=Data("{\"text\":\"🌙\"}\n{\"type\":\"done\"}\n".utf8)
@@ -10,11 +11,13 @@ import Foundation
  _ = try reader.push(Data("partial".utf8))
  #expect(throws: JSONLFramer.FramingError.self) { try reader.finish() }
 }
+
 @Test func centralLinkValidation() {
  #expect(LinkPolicy.url("https://example.com/path?q=one") != nil)
  #expect(LinkPolicy.url("HTTP://example.com") != nil)
  for raw in ["file:///etc/passwd","javascript:alert(1)","https://", "https://user:password@example.com", "https://example.com\nfoo","//example.com"] { #expect(LinkPolicy.url(raw) == nil) }
 }
+
 @Test func sessionGatesSendNewChatAndModelAndIgnoresLateOutput() throws {
  var session=ChatSession()
  let offlineSend=session.beginSend("hi"); #expect(offlineSend == nil)
@@ -33,12 +36,14 @@ import Foundation
  #expect(session.messages.count == 2)
  let fresh=session.beginNewChat(), blocked=session.beginSend("blocked"); #expect(fresh); #expect(blocked == nil)
 }
+
 @Test func commandWClosesPanelWithoutStoppingResponse() {
  #expect(KeyboardPolicy.action(code:13,modifiers:[.command]) == .dismiss)
  #expect(KeyboardPolicy.action(code:13,modifiers:[.command],streaming:true) == .dismiss)
  #expect(KeyboardPolicy.action(code:13,modifiers:[]) == .normal)
  #expect(KeyboardPolicy.action(code:13,modifiers:[.control]) == .normal)
 }
+
 @Test func keyboardSendNewlineEscapeAndPages() {
  #expect(KeyboardPolicy.action(code:36,modifiers:[]) == .send)
  #expect(KeyboardPolicy.action(code:36,modifiers:[.shift]) == .newline)
@@ -50,20 +55,40 @@ import Foundation
  #expect(KeyboardPolicy.action(code:121,modifiers:[]) == .pageDown)
  #expect(KeyboardPolicy.action(code:8,modifiers:[.command]) == .normal)
 }
+
 @Test func executableDiscoveryAndEnvironment() throws {
  let home="/home/test"
  let found=try RuntimeDiscovery.find(name:"node",override:"",home:home,path:"/bin",hermesEntries:["node-26.7.0-darwin-arm64"],exists:{$0 == "/home/test/.hermes/tools/node-26.7.0-darwin-arm64/bin/node"})
  #expect(found.hasSuffix("bin/node"))
  #expect(throws: RuntimeDiscovery.DiscoveryError.self) { try RuntimeDiscovery.find(name:"codex",override:"/invalid",home:home,path:"/bin",exists:{$0 == "/bin/codex"}) }
- let env=RuntimeDiscovery.environment(["OPENAI_API_KEY":"secret","NODE_OPTIONS":"bad","PATH":"/my/bin","HOME":home],home:home)
+ let env=RuntimeDiscovery.environment(["OPENAI_API_KEY":"secret","NODE_OPTIONS":"bad","PATH":"/my/bin","HOME":home,"SPEEDCHAT_STATE_DIR":"/tmp/test"],home:home)
  #expect(env["OPENAI_API_KEY"] == nil); #expect(env["NODE_OPTIONS"] == nil)
+ #expect(env["SPEEDCHAT_STATE_DIR"] == "/tmp/test")
  #expect(env["PATH"]!.contains("/opt/homebrew/bin")); #expect(env["PATH"]!.contains("/home/test/.local/bin"))
 }
+
+@Test func runtimeDirectoryIsPrivateEmptyAndUnique() throws {
+ let a = try RuntimeDiscovery.createRuntimeDirectory()
+ let b = try RuntimeDiscovery.createRuntimeDirectory()
+ defer {
+  try? FileManager.default.removeItem(at: a)
+  try? FileManager.default.removeItem(at: b)
+ }
+ #expect(a != b)
+ let items = try FileManager.default.contentsOfDirectory(atPath: a.path)
+ #expect(items.isEmpty)
+ let attrs = try FileManager.default.attributesOfItem(atPath: a.path)
+ let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0
+ #expect((perms & 0o777) == 0o700)
+ #expect(!RuntimeDiscovery.isExecutableFile(a.path))
+}
+
 @Test func fencedCodePartsIncludeUnfinishedStreamingBlock() {
  let parts=MarkdownBlocks.parse("Hello **world**\n```swift\nlet x = 1\n```\nAfter\n```math\nx²")
  #expect(parts.count == 4); #expect(parts[1].code); #expect(parts[1].language == "swift"); #expect(parts[1].text == "let x = 1")
  #expect(parts[3].code); #expect(parts[3].text == "x²")
 }
+
 @Test func proseBlocksGroupNonHeadingLinesForContiguousSelection() {
  let blocks=ProseBlocks.parse("# Overview\nFirst line\n- Bullet one\n> Quote\n## Next\nFinal line")
  #expect(blocks == [
@@ -73,6 +98,7 @@ import Foundation
   .init(text:"Final line",heading:false),
  ])
 }
+
 @Test func errorsDoNotEnableOfflineOrBusySession() throws {
  var session=ChatSession()
  session.receive(BridgeEvent(type:"fatal",message:"Disconnected"))
@@ -85,12 +111,7 @@ import Foundation
  #expect(!session.shouldStopIdle(hidden:true,elapsed:600))
  session.receive(BridgeEvent(type:"done")); #expect(session.canInteract); #expect(session.notice == "Blocked"); #expect(session.shouldStopIdle(hidden:true,elapsed:301)); #expect(!session.shouldStopIdle(hidden:false,elapsed:600))
 }
-@Test func unbundledDevelopmentFallsBackToBuiltBackend() {
- let found=RuntimeDiscovery.bridgePath(bundled:"/build/backend/bridge.js",source:"/repo/backend/dist/bridge.js",exists:{$0.hasPrefix("/repo/")})
- #expect(found == "/repo/backend/dist/bridge.js")
- let bundled=RuntimeDiscovery.bridgePath(bundled:"/app/backend/bridge.js",source:"/repo/backend/dist/bridge.js",exists:{_ in true})
- #expect(bundled == "/app/backend/bridge.js")
-}
+
 @Test func openRouterModelIdentificationAndCatalogHotReload() throws {
  var session=ChatSession()
  let ready=try JSONDecoder().decode(BridgeEvent.self,from:Data("{\"type\":\"ready\",\"messages\":[],\"model\":\"gpt-6-luna\",\"models\":[{\"model\":\"gpt-6-luna\",\"displayName\":\"GPT-6 Luna\",\"provider\":\"openai\"}]}".utf8))

@@ -4,7 +4,7 @@ A fast, keyboard-summoned native macOS quick-chat panel built with SwiftUI and A
 
 Summon a lightweight, distraction-free conversation window from anywhere with **Option + Space**, chat with **OpenAI** (via your existing local Codex CLI login) and **open-weight models on OpenRouter** from a single unified model picker, and dismiss right back to your work.
 
-Zero runtime npm dependencies, zero external Swift packages, and no Electron/WebView wrapper.
+Zero external dependencies, zero external Swift packages, and no Electron/WebView or Node.js wrapper.
 
 ---
 
@@ -43,29 +43,40 @@ Zero runtime npm dependencies, zero external Swift packages, and no Electron/Web
 ## Prerequisites
 
 - **macOS 14 (Sonoma)** or newer (Apple Silicon / `arm64`).
-- **Node.js 20+** (used to run the lightweight local JSONL bridge).
 - **At least one model provider**:
   - **OpenAI via Codex CLI**: Install the [Codex CLI](https://developers.openai.com/codex/app-server) and sign in once with `codex login` in Terminal, **and/or**
-  - **OpenRouter**: An API key from [openrouter.ai](https://openrouter.ai), configured in **SpeedChat Settings (`⌘,`)**.
+  - **OpenRouter**: An API key from [openrouter.ai](https://openrouter.ai), configured in **SpeedChat Settings (`⌘,`)** (works standalone with zero CLI dependencies).
 
-The app automatically discovers `node` and `codex` across `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, common version-manager paths (`~/.volta/bin`, `~/.asdf/shims`, `~/.local/share/mise/shims`, `~/.fnm/current/bin`, `~/Library/pnpm`), and `~/.hermes/tools` without sourcing shell startup files.
+When using OpenAI via Codex, the app automatically discovers `codex` (and `node` if your `codex` shim uses it) across `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, common version-manager paths (`~/.volta/bin`, `~/.asdf/shims`, `~/.local/share/mise/shims`, `~/.fnm/current/bin`, `~/Library/pnpm`), and `~/.hermes/tools` without sourcing shell startup files.
 
 ---
 
-## Build & Install
+## Download & Install
 
-Clone the repository, install the TypeScript build/test toolchain, run the verification suite, build the signed `.app` bundle, and install to `/Applications`:
+### Option 1: Download Prebuilt App (GitHub Releases)
+
+1. Download **`SpeedChat-macos-arm64.zip`** from the latest [GitHub Release](../../releases), unzip it, and drag **`SpeedChat.app`** into **`/Applications`**.
+2. Because the prebuilt app is ad-hoc signed rather than notarized with a paid Apple Developer ID, strip macOS's browser quarantine flag once in Terminal before first launch:
 
 ```sh
-(cd backend && npm ci --ignore-scripts)
+xattr -dr com.apple.quarantine /Applications/SpeedChat.app
+open /Applications/SpeedChat.app
+```
+
+### Option 2: Build & Install from Source (No Gatekeeper Prompt)
+
+Clone the repository, run the Swift verification suite, build the signed `.app` bundle locally, and install to `/Applications`:
+
+```sh
 scripts/test.sh
 scripts/build-app.sh
 scripts/smoke-ui.sh
 scripts/install-app.sh
 ```
 
-- `scripts/build-app.sh` compiles the TypeScript backend and release Swift executable, renders the `.icns` app icon natively with AppKit, bundles resources into `dist/SpeedChat.app`, and applies an ad-hoc code signature for local personal use.
+- `scripts/build-app.sh` compiles the release Swift executable, renders the `.icns` app icon natively with AppKit, bundles resources into `dist/SpeedChat.app`, and applies an ad-hoc code signature for local personal use.
 - `scripts/install-app.sh` validates the bundle signature and identifier (`local.speedchat`), stages the update, gracefully quits any running instance, retains a rollback copy (`SpeedChat.previous.app`), installs `/Applications/SpeedChat.app`, and launches it without altering your saved chats, preferences, or login items.
+- `scripts/package-release.sh` builds and packages `dist/SpeedChat-macos-arm64.zip` (with SHA-256 checksum) for attaching to a GitHub Release.
 
 To run directly from the checkout without installing to `/Applications`:
 
@@ -105,14 +116,11 @@ rm -rf "$HOME/Library/Application Support/SpeedChat"
 ## Testing & Verification
 
 ```sh
-# Run all backend (Node test runner + TypeScript check) and Swift Testing suites
+# Run the full Swift Testing suite (ChatCore + NativeBridge)
 scripts/test.sh
 
 # Run the native UI fixture smoke test (generates docs/ui-smoke/report.json)
 scripts/smoke-ui.sh
-
-# Run process lifecycle/orphan cleanup verification (no model quota used)
-node scripts/smoke-lifecycle.mjs
 ```
 
 See [docs/verification.md](docs/verification.md) for detailed test coverage and verification notes.

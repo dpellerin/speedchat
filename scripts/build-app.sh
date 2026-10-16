@@ -2,14 +2,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export CLANG_MODULE_CACHE_PATH="$PWD/.build/clang-cache"
-(cd backend && npm run check && npm run build)
 swift build --disable-sandbox --build-system native -c release
 bin=$(swift build --disable-sandbox --build-system native -c release --show-bin-path)
 app="$PWD/dist/SpeedChat.app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/backend"
+rm -rf "$app/Contents/Resources/backend"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/SpeedChat" "$app/Contents/MacOS/SpeedChat"
-cp backend/dist/*.js "$app/Contents/Resources/backend/"
-printf '{"type":"module"}\n' > "$app/Contents/Resources/backend/package.json"
 cp LICENSE THIRD_PARTY_NOTICES.md "$app/Contents/Resources/"
 cp resources/MenuBarIcon.png resources/MenuBarIcon@2x.png "$app/Contents/Resources/"
 swift scripts/icon.swift "$PWD/.build/AppIcon.iconset" "$PWD/resources/AppIcon.png"

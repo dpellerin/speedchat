@@ -24,13 +24,37 @@ public struct BridgeEvent: Codable, Sendable {
  public var delta: String?
  public var text: String?
  public var message: String?
- public var notice: String?
- public var name: String?
- public var durationMs: Double?
- public var busy: Bool?
- public init(type:String,model:String?=nil,itemId:String?=nil,delta:String?=nil,text:String?=nil,message:String?=nil,busy:Bool?=nil) {
-  self.type=type;self.model=model;self.itemId=itemId;self.delta=delta;self.text=text;self.message=message;self.busy=busy
- }
+    public var notice: String?
+    public var name: String?
+    public var durationMs: Double?
+    public var busy: Bool?
+    public init(
+        type: String,
+        messages: [ChatMessage]? = nil,
+        models: [ChatModel]? = nil,
+        model: String? = nil,
+        itemId: String? = nil,
+        delta: String? = nil,
+        text: String? = nil,
+        message: String? = nil,
+        notice: String? = nil,
+        name: String? = nil,
+        durationMs: Double? = nil,
+        busy: Bool? = nil
+    ) {
+        self.type = type
+        self.messages = messages
+        self.models = models
+        self.model = model
+        self.itemId = itemId
+        self.delta = delta
+        self.text = text
+        self.message = message
+        self.notice = notice
+        self.name = name
+        self.durationMs = durationMs
+        self.busy = busy
+    }
 }
 public struct ChatSession: Sendable {
  public enum Phase: Sendable { case offline,connecting,ready,sending,selecting,resetting }

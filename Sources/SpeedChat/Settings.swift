@@ -2,30 +2,10 @@ import SwiftUI
 import ServiceManagement
 import ChatCore
 
-struct StoredOpenRouterConfig: Codable {
- var apiKey: String
- var models: [StoredOpenRouterModel]
- var updatedAt: String?
-}
-
-struct StoredOpenRouterModel: Codable {
- var model: String
- var displayName: String
-}
-
 @MainActor final class Preferences:ObservableObject {
- static let defaultOpenRouterModels:[ChatModel]=[
-  ChatModel(model:"deepseek/deepseek-v4.1-flash",displayName:"DeepSeek V4.1 Flash",provider:"openrouter"),
-  ChatModel(model:"mistralai/mistral-large-4-0",displayName:"Mistral Large 4",provider:"openrouter"),
-  ChatModel(model:"qwen/qwen3.8-flash",displayName:"Qwen 3.8 Flash",provider:"openrouter"),
-  ChatModel(model:"moonshotai/kimi-k3",displayName:"Kimi K3",provider:"openrouter"),
-  ChatModel(model:"z-ai/glm-5.3-flashx",displayName:"GLM 5.3 FlashX",provider:"openrouter"),
-  ChatModel(model:"google/gemma-4-26b-a4b-it",displayName:"Gemma 4 26B A4B",provider:"openrouter"),
-  ChatModel(model:"deepseek/deepseek-v4-pro-0813",displayName:"DeepSeek V4 Pro",provider:"openrouter"),
- ]
+ static let defaultOpenRouterModels:[ChatModel]=OpenRouterClient.defaultModels
  let defaults:UserDefaults
  let configURL:URL
- @Published var nodePath:String {didSet {defaults.set(nodePath,forKey:"nodePath")}}
  @Published var codexPath:String {didSet {defaults.set(codexPath,forKey:"codexPath")}}
  @Published var metrics:Bool {didSet {defaults.set(metrics,forKey:"metrics")}}
  @Published var hotkey:HotKeyBinding
@@ -42,29 +22,16 @@ struct StoredOpenRouterModel: Codable {
  var reloadConfig:(()->Void)?
  init(defaults:UserDefaults = .standard,configURL:URL?=nil) {
   self.defaults=defaults
-  if let configURL {
-   self.configURL=configURL
-  } else if let override=ProcessInfo.processInfo.environment["SPEEDCHAT_STATE_DIR"],!override.isEmpty {
-   self.configURL=URL(fileURLWithPath:override).appendingPathComponent("openrouter.json")
-  } else {
-   let root=FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/SpeedChat")
-   self.configURL=root.appendingPathComponent("openrouter.json")
-  }
-  nodePath=defaults.string(forKey:"nodePath") ?? ""
+  self.configURL=configURL ?? OpenRouterClient.configURL()
   codexPath=defaults.string(forKey:"codexPath") ?? ""
   metrics=defaults.bool(forKey:"metrics")
   hotkey=(defaults.data(forKey:"hotkey").flatMap{try? JSONDecoder().decode(HotKeyBinding.self,from:$0)}) ?? .standard
   loadOpenRouter()
  }
  func loadOpenRouter() {
-  if let data=try? Data(contentsOf:configURL),let decoded=try? JSONDecoder().decode(StoredOpenRouterConfig.self,from:data) {
-   openRouterKey=decoded.apiKey
-   let loaded=decoded.models.map{ChatModel(model:$0.model,displayName:$0.displayName,provider:"openrouter")}.filter{!$0.model.isEmpty}
-   openRouterModels=loaded.isEmpty ? Self.defaultOpenRouterModels : loaded
-  } else {
-   openRouterKey=""
-   openRouterModels=Self.defaultOpenRouterModels
-  }
+  let loaded=OpenRouterClient.loadConfig(from:configURL,env:[:])
+  openRouterKey=loaded.key
+  openRouterModels=loaded.models.isEmpty ? Self.defaultOpenRouterModels : loaded.models
   updateOpenRouterStatus(saved:false)
  }
  private func updateOpenRouterStatus(saved:Bool) {
@@ -77,20 +44,10 @@ struct StoredOpenRouterModel: Codable {
  }
  func saveOpenRouter() {
   do {
-   let dir=configURL.deletingLastPathComponent()
-   try FileManager.default.createDirectory(at:dir,withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
    let trimmedKey=openRouterKey.trimmingCharacters(in:.whitespacesAndNewlines)
    openRouterKey=trimmedKey
    if openRouterModels.isEmpty {openRouterModels=Self.defaultOpenRouterModels}
-   let payload=StoredOpenRouterConfig(
-    apiKey:trimmedKey,
-    models:openRouterModels.map{StoredOpenRouterModel(model:$0.model,displayName:$0.displayName)},
-    updatedAt:ISO8601DateFormatter().string(from:Date())
-   )
-   let encoder=JSONEncoder();encoder.outputFormatting=[.prettyPrinted,.sortedKeys]
-   let data=try encoder.encode(payload)
-   try data.write(to:configURL,options:.atomic)
-   try FileManager.default.setAttributes([.posixPermissions:0o600],ofItemAtPath:configURL.path)
+   try OpenRouterClient.saveConfig(key:trimmedKey,models:openRouterModels,to:configURL)
    error=""
    updateOpenRouterStatus(saved:true)
    reloadConfig?()
@@ -109,18 +66,7 @@ struct StoredOpenRouterModel: Codable {
  static func parseModelEntry(_ raw:String)->ChatModel? {
   let trimmed=raw.trimmingCharacters(in:.whitespacesAndNewlines)
   guard !trimmed.isEmpty else {return nil}
-  let parts=trimmed.split(separator:"|",maxSplits:1).map{String($0).trimmingCharacters(in:.whitespacesAndNewlines)}
-  let slug=parts[0]
-  guard !slug.isEmpty else {return nil}
-  if parts.count > 1 && !parts[1].isEmpty {
-   return ChatModel(model:slug,displayName:parts[1],provider:"openrouter")
-  }
-  if let preset=defaultOpenRouterModels.first(where:{$0.model.lowercased() == slug.lowercased()}) {
-   return preset
-  }
-  let short=slug.split(separator:"/").last.map(String.init) ?? slug
-  let title=short.replacingOccurrences(of:"-",with:" ").replacingOccurrences(of:"_",with:" ").capitalized
-  return ChatModel(model:slug,displayName:title,provider:"openrouter")
+  return OpenRouterClient.parseModels([trimmed]).first
  }
  func addOpenRouterModel() {
   guard let entry=Self.parseModelEntry(newModelInput) else {return}

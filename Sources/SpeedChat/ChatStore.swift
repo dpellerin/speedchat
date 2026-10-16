@@ -17,7 +17,7 @@ import ChatCore
  var hiddenAt:Date?
  var idleTimer:Timer?
  var startedAt=Date()
- var nodeOverride="",codexOverride=""
+ var codexOverride=""
  var fixtureMode=false
  var fixtureCommands=[[String:String]]()
  var changed:(()->Void)?
@@ -38,8 +38,6 @@ import ChatCore
   stop();session.connecting();startedAt=Date();coldStarts += 1
   let current=generation
   let backend=BridgeProcess();bridge=backend
-  let bundled=Bundle.main.resourceURL?.appendingPathComponent("backend/bridge.js").path
-  let source=URL(fileURLWithPath:FileManager.default.currentDirectoryPath).appendingPathComponent("backend/dist/bridge.js").path
   let (events,continuation)=AsyncStream<BridgeEvent>.makeStream()
   eventTask=Task { @MainActor [weak self] in
    for await event in events {
@@ -49,8 +47,7 @@ import ChatCore
     if event.type == "done" {self.focusToken += 1}
    }
   }
-  let path=RuntimeDiscovery.bridgePath(bundled:bundled,source:source,exists:FileManager.default.fileExists(atPath:))
-  backend.start(bridge:path,nodeOverride:nodeOverride,codexOverride:codexOverride) {event in
+  backend.start(codexOverride:codexOverride) {event in
    continuation.yield(event)
    if event.type == "fatal" {continuation.finish()}
   }

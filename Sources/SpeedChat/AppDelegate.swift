@@ -55,7 +55,7 @@ import ChatCore
   show()
   if fixture {Task { @MainActor in try? await Task.sleep(for:.milliseconds(700));self.runUISmoke() }}
  }
- func applyPreferences() {store.nodeOverride=preferences.nodePath;store.codexOverride=preferences.codexPath;store.developerMetrics=preferences.metrics}
+ func applyPreferences() {store.codexOverride=preferences.codexPath;store.developerMetrics=preferences.metrics}
  func createMainMenu() {
   let mainMenu=NSMenu()
   let appItem=NSMenuItem();mainMenu.addItem(appItem)
