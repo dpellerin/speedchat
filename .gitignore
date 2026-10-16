@@ -1,0 +1,14 @@
+.build/
+.swiftpm/
+.pnpm-store/
+backend/node_modules/
+backend/docs/
+dist/
+.DS_Store
+.env
+.env.*
+*.log
+docs/test-results/
+docs/ui-*/
+docs/*smoke*.json
+docs/native-launch.json

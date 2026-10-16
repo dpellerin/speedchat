@@ -1,0 +1,22 @@
+{
+  "name": "speedchat-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "smoke": "cd .. && node scripts/smoke-bridge.mjs",
+    "start": "node dist/bridge.js",
+    "test": "node --import tsx --test test/*.test.ts",
+    "verify": "npm test && npm run check && npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3"
+  }
+}
