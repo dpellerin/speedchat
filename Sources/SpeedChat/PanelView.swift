@@ -175,6 +175,9 @@ struct PanelView:View {
  var settings:()->Void
  var dismiss:()->Void
  @Environment(\.colorScheme) private var colorScheme
+ // Use the property wrapper, not the newer SDK's same-named State macro.
+ private typealias ViewState<Value> = SwiftUI.State<Value>
+ @ViewState private var showingErrorDetails=false
  var body:some View {
   VStack(spacing:0) {header;Divider();transcript;Divider();footer}
    .frame(minWidth:400,minHeight:460)
@@ -239,8 +242,24 @@ struct PanelView:View {
   HStack(spacing:7) {
    if store.session.busy || store.session.phase == .connecting {ProgressView().controlSize(.small)}
    Circle().fill(store.session.failed ? Color.red : (store.session.canInteract ? Color.green : Color.secondary)).frame(width:6,height:6)
-   Text(store.session.notice).font(.caption).foregroundStyle(Color.secondary).lineLimit(2).textSelection(.enabled)
+   Text(store.session.notice).font(.caption).foregroundStyle(store.session.failed ? Color.red : Color.secondary).lineLimit(2).textSelection(.enabled)
    Spacer(minLength:0)
+   if store.session.failed {
+    Button("Details") {showingErrorDetails=true}.controlSize(.small).accessibilityLabel("Show error details")
+     .popover(isPresented:$showingErrorDetails,arrowEdge:.top) {
+      VStack(alignment:.leading,spacing:12) {
+       HStack {
+        Text("Request failed").font(.headline)
+        Spacer()
+        Button {NativeActions.copy(store.session.notice)} label:{Label("Copy",systemImage:"doc.on.doc")}.help("Copy full error").accessibilityLabel("Copy full error")
+       }
+       ScrollView {
+        Text(store.session.notice).font(.callout).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading).fixedSize(horizontal:false,vertical:true)
+       }.frame(height:220)
+      }.padding(16).frame(width:380)
+     }
+     .onChange(of:store.session.notice) {showingErrorDetails=false}
+   }
    if store.session.failed && store.session.canInteract && !store.session.lastRequest.isEmpty {Button("Retry",action:store.retry).controlSize(.small)}
    if store.session.phase == .offline {Button("Reconnect",action:store.connect).controlSize(.small).disabled(store.session.busy)}
   }

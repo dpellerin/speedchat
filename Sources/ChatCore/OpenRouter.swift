@@ -32,6 +32,7 @@ public struct OpenRouterStreamOptions: Sendable {
     public var onDelta: @Sendable (String) -> Void
     public var onSearching: @Sendable () -> Void
     public var onCitation: (@Sendable (CitationSource) -> Void)?
+    public var onReasoning: (@Sendable (String) -> Void)?
     public var fetch: OpenRouterFetch?
 
     public init(
@@ -42,6 +43,7 @@ public struct OpenRouterStreamOptions: Sendable {
         onDelta: @escaping @Sendable (String) -> Void,
         onSearching: @escaping @Sendable () -> Void,
         onCitation: (@Sendable (CitationSource) -> Void)? = nil,
+        onReasoning: (@Sendable (String) -> Void)? = nil,
         fetch: OpenRouterFetch? = nil
     ) {
         self.key = key
@@ -51,6 +53,7 @@ public struct OpenRouterStreamOptions: Sendable {
         self.onDelta = onDelta
         self.onSearching = onSearching
         self.onCitation = onCitation
+        self.onReasoning = onReasoning
         self.fetch = fetch
     }
 }
@@ -211,11 +214,34 @@ public enum OpenRouterClient {
 
     public static func extractError(status: Int, bodyText: String) -> OpenRouterHTTPError {
         var detail = ""
+        var providerDetails = [String]()
         if let data = bodyText.data(using: .utf8),
            let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let err = parsed["error"] as? [String: Any],
-           let msg = err["message"] as? String {
-            detail = msg
+           let err = parsed["error"] as? [String: Any] {
+            detail = (err["message"] as? String) ?? ""
+            if let metadata = err["metadata"] as? [String: Any] {
+                if let provider = metadata["provider_name"] as? String, !provider.isEmpty {
+                    providerDetails.append("Provider: \(provider)")
+                }
+                if let raw = metadata["raw"] as? String, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let upstream = raw.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+                    let reason = (upstream?["error"] as? [String: Any])?["message"] as? String
+                        ?? upstream?["message"] as? String
+                        ?? upstream?["detail"] as? String
+                        ?? upstream?["error"] as? String
+                    // Do not dump a JSON response that may echo the request.
+                    if let reason, !reason.isEmpty {
+                        providerDetails.append(reason)
+                    } else if upstream == nil, !raw.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{") {
+                        providerDetails.append(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+                    }
+                }
+                for field in ["error_type", "provider_code"] {
+                    if let value = metadata[field] as? String, !value.isEmpty {
+                        providerDetails.append("\(field): \(value)")
+                    }
+                }
+            }
         } else {
             detail = bodyText.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -229,7 +255,8 @@ public enum OpenRouterClient {
         } else {
             message = detail.isEmpty ? "OpenRouter request failed (HTTP \(status))." : detail
         }
-        return OpenRouterHTTPError(status: status, rawBody: bodyText, message: message)
+        let diagnostic = ([message, "HTTP status: \(status)"] + providerDetails).joined(separator: "\n")
+        return OpenRouterHTTPError(status: status, rawBody: bodyText, message: diagnostic)
     }
 
     public static let liveFetch: OpenRouterFetch = { request in
@@ -273,6 +300,7 @@ public enum OpenRouterClient {
     }
 
     private struct SingleStreamResult {
+        var reasoning: String
         var content: String
         var toolCalls: [ToolCallAccumulator]
         var citations: [(url: String, title: String)]
@@ -287,15 +315,34 @@ public enum OpenRouterClient {
         var apiMessages: [[String: String]] = [
             ["role": "system", "content": options.instructions]
         ]
-        for msg in options.messages {
-            apiMessages.append(["role": msg.role, "content": msg.text])
+        let replayReasoning = options.model.hasPrefix("reflection/beam-")
+        var messages = options.messages
+        if replayReasoning, let lastMissing = messages.lastIndex(where: { $0.role == "assistant" && ($0.reasoning ?? "").isEmpty }) {
+            // Old chats and replies from other models have no Beam reasoning.
+            // Preserve their visible history as quoted user context, rather
+            // than inventing reasoning or disabling the provider's guard.
+            let history = messages[...lastMissing].map { "\($0.role == "user" ? "User" : "Assistant"): \($0.text)" }.joined(separator: "\n\n")
+            let context = "[Earlier conversation, supplied as context only:\n\(history)\nEnd of earlier conversation.]\n\n"
+            messages = Array(messages.dropFirst(lastMissing + 1))
+            if messages.first?.role == "user" {
+                messages[0].text = context + messages[0].text
+            } else {
+                messages.insert(ChatMessage(id: "beam-history", role: "user", text: context), at: 0)
+            }
+        }
+        for msg in messages {
+            var message = ["role": msg.role, "content": msg.text]
+            if replayReasoning, msg.role == "assistant", let reasoning = msg.reasoning, !reasoning.isEmpty {
+                message["reasoning"] = reasoning
+            }
+            apiMessages.append(message)
         }
 
         var body: [String: Any] = [
             "model": options.model,
             "messages": apiMessages,
             "stream": true,
-            "reasoning": ["effort": "low", "exclude": true],
+            "reasoning": ["effort": "low", "exclude": !replayReasoning],
         ]
         for (k, v) in extraBody {
             body[k] = v
@@ -315,6 +362,7 @@ public enum OpenRouterClient {
         }
 
         var content = ""
+        var reasoning = ""
         var toolCalls = [Int: ToolCallAccumulator]()
         var toolCallOrder = [Int]()
         var citations = [(url: String, title: String)]()
@@ -346,14 +394,17 @@ public enum OpenRouterClient {
                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return
             }
-            if let errorDict = parsed["error"] as? [String: Any],
-               let message = errorDict["message"] as? String, !message.isEmpty {
-                throw OpenRouterHTTPError(status: 500, rawBody: payload, message: message)
+            if let errorDict = parsed["error"] as? [String: Any] {
+                let status = (errorDict["code"] as? Int) ?? 500
+                throw extractError(status: status, bodyText: payload)
             }
             guard let choices = parsed["choices"] as? [[String: Any]],
                   let choice = choices.first else { return }
             let delta = choice["delta"] as? [String: Any]
             let message = choice["message"] as? [String: Any]
+            if replayReasoning, let text = delta?["reasoning"] as? String ?? delta?["reasoning_content"] as? String {
+                reasoning += text
+            }
             recordAnnotations(delta?["annotations"])
             recordAnnotations(message?["annotations"])
 
@@ -385,7 +436,7 @@ public enum OpenRouterClient {
         }
 
         let orderedCalls = toolCallOrder.compactMap { toolCalls[$0] }
-        return SingleStreamResult(content: content, toolCalls: orderedCalls, citations: citations)
+        return SingleStreamResult(reasoning: reasoning, content: content, toolCalls: orderedCalls, citations: citations)
     }
 
     public static func streamTurn(_ options: OpenRouterStreamOptions) async throws -> String {
@@ -406,6 +457,7 @@ public enum OpenRouterClient {
         }
 
         guard let searchCall = firstPass.toolCalls.first(where: { $0.name == "web_search" }) else {
+            options.onReasoning?(firstPass.reasoning)
             return appendMissingCitations(firstPass.content, citations: firstPass.citations)
         }
 
@@ -428,6 +480,7 @@ public enum OpenRouterClient {
             extraBody: ["plugins": [["id": "web", "max_results": 5]]],
             emitContentDeltas: true
         )
+        options.onReasoning?(secondPass.reasoning)
         return appendMissingCitations(secondPass.content, citations: secondPass.citations)
     }
 

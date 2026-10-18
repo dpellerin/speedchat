@@ -3,7 +3,8 @@ public struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
  public var id: String
  public var role: String
  public var text: String
- public init(id:String, role:String,text:String) {self.id=id;self.role=role;self.text=text}
+ public var reasoning: String?
+ public init(id:String, role:String,text:String,reasoning:String?=nil) {self.id=id;self.role=role;self.text=text;self.reasoning=reasoning}
 }
 public struct ChatModel: Codable, Identifiable, Equatable, Sendable {
  public var model: String

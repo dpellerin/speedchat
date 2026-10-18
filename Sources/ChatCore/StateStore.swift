@@ -59,7 +59,7 @@ public enum StateStore {
                       let text = item["text"] as? String else {
                     return nil
                 }
-                return ChatMessage(id: id, role: role, text: text)
+                return ChatMessage(id: id, role: role, text: text, reasoning: role == "assistant" ? item["reasoning"] as? String : nil)
             }
         }
         let codexSyncedCount = raw["codexSyncedCount"] as? Int
@@ -134,7 +134,8 @@ public enum StateStore {
     }
 
     public static func friendlyError(_ error: Error) -> String {
-        friendlyErrorMessage(error.localizedDescription)
+        if let providerError = error as? OpenRouterHTTPError { return providerError.message }
+        return friendlyErrorMessage(error.localizedDescription)
     }
 
     public static func friendlyErrorMessage(_ raw: String) -> String {

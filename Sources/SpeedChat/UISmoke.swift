@@ -120,6 +120,34 @@ extension AppDelegate {
       check("Link hover matches \(name) text at width \(Int(width))",renderedLinkHoverMatches())
      }
     }
+    func accessibleElements(_ element:Any,depth:Int=0)->[any NSAccessibilityProtocol] {
+     guard depth < 30,let node=element as? any NSAccessibilityProtocol else {return []}
+     return [node]+(node.accessibilityChildren() ?? []).flatMap{accessibleElements($0,depth:depth+1)}
+    }
+    let errorNotice="OpenRouter request failed (HTTP 400). "+String(repeating:"The provider rejected a request parameter. ",count:12)+"Diagnostic end marker."
+    self.store.session.receive(BridgeEvent(type:"error",message:errorNotice))
+    self.show()
+    try? await Task.sleep(for:.milliseconds(100))
+    self.panel.contentView?.layoutSubtreeIfNeeded()
+    if let content=self.panel.contentView,let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) {content.cacheDisplay(in:content.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/error-panel.png"))}
+    let notice=self.panel.flatMap{accessibleElements($0).first{($0.accessibilityValue() as? String) == errorNotice}}
+    if let notice {
+     // SwiftUI's virtual buttons are absent from in-process AX children. Send
+     // mouse events only to this fixture window, at the screenshot-verified
+     // Details position (100 points from the right edge, beside Retry).
+     let screen=NSPoint(x:self.panel.frame.maxX-100,y:notice.accessibilityFrame().midY)
+     let point=self.panel.convertPoint(fromScreen:screen)
+     for type in [NSEvent.EventType.leftMouseDown,.leftMouseUp] {
+      if let event=NSEvent.mouseEvent(with:type,location:point,modifierFlags:[],timestamp:ProcessInfo.processInfo.systemUptime,windowNumber:self.panel.windowNumber,context:nil,eventNumber:0,clickCount:1,pressure:0) {self.panel.sendEvent(event)}
+     }
+     try? await Task.sleep(for:.milliseconds(150))
+    }
+    let errorWindows=NSApp.windows.filter{$0 !== self.panel && $0.isVisible}
+    check("Error details open without dismissing chat",self.panel.isVisible && !errorWindows.isEmpty)
+    check("Error details include complete selectable provider message",errorWindows.flatMap{accessibleElements($0)}.contains{($0.accessibilityValue() as? String) == errorNotice})
+    for window in errorWindows {
+     if let content=window.contentView,let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) {content.cacheDisplay(in:content.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/error-details.png"))}
+    }
     let failures=checks.filter{($0["passed"] as? Bool) != true}.count
     let report:[String:Any]=["checks":checks,"passed":checks.count-failures,"failed":failures,"note":"Fixture UI harness. Does not verify physical hotkey, all Spaces, login-item changes, or live response rendering." ]
     if let data=try? JSONSerialization.data(withJSONObject:report,options:[.prettyPrinted,.sortedKeys]) {try? data.write(to:URL(fileURLWithPath:path+"/report.json"))}

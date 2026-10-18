@@ -614,6 +614,7 @@ public final class ChatClient: @unchecked Sendable {
     ) async {
         final class StreamBox: @unchecked Sendable {
             var streamedText = ""
+            var reasoning: String?
         }
         let box = StreamBox()
 
@@ -647,6 +648,13 @@ public final class ChatClient: @unchecked Sendable {
                         guard let self else { return }
                         self.sync { self.recordCitation(source) }
                     },
+                    onReasoning: { [weak self] reasoning in
+                        guard let self else { return }
+                        self.sync {
+                            guard self.openRouterTurnToken == token else { return }
+                            box.reasoning = reasoning.isEmpty ? nil : reasoning
+                        }
+                    },
                     fetch: options.openRouterFetch
                 )
             )
@@ -658,7 +666,7 @@ public final class ChatClient: @unchecked Sendable {
                 let rawText = fullText.isEmpty ? box.streamedText : fullText
                 let normalized = RenderNormalizer.normalizeAssistantText(rawText, sources: orderedCitations())
                 if !normalized.isEmpty {
-                    messages.append(ChatMessage(id: itemId, role: "assistant", text: normalized))
+                    messages.append(ChatMessage(id: itemId, role: "assistant", text: normalized, reasoning: box.reasoning))
                     saveCurrentState()
                 }
                 openRouterTask = nil

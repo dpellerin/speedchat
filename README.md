@@ -15,6 +15,8 @@ Zero external dependencies, zero external Swift packages, and no Electron/WebVie
   - **OpenRouter**: Optionally add an OpenRouter API key in **Settings (`⌘,`)** to chat with fast, personable open-weight models alongside OpenAI, or run standalone with OpenRouter alone.
   - **Curated Open-Weight Defaults**: Ships with **DeepSeek V4.1 Flash**, **Mistral Large 4**, **Qwen 3.8 Flash**, **Kimi K3**, **GLM 5.3 FlashX**, **Gemma 4 26B A4B**, and **DeepSeek V4 Pro**—customizable directly in Settings (`slug` or `slug | Display Name`).
   - **Seamless Mid-Chat Switching**: Switch between OpenAI and OpenRouter models inside the same conversation without losing context.
+  - **Beam Follow-Ups**: Preserves Beam's required reasoning metadata privately across turns and app restarts. Older replies without that metadata are supplied as quoted conversation context; reasoning is never shown in chat or forwarded to other models.
+  - **Readable Errors**: Failed requests expose a **Details** popover with the HTTP status, available provider diagnostics, selectable text, and **Copy**.
 - **On-Demand Web Search**
   - Hosted live web search on OpenAI models and on-demand OpenRouter web search (`plugins: [{ id: "web" }]`) triggered only when current information is needed, with inline Markdown source citations.
 - **Native macOS Experience**
