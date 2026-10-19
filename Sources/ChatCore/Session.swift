@@ -61,6 +61,7 @@ public struct ChatSession: Sendable {
  public enum Phase: Sendable { case offline,connecting,ready,sending,selecting,resetting }
  public private(set) var phase: Phase = .offline
  public private(set) var messages=[ChatMessage]()
+ public private(set) var transcriptID=UUID()
  public private(set) var models=[ChatModel]()
  public private(set) var selectedModel=""
  public private(set) var activeModel=""
@@ -89,7 +90,7 @@ public struct ChatSession: Sendable {
  public func shouldStopIdle(hidden:Bool,elapsed:TimeInterval) -> Bool {hidden && !busy && elapsed >= 300}
  public mutating func receive(_ event:BridgeEvent) {
   switch event.type {
-  case "ready": messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel;phase = .ready;notice=event.notice ?? "Ready";failed=false
+  case "ready": transcriptID=UUID();messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel;phase = .ready;notice=event.notice ?? "Ready";failed=false
   case "modelsUpdated":
    models=event.models ?? models
    if let updated=event.model, !updated.isEmpty { selectedModel=updated; if !streaming { activeModel=updated } }

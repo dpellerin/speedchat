@@ -4,7 +4,8 @@
 
 SpeedChat is verified through two automated native layers:
 
-1. **Swift Testing Suite (`43/43 passing`)** — `scripts/test.sh`
+1. **Swift Testing Suite (`45/45 passing`)** — `scripts/test.sh`
+   - **Standalone OpenRouter → Codex Handoff**: Restores a local `openrouter-…` conversation with either provider selected, creates a real Codex thread before sending, preserves visible history without forwarding private reasoning, persists the replacement ID, and avoids repeating history on subsequent turns. Failed or malformed thread creation preserves history and allows retry. These checks use a fake transport; the installed app and the user's saved chat are not changed by the tests.
    - **Beam Reasoning Continuity**: Replays private reasoning across follow-ups and restarts, keeps it out of visible responses and other providers, and supplies legacy/mixed-model history as quoted context rather than fabricating reasoning or disabling provider validation.
    - **Provider Error Diagnostics**: Retains HTTP status, provider name, nested upstream error messages, and typed error metadata for HTTP and SSE errors; prevents OpenRouter errors from being rewritten as Codex errors.
    - **Model Catalog & Defaults**: Filters low-reasoning-effort OpenAI models (`gpt-6-luna` default when available) and merges configured OpenRouter open-weight models (`deepseek/deepseek-v4.1-flash`, `mistralai/mistral-large-4-0`, `qwen/qwen3.8-flash`, `moonshotai/kimi-k3`, `z-ai/glm-5.3-flashx`, `google/gemma-4-26b-a4b-it`, `deepseek/deepseek-v4-pro-0813`).
@@ -16,7 +17,8 @@ SpeedChat is verified through two automated native layers:
    - **Session & Keyboard State Machine**: Verifies `ChatSession` busy gating, `modelsUpdated` hot-reloading, `ChatModel.isOpenRouter` classification, and `KeyboardPolicy` (`↵` send, `⇧↵` newline, `Esc` stop/dismiss, `⌘W` dismiss without interrupting active streams, `⌘N`/`⌃N` new chat, `Page Up`/`Page Down`).
    - **Subprocess & Preferences Integration**: Tests cooperative Codex subprocess close timing, server tool refusal over stdio, symlinked executable discovery, and `Preferences` OpenRouter configuration persistence with `0600` permissions.
 
-2. **Native UI Fixture Smoke (`27/27 passing` in Light & Dark Mode)** — `scripts/smoke-ui.sh`
+2. **Native UI Fixture Smoke** — `scripts/smoke-ui.sh`
+   - **New Chat Transcript Reset**: Rebuilds the scroll container whenever a conversation loads. The focused run passed 24 checks, including five resets from a scrolled conversation at 580-point width and replies arriving while hidden. Run `dist/SpeedChat.app/Contents/MacOS/SpeedChat --ui-smoke --new-chat-smoke --smoke-output /tmp/speedchat-new-chat` after building. The full v1.1.4 fixture passed 30/32 checks. Its two provider-error popover checks still failed, matching the limitation reported for v1.1.3; all five new-chat checks passed.
    - Opens error details through fixture-window mouse events, verifies the chat stays visible, and reads back the complete selectable error message from the popover. Saves error-footer and popover screenshots; this does not require desktop accessibility permission.
    - Launches `dist/SpeedChat.app` in fixture mode (`--ui-smoke`) and verifies:
      - Automatic focus of the editable `ComposerTextView` on panel open before backend readiness.
@@ -31,6 +33,10 @@ SpeedChat is verified through two automated native layers:
 ## Live Beam Verification
 
 The native OpenRouter client was exercised with generic diagnostic prompts using a real configured account: a first turn returned `READY.`, a follow-up with preserved reasoning returned `ORCHARD.`, and continuation of the same visible history without old reasoning returned `ORCHARD` via quoted-context migration. The user's existing conversation was not resent for these diagnostics. Restart persistence and provider-switch isolation are covered by automated tests, not a live account restart test.
+
+## Live Sol Transcript Investigation
+
+The reported blank panel was captured in the running installed app even though both user messages and Sol replies were persisted. Two isolated live GPT-6.1-Sol new chats delivered deltas, final messages, and completion events successfully through the native bridge and session. Fixture resets also rendered correctly before the change, so the intermittent trigger is not reproduced deterministically. The fix gives each loaded transcript a fresh scroll container to discard the previous lazy layout and clip position. The user confirmed that both the provider handoff and blank-transcript fixes work in the installed app.
 
 ## Scope & Manual Verification Notes
 

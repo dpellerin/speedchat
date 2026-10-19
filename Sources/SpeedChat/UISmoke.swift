@@ -106,6 +106,40 @@ extension AppDelegate {
     try? FileManager.default.createDirectory(atPath:path,withIntermediateDirectories:true)
     if let view=self.panel.contentView,let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds) {view.cacheDisplay(in:view.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/panel.png"))}
     if let settingsView=self.settingsWindow?.contentView,let bitmap=settingsView.bitmapImageRepForCachingDisplay(in:settingsView.bounds) {settingsView.cacheDisplay(in:settingsView.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/settings.png"))}
+    // Start at the narrow panel width used by the reported blank transcript.
+    self.panel.setContentSize(NSSize(width:580,height:740))
+    for reset in 0..<5 {
+     let longHistory=(0..<8).map { index in
+      ChatMessage(id:"old-\(reset)-\(index)",role:index.isMultiple(of:2) ? "user" : "assistant",text:String(repeating:"Earlier conversation text. ",count:15))
+     }
+     self.store.session.receive(BridgeEvent(type:"ready",messages:longHistory,model:"gpt-6.1-sol"))
+     try? await Task.sleep(for:.milliseconds(150))
+     self.scroll.page(100)
+     try? await Task.sleep(for:.milliseconds(100))
+     self.store.newChat()
+     self.store.session.receive(BridgeEvent(type:"ready",messages:[],model:"gpt-6.1-sol"))
+     try? await Task.sleep(for:.milliseconds(100))
+     if reset.isMultiple(of:2) {self.hide()}
+     self.store.draft="Hello in the new chat"
+     self.store.send()
+     self.store.session.receive(BridgeEvent(type:"message",itemId:"new-reply-\(reset)",text:"New chat response is visible."))
+     self.store.session.receive(BridgeEvent(type:"done"))
+     try? await Task.sleep(for:.milliseconds(150))
+     self.show()
+     try? await Task.sleep(for:.milliseconds(150))
+     self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+     let newReplyViews=self.panel.contentView.map(findProse) ?? []
+     check("New chat \(reset) renders reply after clearing a scrolled transcript",newReplyViews.contains {
+      $0.storage.string == "New chat response is visible." && !$0.visibleRect.isEmpty
+     })
+     if let view=self.panel.contentView,let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds) {view.cacheDisplay(in:view.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/new-chat-\(reset).png"))}
+    }
+    if CommandLine.arguments.contains("--new-chat-smoke") {
+     let failures=checks.filter{($0["passed"] as? Bool) != true}.count
+     let report:[String:Any]=["checks":checks,"passed":checks.count-failures,"failed":failures]
+     if let data=try? JSONSerialization.data(withJSONObject:report,options:[.prettyPrinted,.sortedKeys]) {try? data.write(to:URL(fileURLWithPath:path+"/report.json"))}
+     exit(failures == 0 ? 0 : 1)
+    }
     let linkFixtures=[
      ("single-line","Read the [example source](https://example.com) here."),
      ("wrapped","A **bold** introduction with *emphasis* and `inline code` before a link. "+String(repeating:"More prose before the source. ",count:6)+"[A long example source label that wraps across multiple lines and keeps every visible word clickable](https://example.com)"),

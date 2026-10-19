@@ -8,6 +8,8 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
     var onExit: (@Sendable () -> Void)?
     var calls = [(method: String, params: [String: Any])]()
     var failStart = false
+    var failThreadStart = false
+    var missingThreadId = false
     var holdTurnStart = false
     var holdSettings = false
     var holdFirstRename = false
@@ -104,6 +106,8 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
             ]
         }
         if method == "thread/start" {
+            if failThreadStart { throw NSError(domain: "test", code: 500) }
+            if missingThreadId { return ["thread": [:]] }
             let count = sync { () -> Int in
                 let c = threadCounter
                 threadCounter += 1
@@ -113,10 +117,87 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
             return ["thread": ["id": id], "model": "gpt-6-luna"]
         }
         if method == "turn/start" {
+            if (params["threadId"] as? String)?.hasPrefix("openrouter-") == true {
+                throw NSError(domain: "test", code: -32600, userInfo: [NSLocalizedDescriptionKey: "invalid thread id: expected UUID"])
+            }
             return ["turn": ["id": "turn-1"]]
         }
         return [:]
     }
+}
+
+@Test(arguments: ["deepseek/deepseek-v4.1-flash", "gpt-6-luna"])
+func restoredOpenRouterChatCanContinueOnCodex(savedModel: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("provider-handoff-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let configURL = dir.appendingPathComponent("openrouter.json")
+    try OpenRouterClient.saveConfig(key: "test-or-key", to: configURL)
+    let history = [
+        ChatMessage(id: "user-1", role: "user", text: "Remember orchard."),
+        ChatMessage(id: "assistant-1", role: "assistant", text: "Orchard remembered.", reasoning: "private provider reasoning"),
+    ]
+    try StateStore.save(threadId: "openrouter-" + UUID().uuidString.lowercased(), model: savedModel,
+                        to: stateURL, messages: history, codexSyncedCount: 0)
+    let rpc = FakeCodexTransport()
+    let client = ChatClient(rpc: rpc, options: ChatClientOptions(openRouterConfigURL: configURL, stateURL: stateURL, env: [:]))
+    let ready = try await client.connect()
+    #expect(ready.messages == history)
+    if savedModel != "gpt-6-luna" {
+        _ = try await client.selectModel("gpt-6-luna")
+    }
+    try await client.send("What did I ask you to remember?")
+
+    let startedThread = try #require(rpc.calls.first { $0.method == "thread/start" })
+    #expect(startedThread.params["model"] as? String == "gpt-6-luna")
+    let turn = try #require(rpc.calls.first { $0.method == "turn/start" })
+    #expect(turn.params["threadId"] as? String == "dedicated")
+    let input = try #require((turn.params["input"] as? [[String: Any]])?.first?["text"] as? String)
+    #expect(input.contains("Remember orchard."))
+    #expect(input.contains("Orchard remembered."))
+    #expect(!input.contains("private provider reasoning"))
+    #expect(input.hasSuffix("What did I ask you to remember?"))
+    let saved = try #require(StateStore.load(from: stateURL))
+    #expect(saved.threadId == "dedicated")
+    #expect(saved.messages == history)
+    #expect(!rpc.calls.contains { ($0.params["threadId"] as? String)?.hasPrefix("openrouter-") == true })
+    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
+        "threadId": "dedicated", "turn": ["id": "turn-1", "status": "completed"],
+    ]))
+    try await client.send("Continue")
+    #expect(rpc.calls.filter { $0.method == "thread/start" }.count == 1)
+    let followUp = try #require(rpc.calls.last { $0.method == "turn/start" })
+    #expect((followUp.params["input"] as? [[String: Any]])?.first?["text"] as? String == "Continue")
+    await client.close()
+}
+
+@Test(arguments: [false, true])
+func failedCodexHandoffPreservesHistoryAndCanRetry(malformedResponse: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("failed-handoff-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let history = [ChatMessage(id: "previous", role: "user", text: "Keep this message.")]
+    let localId = "openrouter-" + UUID().uuidString.lowercased()
+    try StateStore.save(threadId: localId, model: "gpt-6-luna", to: stateURL, messages: history, codexSyncedCount: 0)
+    let rpc = FakeCodexTransport()
+    rpc.failThreadStart = !malformedResponse
+    rpc.missingThreadId = malformedResponse
+    let client = ChatClient(rpc: rpc, options: ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]))
+    _ = try await client.connect()
+    await #expect(throws: (any Error).self) { try await client.send("Try again") }
+    #expect(!client.busy)
+    #expect(StateStore.load(from: stateURL)?.threadId == localId)
+    #expect(StateStore.load(from: stateURL)?.messages == history)
+    #expect(!rpc.calls.contains { $0.method == "turn/start" })
+    rpc.failThreadStart = false
+    rpc.missingThreadId = false
+    try await client.send("Try again")
+    let turn = try #require(rpc.calls.first { $0.method == "turn/start" })
+    let input = try #require((turn.params["input"] as? [[String: Any]])?.first?["text"] as? String)
+    #expect(input.contains("Keep this message."))
+    #expect(StateStore.load(from: stateURL)?.threadId == "dedicated")
+    await client.close()
 }
 
 private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {

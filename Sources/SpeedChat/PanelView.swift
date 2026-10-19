@@ -213,6 +213,8 @@ struct PanelView:View {
   }.padding(.horizontal,18).padding(.vertical,8)
  }
  private var transcript:some View {
+  // Rebuild the scroll container when loading a conversation so its lazy
+  // layout and clip position cannot carry over from the previous transcript.
   ScrollViewReader {proxy in
    ZStack(alignment:.bottomTrailing) {
     ScrollView {
@@ -232,7 +234,7 @@ struct PanelView:View {
     }
     if !store.followBottom {Button {scroll.userScrolled=false;store.followBottom=true;proxy.scrollTo("bottom",anchor:.bottom)} label:{Label("Latest",systemImage:"arrow.down")}.buttonStyle(.borderedProminent).padding(14)}
    }
-  }
+  }.id(store.session.transcriptID)
  }
  private var emptyState:some View {
   VStack(spacing:14) {Image(systemName:"sparkles").font(.system(size:32)).foregroundStyle(Color.accentColor);Text("What’s on your mind?").font(.title2.weight(.medium));Text("A quiet space to ask, explore, and think.\nYour conversation resumes when you return.").foregroundStyle(.secondary).multilineTextAlignment(.center)}.frame(maxWidth:.infinity).padding(.top,80).padding(.bottom,40)

@@ -377,6 +377,50 @@ public final class ChatClient: @unchecked Sendable {
         }
     }
 
+    private func startCodexThread(model: String, cwdPath: String) async throws -> (id: String, model: String?) {
+        let response = try await rpc.request(
+            method: "thread/start",
+            params: [
+                "model": model,
+                "personality": ChatPrompt.personality,
+                "cwd": cwdPath,
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "sandbox": "read-only",
+                "config": ["web_search": "live"],
+                "baseInstructions": ChatPrompt.instructions,
+                "developerInstructions": ChatPrompt.instructions,
+                "dynamicTools": [],
+                "environments": [],
+                "runtimeWorkspaceRoots": [],
+                "selectedCapabilityRoots": [],
+                "ephemeral": false,
+                "serviceTier": "default",
+            ],
+            timeoutMs: 30_000
+        )
+        guard let thread = response["thread"] as? [String: Any],
+              let id = thread["id"] as? String, !id.isEmpty,
+              !id.hasPrefix("openrouter-"), !id.hasPrefix("codex-") else {
+            throw NSError(domain: "SpeedChat.Client", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid new Codex thread."])
+        }
+        return (id, response["model"] as? String)
+    }
+
+    private func codexThreadForSend(currentThread: String, model: String) async throws -> String {
+        guard currentThread.hasPrefix("openrouter-") else { return currentThread }
+        let cwdPath = sync { runtimeDir?.path ?? "" }
+        let started = try await startCodexThread(model: model, cwdPath: cwdPath)
+        return sync {
+            threadId = started.id
+            // This is a fresh Codex thread; all visible history must be sent.
+            codexSyncedCount = 0
+            titleNeeded = true
+            saveCurrentState()
+            return started.id
+        }
+    }
+
     public func newChat() async throws -> ReadyState {
         let (isCodexUp, codexModel, cwdPath) = try sync { () -> (Bool, String, String) in
             if turnStarting || turnId != nil || mutationPending {
@@ -394,30 +438,7 @@ public final class ChatClient: @unchecked Sendable {
         }
 
         if isCodexUp {
-            let response = try await rpc.request(
-                method: "thread/start",
-                params: [
-                    "model": codexModel,
-                    "personality": ChatPrompt.personality,
-                    "cwd": cwdPath,
-                    "approvalPolicy": "never",
-                    "approvalsReviewer": "user",
-                    "sandbox": "read-only",
-                    "config": ["web_search": "live"],
-                    "baseInstructions": ChatPrompt.instructions,
-                    "developerInstructions": ChatPrompt.instructions,
-                    "dynamicTools": [],
-                    "environments": [],
-                    "runtimeWorkspaceRoots": [],
-                    "selectedCapabilityRoots": [],
-                    "ephemeral": false,
-                    "serviceTier": "default",
-                ],
-                timeoutMs: 30_000
-            )
-            let threadDict = (response["thread"] as? [String: Any]) ?? [:]
-            let startedId = (threadDict["id"] as? String) ?? "codex-\(UUID().uuidString)"
-            let respModel = response["model"] as? String
+            let (startedId, respModel) = try await startCodexThread(model: codexModel, cwdPath: cwdPath)
             let ready = sync { () -> ReadyState in
                 threadId = startedId
                 if !isOpenRouterModel(model), let respModel, !respModel.isEmpty {
@@ -550,7 +571,9 @@ public final class ChatClient: @unchecked Sendable {
             return
         }
 
+        var appendedUserMessageId: String?
         do {
+            let codexThread = try await codexThreadForSend(currentThread: currentThread, model: currentModel)
             let (inputText, cwdPath) = sync { () -> (String, String) in
                 let unsent = Array(messages.dropFirst(codexSyncedCount))
                 let formattedInput: String
@@ -562,13 +585,14 @@ public final class ChatClient: @unchecked Sendable {
                 }
                 let userMessage = ChatMessage(id: UUID().uuidString.lowercased(), role: "user", text: text)
                 messages.append(userMessage)
+                appendedUserMessageId = userMessage.id
                 return (formattedInput, runtimeDir?.path ?? "")
             }
 
             let response = try await rpc.request(
                 method: "turn/start",
                 params: [
-                    "threadId": currentThread,
+                    "threadId": codexThread,
                     "input": [["type": "text", "text": inputText]],
                     "model": currentModel,
                     "personality": ChatPrompt.personality,
@@ -599,7 +623,9 @@ public final class ChatClient: @unchecked Sendable {
         } catch {
             sync {
                 turnStarting = false
-                if !messages.isEmpty { messages.removeLast() }
+                if let appendedUserMessageId, messages.last?.id == appendedUserMessageId {
+                    messages.removeLast()
+                }
             }
             throw error
         }
