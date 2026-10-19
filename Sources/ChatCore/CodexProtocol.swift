@@ -58,8 +58,10 @@ public enum CodexProtocol {
 
     public static func arguments() -> [String] {
         var args = ["app-server", "--stdio"]
+        // CLI --disable rejects flags absent from older Codex versions. Config
+        // overrides keep known features disabled and tolerate unavailable ones.
         for feature in disabledFeatures {
-            args.append(contentsOf: ["--disable", feature])
+            args.append(contentsOf: ["-c", "features.\(feature)=false"])
         }
         args.append(contentsOf: [
             "--enable", "skip_host_skill_discovery",

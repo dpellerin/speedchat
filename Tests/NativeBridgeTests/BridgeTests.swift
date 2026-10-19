@@ -20,6 +20,9 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
     let script = """
     #!/usr/bin/env python3
     import json, sys
+    # Older Codex CLIs reject unknown --disable flags before initialization.
+    if "--disable" in sys.argv and "browser_annotation_api" in sys.argv:
+        sys.exit("Unknown feature flag: browser_annotation_api")
     for raw in sys.stdin:
         msg = json.loads(raw)
         if msg.get("method") == "initialize":
@@ -66,6 +69,9 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
     let script = """
     #!/usr/bin/env python3
     import json, sys
+    # Older Codex CLIs reject unknown --disable flags before initialization.
+    if "--disable" in sys.argv and "browser_annotation_api" in sys.argv:
+        sys.exit("Unknown feature flag: browser_annotation_api")
     for raw in sys.stdin:
         msg = json.loads(raw)
         method = msg.get("method")

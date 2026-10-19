@@ -64,7 +64,7 @@ import Foundation
     let args = CodexProtocol.arguments()
     #expect(Array(args.prefix(2)) == ["app-server", "--stdio"])
     for feature in CodexProtocol.disabledFeatures {
-        let found = (0..<(args.count - 1)).contains { args[$0] == "--disable" && args[$0 + 1] == feature }
+        let found = (0..<(args.count - 1)).contains { args[$0] == "-c" && args[$0 + 1] == "features.\(feature)=false" }
         #expect(found, "Expected \(feature) to be disabled")
     }
     #expect(Array(args.suffix(4)) == ["-c", "mcp_servers={}", "-c", "web_search=\"live\""])
