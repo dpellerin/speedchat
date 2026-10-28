@@ -23,12 +23,12 @@ import ChatCore
   applyPreferences()
   panel=FloatingPanel(contentRect:NSRect(x:0,y:0,width:790,height:740),styleMask:[.titled,.closable,.resizable,.fullSizeContentView,.nonactivatingPanel],backing:.buffered,defer:false)
   panel.title="SpeedChat";panel.titleVisibility = .hidden;panel.titlebarAppearsTransparent=true
-  panel.isFloatingPanel=false;panel.level = .normal;panel.hidesOnDeactivate=true;panel.isReleasedWhenClosed=false
+  panel.isFloatingPanel=false;panel.level = .normal;panel.hidesOnDeactivate=false;panel.isReleasedWhenClosed=false
   panel.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary];panel.minSize=NSSize(width:580,height:480)
   panel.delegate=self
   panel.contentView=NSHostingView(rootView:PanelView(store:store,preferences:preferences,scroll:scroll,settings:{[weak self] in self?.showSettings()},dismiss:{[weak self] in self?.hide()}))
   if !fixture {panel.setFrameAutosaveName("SpeedChat.Panel");if !panel.setFrameUsingName("SpeedChat.Panel") {panel.center()}} else {panel.center()}
-  hotkey.action={ [weak self] in self?.toggle() }
+  hotkey.action={ [weak self] in self?.show() }
   preferences.updateHotkey={ [weak self] binding in try self?.hotkey.register(binding) }
   preferences.reconnect={ [weak self] in self?.applyPreferences();self?.store.connect() }
   preferences.reloadConfig={ [weak self] in
@@ -95,15 +95,17 @@ import ChatCore
    statusItem?.button?.image=NSImage(systemSymbolName:"bubble.left.and.bubble.right",accessibilityDescription:"SpeedChat")
   }
   let menu=NSMenu()
-  for (title,selector,key) in [("Show / Hide SpeedChat",#selector(toggle),""),("New Chat",#selector(newChat),"n"),("Settings…",#selector(showSettings),",")] {
+  for (title,selector,key) in [("Show SpeedChat",#selector(showFromMenu),""),("New Chat",#selector(newChat),"n"),("Settings…",#selector(showSettings),",")] {
    let item=NSMenuItem(title:title,action:selector,keyEquivalent:key);item.target=self;menu.addItem(item)
   }
   menu.addItem(.separator());let quit=NSMenuItem(title:"Quit SpeedChat",action:#selector(quit),keyEquivalent:"q");quit.target=self;menu.addItem(quit)
   statusItem?.menu=menu
  }
- @objc func toggle() {panel.isVisible ? hide() : show()}
+ @objc func showFromMenu() {show()}
  func show() {
-  store.show();NSApp.activate(ignoringOtherApps:true);panel.makeKeyAndOrderFront(nil)
+  // Put the all-Spaces panel in front before activating the app. Activating
+  // first can switch to the Space containing another SpeedChat window.
+  store.show();panel.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
   panel.contentView?.layoutSubtreeIfNeeded()
   focusComposer()
   DispatchQueue.main.async { [weak self] in
@@ -122,13 +124,6 @@ import ChatCore
   }
  }
  func hide() {panel.orderOut(nil);store.hide()}
- func windowDidResignKey(_ notification:Notification) {
-  guard notification.object as? NSWindow === panel else {return}
-  hide()
- }
- func applicationDidResignActive(_ notification:Notification) {
-  if panel.isVisible {hide()}
- }
  @objc func newChat() {show();store.newChat()}
  @objc func showSettings() {
   preferences.refreshLogin()

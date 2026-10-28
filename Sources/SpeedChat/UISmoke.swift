@@ -63,12 +63,7 @@ extension AppDelegate {
    }
    check("Links configure pointing-hand cursor and validated URL",linkCursorConfigured)
    check("Panel is visible, normal-level and resizable",panel.isVisible && panel.level == .normal && !panel.isFloatingPanel && panel.styleMask.contains(.resizable))
-   check("Panel dismisses after losing focus", {
-    windowDidResignKey(Notification(name:NSWindow.didResignKeyNotification,object:panel))
-    let hidden = !panel.isVisible
-    show()
-    return hidden
-   }())
+   check("Panel stays visible when app deactivates",!panel.hidesOnDeactivate)
    check("Panel joins Spaces and fullscreen",panel.collectionBehavior.contains(.canJoinAllSpaces) && panel.collectionBehavior.contains(.fullScreenAuxiliary))
    func findComposer(_ view:NSView)->ComposerTextView? {if let text=view as? ComposerTextView {return text};for child in view.subviews {if let found=findComposer(child) {return found}};return nil}
    if let view=panel.contentView.flatMap(findComposer) {
@@ -86,6 +81,7 @@ extension AppDelegate {
    if let savedClipboard {NativeActions.copy(savedClipboard)}
    check("Unsafe URL is never opened",!NativeActions.open(URL(fileURLWithPath:"/tmp/blocked")))
    showSettings()
+   check("Panel stays visible when another window receives focus",panel.isVisible && settingsWindow?.isKeyWindow == true)
    func hasScrollView(_ view:NSView)->Bool {if view is NSScrollView {return true};return view.subviews.contains(where:hasScrollView)}
    if let settingsContent=settingsWindow?.contentView {
     settingsContent.layoutSubtreeIfNeeded()

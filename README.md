@@ -21,7 +21,7 @@ Zero external dependencies, zero external Swift packages, and no Electron/WebVie
   - Hosted live web search on OpenAI models and on-demand OpenRouter web search (`plugins: [{ id: "web" }]`) triggered only when current information is needed, with inline Markdown source citations.
 - **Native macOS Experience**
   - Compact, draggable, resizable `NSPanel` with semantic light/dark appearance (clean white chat surface in light mode, native contrast in dark mode).
-  - Joins all Spaces and works over fullscreen apps; automatically hides when it loses focus while keeping your draft, conversation, and warm backend ready.
+  - Joins all Spaces and works over fullscreen apps; stays open when it loses focus. Dismiss it with Escape or Command-W while keeping your draft, conversation, and warm backend ready.
   - Native selectable prose, code blocks with one-click copy, and readable Unicode math normalization.
 
 ---
