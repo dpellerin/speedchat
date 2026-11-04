@@ -61,6 +61,12 @@ public enum RuntimeDiscovery {
         var candidates = (environment(["PATH": path], home: home)["PATH"] ?? "")
             .split(separator: ":")
             .map { String($0) + "/" + name }
+        // Finder's PATH can discover an older system Codex before the user's
+        // current installation, which can expose a stale bundled model catalog.
+        // Keep explicit overrides authoritative; otherwise prefer user Codex.
+        if name == "codex" {
+            candidates.insert(home + "/.local/bin/codex", at: 0)
+        }
         if name == "node" {
             candidates += hermesEntries
                 .filter { $0.hasPrefix("node-") && $0.contains("-darwin-") }

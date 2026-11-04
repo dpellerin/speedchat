@@ -30,7 +30,7 @@ Zero external dependencies, zero external Swift packages, and no Electron/WebVie
 
 | Shortcut | Action |
 | --- | --- |
-| **⌥ Space** *(configurable)* | Summon or hide the SpeedChat panel from anywhere |
+| **⌥ Space** *(configurable)* | Show or focus the SpeedChat panel from anywhere |
 | **↵ (Enter)** | Send message |
 | **⇧↵ (Shift + Enter)** | Insert newline in composer |
 | **⌘N** / **⌃N** | Start a new chat (keeps selected model) |
@@ -50,6 +50,10 @@ Zero external dependencies, zero external Swift packages, and no Electron/WebVie
   - **OpenRouter**: An API key from [openrouter.ai](https://openrouter.ai), configured in **SpeedChat Settings (`⌘,`)** (works standalone with zero CLI dependencies).
 
 When using OpenAI via Codex, the app automatically discovers `codex` (and `node` if your `codex` shim uses it) across `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, common version-manager paths (`~/.volta/bin`, `~/.asdf/shims`, `~/.local/share/mise/shims`, `~/.fnm/current/bin`, `~/Library/pnpm`), and `~/.hermes/tools` without sourcing shell startup files.
+
+For Codex, auto-discovery prefers `~/.local/bin/codex` when installed, so an older system-wide copy does not mask the user installation's model catalog. An explicit Codex path in Settings or `SPEEDCHAT_CODEX` takes precedence.
+
+OpenAI model choices come from the selected Codex CLI's catalog. If newer models are missing, update that Codex installation and restart SpeedChat. If you have multiple installations, check the Codex path in Settings; an explicit path continues to use that copy.
 
 ---
 

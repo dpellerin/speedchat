@@ -67,6 +67,21 @@ import Foundation
  #expect(env["PATH"]!.contains("/opt/homebrew/bin")); #expect(env["PATH"]!.contains("/home/test/.local/bin"))
 }
 
+@Test func codexDiscoveryPrefersUserInstallAndHonorsOverrides() throws {
+ let home = "/home/test"
+ let localCodex = home + "/.local/bin/codex"
+ let systemCodex = "/opt/homebrew/bin/codex"
+ let installed: Set<String> = [localCodex, systemCodex]
+ // Finder has no user PATH; a shell may explicitly include Homebrew first.
+ for path in ["/usr/bin:/bin", "/opt/homebrew/bin:/usr/bin:/bin"] {
+  #expect(try RuntimeDiscovery.find(name:"codex",home:home,path:path,exists:installed.contains) == localCodex)
+  #expect(try RuntimeDiscovery.find(name:"codex",override:systemCodex,home:home,path:path,exists:installed.contains) == systemCodex)
+  #expect(try RuntimeDiscovery.find(name:"codex",home:home,path:path,exists:{$0 == systemCodex}) == systemCodex)
+ }
+ let nodes: Set<String> = [home + "/.local/bin/node", "/opt/homebrew/bin/node"]
+ #expect(try RuntimeDiscovery.find(name:"node",home:home,path:"/opt/homebrew/bin",exists:nodes.contains) == "/opt/homebrew/bin/node")
+}
+
 @Test func runtimeDirectoryIsPrivateEmptyAndUnique() throws {
  let a = try RuntimeDiscovery.createRuntimeDirectory()
  let b = try RuntimeDiscovery.createRuntimeDirectory()
