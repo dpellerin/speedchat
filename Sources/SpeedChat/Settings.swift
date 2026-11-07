@@ -117,7 +117,9 @@ struct SettingsView:View {
     HStack {
      Text("Launch at login")
      Spacer()
-     Toggle("",isOn:Binding(get:{preferences.loginEnabled},set:preferences.setLogin)).labelsHidden().toggleStyle(.switch)
+     // An explicit closure avoids Swift IRGen crashing on the actor-isolated
+     // method-reference thunk (SmallVector unable to grow).
+     Toggle("",isOn:Binding(get:{preferences.loginEnabled},set:{preferences.setLogin($0)})).labelsHidden().toggleStyle(.switch)
     }
     Text(preferences.loginStatus).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)
    }

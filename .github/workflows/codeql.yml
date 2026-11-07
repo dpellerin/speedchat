@@ -1,0 +1,94 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '23 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Native tests and app package
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      # Keep CI off the moving macos-latest / Xcode 26.6 Swift 6.3.3
+      # toolchain that crashes in Settings.swift during IR generation.
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify native toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          swift --version
+      - name: Run all Swift tests
+        run: scripts/test.sh
+      - name: Build, sign, and package the app without installing it
+        run: scripts/package-release.sh
+      - name: Exercise the packaged native app with the new-chat fixture
+        timeout-minutes: 5
+        run: dist/SpeedChat.app/Contents/MacOS/SpeedChat --ui-smoke --new-chat-smoke --smoke-output "$RUNNER_TEMP/speedchat-smoke"
+      - name: Save native fixture evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-smoke
+          path: ${{ runner.temp }}/speedchat-smoke
+          retention-days: 7
+          if-no-files-found: warn
+      - name: Save verified app package (not a published release)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SpeedChat-macos-arm64
+          path: dist/SpeedChat-macos-arm64.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  analyze:
+    name: Swift security analysis
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify native toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          swift --version
+      - name: Initialize Swift tracing
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: swift
+          build-mode: manual
+          queries: security-extended
+      - name: Compile the complete app under CodeQL tracing
+        # A fresh build path prevents an incremental build from yielding an empty
+        # database. Build SpeedChat and ChatCore, not a tests-only subset.
+        run: swift build --disable-sandbox --build-system native --arch arm64 --configuration release --scratch-path .build/codeql
+      - name: Analyze and upload Swift security results
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:swift
+          wait-for-processing: true

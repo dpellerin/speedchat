@@ -53,7 +53,7 @@ import ChatCore
    }
   }
   show()
-  if fixture {Task { @MainActor in try? await Task.sleep(for:.milliseconds(700));self.runUISmoke() }}
+  if fixture {Task { @MainActor in try? await Task.sleep(for:.milliseconds(700));await self.runUISmoke() }}
  }
  func applyPreferences() {store.codexOverride=preferences.codexPath;store.developerMetrics=preferences.metrics}
  func createMainMenu() {
