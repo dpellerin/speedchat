@@ -3,7 +3,7 @@ import Foundation
 import ChatCore
 
 extension AppDelegate {
- func runUISmoke() {
+ func runUISmoke() async {
   var checks=[[String:Any]]()
   func check(_ name:String,_ condition:Bool) {checks.append(["name":name,"passed":condition])}
   let fixture="""
@@ -17,6 +17,9 @@ extension AppDelegate {
    let coldComposer=panel.contentView.flatMap(composerIn)
    check("Opening focuses editable composer before backend ready",coldComposer != nil && panel.firstResponder === coldComposer && coldComposer?.isEditable == true)
    let ready=try JSONDecoder().decode(BridgeEvent.self,from:Data(fixture.utf8));store.session.receive(ready)
+   // SwiftUI mounts the new transcript on a later main-actor turn. Inspecting
+   // synchronously can see the previous empty tree on a cold CI launch.
+   try await Task.sleep(for:.milliseconds(400))
    panel.contentView?.layoutSubtreeIfNeeded();panel.displayIfNeeded()
    func findDrag(_ view:NSView)->HeaderDragView? {if let drag=view as? HeaderDragView {return drag};return view.subviews.lazy.compactMap(findDrag).first}
    check("Header stays compact",panel.contentView.flatMap(findDrag).map{$0.bounds.height <= 32} ?? false)
