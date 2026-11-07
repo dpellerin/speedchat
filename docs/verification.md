@@ -42,7 +42,14 @@ failed before analysis: Apple Swift 6.3.3 from Xcode 26.6 crashed during IR
 generation of `Sources/SpeedChat/Settings.swift` with `SmallVector unable to
 grow`. The failed analysis had zero rules; it did not establish security coverage.
 Advanced setup makes the toolchain and build explicit rather than silently
-following `macos-latest`.
+following `macos-latest`. [PR run 42388973184](https://github.com/dpellerin/speedchat/actions/runs/42388973184)
+also reproduced the same crash without CodeQL tracing on Swift 6.1.2 / Xcode
+16.4. This ruled out CodeQL tracing or the newest compiler alone as the cause.
+The failing IR symbol was the actor-isolated `Bool` method-reference thunk for
+the launch-at-login binding. Passing an explicit closure to `Binding` avoids
+that thunk without changing the login setting's behavior. Compiling the complete
+app in the native test job is the regression gate; the pre-fix job fails before
+any tests execute.
 
 - **Native tests and app package** runs the complete `scripts/test.sh` suite,
   builds and ad-hoc signs the release `.app` through `scripts/package-release.sh`,
