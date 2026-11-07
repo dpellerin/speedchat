@@ -30,6 +30,39 @@ SpeedChat is verified through two automated native layers:
      - Native clipboard copy (`NSPasteboard`, preserving/restoring user clipboard contents) and rejection of unsafe file URLs.
      - Non-scrolling Settings window fitting content cleanly and `Edit → Paste` (`⌘V`) menu wiring.
 
+## Continuous Verification and CodeQL
+
+The [CodeQL workflow](../.github/workflows/codeql.yml) runs on pull requests to
+`main`, pushes to `main`, a weekly schedule, and manual dispatch. It uses the
+standard `macos-15` Apple Silicon runner (included for this public repository),
+with Xcode 16.4 selected explicitly. Actions are pinned to release commit SHAs.
+
+The initial default-setup [run 42386781519](https://github.com/dpellerin/speedchat/actions/runs/42386781519)
+failed before analysis: Apple Swift 6.3.3 from Xcode 26.6 crashed during IR
+generation of `Sources/SpeedChat/Settings.swift` with `SmallVector unable to
+grow`. The failed analysis had zero rules; it did not establish security coverage.
+Advanced setup makes the toolchain and build explicit rather than silently
+following `macos-latest`.
+
+- **Native tests and app package** runs the complete `scripts/test.sh` suite,
+  builds and ad-hoc signs the release `.app` through `scripts/package-release.sh`,
+  and launches the real built executable with the existing `--new-chat-smoke`
+  fixture. This focused fixture deliberately does not claim the full UI smoke's
+  known provider-error-popover checks pass (see the UI notes above). The fixture
+  reports and packaged ZIP are retained as short-lived Actions artifacts. The
+  workflow does not install the app or publish/update a GitHub Release.
+- **Swift security analysis** initializes CodeQL in `manual` mode, compiles the
+  complete `SpeedChat` executable and `ChatCore` library for `arm64` in release
+  mode using a fresh `.build/codeql` path, then runs `security-extended` queries
+  and uploads results. No application files are excluded, build failures are not
+  ignored, and no precompiled build cache bypasses extraction. Only this job has
+  `security-events: write`; repository contents remain read-only.
+
+When updating the toolchain, require both jobs to pass and confirm the newest
+`main` analysis has no error and a nonzero `rules_count` in the code-scanning
+API. Do not re-enable default setup alongside this advanced workflow. GitHub
+supports manual [`swift build` extraction](https://docs.github.com/en/code-security/reference/code-scanning/codeql/build-options-for-compiled-languages#customizing-swift-compilation-in-a-codeql-analysis-workflow).
+
 ## Live Beam Verification
 
 The native OpenRouter client was exercised with generic diagnostic prompts using a real configured account: a first turn returned `READY.`, a follow-up with preserved reasoning returned `ORCHARD.`, and continuation of the same visible history without old reasoning returned `ORCHARD` via quoted-context migration. The user's existing conversation was not resent for these diagnostics. Restart persistence and provider-switch isolation are covered by automated tests, not a live account restart test.
