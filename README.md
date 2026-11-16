@@ -23,7 +23,7 @@ Zero external dependencies, zero external Swift packages, and no Electron/WebVie
   - Compact, draggable, resizable `NSPanel` with semantic light/dark appearance (clean white chat surface in light mode, native contrast in dark mode).
   - Joins all Spaces and works over fullscreen apps; stays open when it loses focus. Dismiss it with Escape or Command-W while keeping your draft, conversation, and warm backend ready.
   - Native selectable prose, code blocks with one-click copy, and readable Unicode math normalization.
-  - The menu-bar bubble includes **About SpeedChat**, which shows the version, build number, and the time the app bundle was built.
+  - The menu-bar bubble includes **About SpeedChat**, which shows the version, build number, the time the app bundle was built, and the copyright notice from the bundle.
 
 ---
 

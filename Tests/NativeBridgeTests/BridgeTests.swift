@@ -137,14 +137,16 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
 }
 @Test func aboutInfoFormatsVersionBuildAndRealTimestamp() {
  let stamped=AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"2026-11-16T03:07:00Z")
- #expect(stamped == AboutInfo(name:"SpeedChat",versionLine:"Version 1.1.5 (7)",buildDateLine:"Built Nov 16, 2026, 3:07 AM UTC"))
+ #expect(stamped == AboutInfo(name:"SpeedChat",versionLine:"Version 1.1.5 (7)",buildDateLine:"Built Nov 16, 2026, 3:07 AM UTC",copyright:nil))
+ #expect(AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"2026-11-16T03:07:00Z",copyright:"  Copyright © 2026 Dana Pellerin  ").copyright == "Copyright © 2026 Dana Pellerin")
+ #expect(AboutInfo.make(name:"SpeedChat",version:nil,build:nil,buildDate:nil,copyright:"   ").copyright == nil)
  let shifted=AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"  2026-11-16T03:07:00-08:00 ")
  #expect(shifted.buildDateLine == "Built Nov 16, 2026, 11:07 AM UTC")
  let versionOnly=AboutInfo.make(name:"SpeedChat",version:"1.2.0",build:" ",buildDate:"")
  #expect(versionOnly.versionLine == "Version 1.2.0")
  #expect(versionOnly.buildDateLine == "Development build")
  let missing=AboutInfo.make(name:" ",version:nil,build:nil,buildDate:nil)
- #expect(missing == AboutInfo(name:"SpeedChat",versionLine:"Development",buildDateLine:"Development build"))
+ #expect(missing == AboutInfo(name:"SpeedChat",versionLine:"Development",buildDateLine:"Development build",copyright:nil))
  let unreadable=AboutInfo.make(name:nil,version:"1.1.5",build:"7",buildDate:"yesterday")
  #expect(unreadable.versionLine == "Version 1.1.5 (7)")
  #expect(unreadable.buildDateLine == "Build date unavailable")
@@ -168,9 +170,10 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
  <key>CFBundleShortVersionString</key><string>9.9.9</string>
  <key>CFBundleVersion</key><string>42</string>
  <key>SpeedChatBuildDate</key><string>2026-01-02T15:04:00Z</string>
+ <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Dana Pellerin</string>
  </dict></plist>
  """)
- #expect(AboutInfo.current(bundle:stamped) == AboutInfo(name:"SpeedChat",versionLine:"Version 9.9.9 (42)",buildDateLine:"Built Jan 2, 2026, 3:04 PM UTC"))
+ #expect(AboutInfo.current(bundle:stamped) == AboutInfo(name:"SpeedChat",versionLine:"Version 9.9.9 (42)",buildDateLine:"Built Jan 2, 2026, 3:04 PM UTC",copyright:"Copyright © 2026 Dana Pellerin"))
  let development=try bundle("about-dev","""
  <?xml version="1.0" encoding="UTF-8"?>
  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -178,5 +181,5 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
  <key>CFBundleName</key><string>SpeedChat Dev</string>
  </dict></plist>
  """)
- #expect(AboutInfo.current(bundle:development) == AboutInfo(name:"SpeedChat Dev",versionLine:"Development",buildDateLine:"Development build"))
+ #expect(AboutInfo.current(bundle:development) == AboutInfo(name:"SpeedChat Dev",versionLine:"Development",buildDateLine:"Development build",copyright:nil))
 }

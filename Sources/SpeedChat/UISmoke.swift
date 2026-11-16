@@ -98,7 +98,8 @@ extension AppDelegate {
    let bundleVersion=(Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String) ?? ""
    let bundleBuild=(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String) ?? ""
    let stamped=(Bundle.main.object(forInfoDictionaryKey:"SpeedChatBuildDate") as? String) ?? ""
-   check("About window shows the bundled version and build time",aboutWindow?.isVisible == true && aboutWindow?.isKeyWindow == true && aboutWindow?.title == "About SpeedChat" && !bundleVersion.isEmpty && about.versionLine.contains(bundleVersion) && about.versionLine.contains("(\(bundleBuild))") && AboutInfo.parseBuildDate(stamped) != nil && about.buildDateLine.hasPrefix("Built "))
+   let copyright=(Bundle.main.object(forInfoDictionaryKey:"NSHumanReadableCopyright") as? String)?.trimmingCharacters(in:.whitespacesAndNewlines) ?? ""
+   check("About window shows the bundled version, build time, and copyright",aboutWindow?.isVisible == true && aboutWindow?.isKeyWindow == true && aboutWindow?.title == "About SpeedChat" && !bundleVersion.isEmpty && about.versionLine.contains(bundleVersion) && about.versionLine.contains("(\(bundleBuild))") && AboutInfo.parseBuildDate(stamped) != nil && about.buildDateLine.hasPrefix("Built ") && !copyright.isEmpty && about.copyright == copyright)
    aboutWindow?.orderOut(nil)
    show()
    let warm=store.warmReopens;store.bridge=BridgeProcess();hide();show();check("Reopen reuses bridge",store.warmReopens == warm+1);store.stop()
