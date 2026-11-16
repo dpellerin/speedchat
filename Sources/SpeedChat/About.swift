@@ -11,14 +11,18 @@ struct AboutInfo:Equatable {
   formatter.formatOptions=[.withInternetDateTime]
   return formatter.date(from:raw.trimmingCharacters(in:.whitespacesAndNewlines))
  }
- static func formatBuildDate(_ date:Date)->String {
+ static func formatBuildDate(_ date:Date,timeZone:TimeZone = .current,locale:Locale = .current)->String {
   let formatter=DateFormatter()
-  formatter.locale=Locale(identifier:"en_US_POSIX")
-  formatter.timeZone=TimeZone(secondsFromGMT:0)
-  formatter.dateFormat="MMM d, yyyy, h:mm a"
-  return formatter.string(from:date)+" UTC"
+  formatter.locale=locale
+  formatter.timeZone=timeZone
+  formatter.dateStyle=.medium
+  formatter.timeStyle=.short
+  let formatted=formatter.string(from:date)
+  let zone=timeZone.abbreviation(for:date).flatMap{$0.isEmpty ? nil : $0} ?? timeZone.identifier
+  if formatted.hasSuffix(" "+zone) {return formatted}
+  return formatted+" "+zone
  }
- static func make(name:String?,version:String?,build:String?,buildDate:String?,copyright:String?=nil)->AboutInfo {
+ static func make(name:String?,version:String?,build:String?,buildDate:String?,copyright:String?=nil,timeZone:TimeZone = .current,locale:Locale = .current)->AboutInfo {
   func cleaned(_ value:String?)->String? {
    let trimmed=value?.trimmingCharacters(in:.whitespacesAndNewlines) ?? ""
    return trimmed.isEmpty ? nil : trimmed
@@ -31,14 +35,14 @@ struct AboutInfo:Equatable {
   else if let versionText {versionLine="Version \(versionText)"}
   else {versionLine="Development"}
   let buildDateLine:String
-  if let raw=cleaned(buildDate),let date=parseBuildDate(raw) {buildDateLine="Built \(formatBuildDate(date))"}
+  if let raw=cleaned(buildDate),let date=parseBuildDate(raw) {buildDateLine="Built \(formatBuildDate(date,timeZone:timeZone,locale:locale))"}
   else if cleaned(buildDate) != nil {buildDateLine="Build date unavailable"}
   else {buildDateLine="Development build"}
   return AboutInfo(name:resolvedName,versionLine:versionLine,buildDateLine:buildDateLine,copyright:cleaned(copyright))
  }
- static func current(bundle:Bundle = .main)->AboutInfo {
+ static func current(bundle:Bundle = .main,timeZone:TimeZone = .current,locale:Locale = .current)->AboutInfo {
   func string(_ key:String)->String? {bundle.object(forInfoDictionaryKey:key) as? String}
-  return make(name:string("CFBundleDisplayName") ?? string("CFBundleName"),version:string("CFBundleShortVersionString"),build:string("CFBundleVersion"),buildDate:string("SpeedChatBuildDate"),copyright:string("NSHumanReadableCopyright"))
+  return make(name:string("CFBundleDisplayName") ?? string("CFBundleName"),version:string("CFBundleShortVersionString"),build:string("CFBundleVersion"),buildDate:string("SpeedChatBuildDate"),copyright:string("NSHumanReadableCopyright"),timeZone:timeZone,locale:locale)
  }
 }
 struct AboutView:View {
@@ -55,7 +59,7 @@ struct AboutView:View {
   .multilineTextAlignment(.center)
   .padding(.horizontal,24)
   .padding(.vertical,20)
-  .frame(width:300)
+  .frame(width:340)
   .fixedSize(horizontal:false,vertical:true)
  }
 }

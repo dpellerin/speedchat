@@ -135,13 +135,25 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
  #expect(AppDelegate.statusMenuSpec.map(\.key) == ["","n",",","","q"])
  #expect(AppDelegate.statusMenuSpec.map(\.action) == [#selector(AppDelegate.showFromMenu),#selector(AppDelegate.newChat),#selector(AppDelegate.showSettings),#selector(AppDelegate.showAbout),#selector(AppDelegate.quit)])
 }
-@Test func aboutInfoFormatsVersionBuildAndRealTimestamp() {
- let stamped=AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"2026-11-16T03:07:00Z")
- #expect(stamped == AboutInfo(name:"SpeedChat",versionLine:"Version 1.1.5 (7)",buildDateLine:"Built Nov 16, 2026, 3:07 AM UTC",copyright:nil))
- #expect(AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"2026-11-16T03:07:00Z",copyright:"  Copyright © 2026 Dana Pellerin  ").copyright == "Copyright © 2026 Dana Pellerin")
+private func visibleDate(_ value:String)->String {
+ value.replacingOccurrences(of:"\u{202F}",with:" ").replacingOccurrences(of:"\u{00A0}",with:" ")
+}
+@Test func aboutInfoFormatsVersionBuildAndRealTimestamp() throws {
+ let pacific=try #require(TimeZone(identifier:"America/Los_Angeles"))
+ let eastern=try #require(TimeZone(identifier:"America/New_York"))
+ let locale=Locale(identifier:"en_US")
+ func shown(_ raw:String,_ zone:TimeZone)->String {
+  visibleDate(AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:raw,timeZone:zone,locale:locale).buildDateLine)
+ }
+ let stamped=AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"2026-11-16T03:34:00Z",timeZone:pacific,locale:locale)
+ #expect(stamped.versionLine == "Version 1.1.5 (7)")
+ #expect(stamped.copyright == nil)
+ #expect(visibleDate(stamped.buildDateLine) == "Built Nov 15, 2026 at 7:34 PM PST")
+ #expect(shown("2026-11-16T03:07:00Z",eastern) == "Built Nov 15, 2026 at 10:07 PM EST")
+ #expect(shown("2026-07-16T02:34:00Z",pacific) == "Built Jul 15, 2026 at 7:34 PM PDT")
+ #expect(AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"2026-11-16T03:07:00Z",copyright:"  Copyright © 2026 Dana Pellerin  ",timeZone:pacific,locale:locale).copyright == "Copyright © 2026 Dana Pellerin")
  #expect(AboutInfo.make(name:"SpeedChat",version:nil,build:nil,buildDate:nil,copyright:"   ").copyright == nil)
- let shifted=AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"  2026-11-16T03:07:00-08:00 ")
- #expect(shifted.buildDateLine == "Built Nov 16, 2026, 11:07 AM UTC")
+ #expect(shown("  2026-11-16T03:07:00-08:00 ",pacific) == "Built Nov 16, 2026 at 3:07 AM PST")
  let versionOnly=AboutInfo.make(name:"SpeedChat",version:"1.2.0",build:" ",buildDate:"")
  #expect(versionOnly.versionLine == "Version 1.2.0")
  #expect(versionOnly.buildDateLine == "Development build")
@@ -173,7 +185,12 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
  <key>NSHumanReadableCopyright</key><string>Copyright © 2026 Dana Pellerin</string>
  </dict></plist>
  """)
- #expect(AboutInfo.current(bundle:stamped) == AboutInfo(name:"SpeedChat",versionLine:"Version 9.9.9 (42)",buildDateLine:"Built Jan 2, 2026, 3:04 PM UTC",copyright:"Copyright © 2026 Dana Pellerin"))
+ let pacific=try #require(TimeZone(identifier:"America/Los_Angeles"))
+ let info=AboutInfo.current(bundle:stamped,timeZone:pacific,locale:Locale(identifier:"en_US"))
+ #expect(info.name == "SpeedChat")
+ #expect(info.versionLine == "Version 9.9.9 (42)")
+ #expect(visibleDate(info.buildDateLine) == "Built Jan 2, 2026 at 7:04 AM PST")
+ #expect(info.copyright == "Copyright © 2026 Dana Pellerin")
  let development=try bundle("about-dev","""
  <?xml version="1.0" encoding="UTF-8"?>
  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
