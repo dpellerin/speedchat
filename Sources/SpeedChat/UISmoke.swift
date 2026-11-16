@@ -93,6 +93,16 @@ extension AppDelegate {
     check("Edit menu enables Command-V paste in Settings fields",hasPasteMenu)
    } else {check("Settings window has no scroll bar and fits content",false)}
    settingsWindow?.orderOut(nil)
+   showAbout()
+   let about=AboutInfo.current()
+   let bundleVersion=(Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String) ?? ""
+   let bundleBuild=(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String) ?? ""
+   let stamped=(Bundle.main.object(forInfoDictionaryKey:"SpeedChatBuildDate") as? String) ?? ""
+   let built=AboutInfo.parseBuildDate(stamped)
+   let zone=built.flatMap{TimeZone.current.abbreviation(for:$0)} ?? ""
+   let copyright=(Bundle.main.object(forInfoDictionaryKey:"NSHumanReadableCopyright") as? String)?.trimmingCharacters(in:.whitespacesAndNewlines) ?? ""
+   check("About window shows the bundled version, local build time, and copyright",aboutWindow?.isVisible == true && aboutWindow?.isKeyWindow == true && aboutWindow?.title == "About SpeedChat" && !bundleVersion.isEmpty && about.versionLine.contains(bundleVersion) && about.versionLine.contains("(\(bundleBuild))") && built != nil && about.buildDateLine.hasPrefix("Built ") && !zone.isEmpty && about.buildDateLine.contains(zone) && !copyright.isEmpty && about.copyright == copyright)
+   aboutWindow?.orderOut(nil)
    show()
    let warm=store.warmReopens;store.bridge=BridgeProcess();hide();show();check("Reopen reuses bridge",store.warmReopens == warm+1);store.stop()
    store.session.receive(ready);store.focusToken += 1

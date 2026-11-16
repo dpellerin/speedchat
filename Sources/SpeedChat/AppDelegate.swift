@@ -13,6 +13,7 @@ import ChatCore
  let hotkey=GlobalHotKey()
  var panel:FloatingPanel!
  var settingsWindow:NSWindow?
+ var aboutWindow:NSWindow?
  var statusItem:NSStatusItem?
  var keyMonitor:Any?
  let fixture=CommandLine.arguments.contains("--ui-smoke")
@@ -79,6 +80,13 @@ import ChatCore
   editItem.submenu=editMenu
   NSApp.mainMenu=mainMenu
  }
+ static let statusMenuSpec:[(title:String,action:Selector,key:String)]=[
+  ("Show SpeedChat",#selector(showFromMenu),""),
+  ("New Chat",#selector(newChat),"n"),
+  ("Settings…",#selector(showSettings),","),
+  ("About SpeedChat",#selector(showAbout),""),
+  ("Quit SpeedChat",#selector(quit),"q")
+ ]
  func createMenu() {
   statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength)
   let menuIcon:NSImage?={
@@ -95,10 +103,10 @@ import ChatCore
    statusItem?.button?.image=NSImage(systemSymbolName:"bubble.left.and.bubble.right",accessibilityDescription:"SpeedChat")
   }
   let menu=NSMenu()
-  for (title,selector,key) in [("Show SpeedChat",#selector(showFromMenu),""),("New Chat",#selector(newChat),"n"),("Settings…",#selector(showSettings),",")] {
-   let item=NSMenuItem(title:title,action:selector,keyEquivalent:key);item.target=self;menu.addItem(item)
+  for spec in Self.statusMenuSpec {
+   if spec.action == #selector(quit) {menu.addItem(.separator())}
+   let item=NSMenuItem(title:spec.title,action:spec.action,keyEquivalent:spec.key);item.target=self;menu.addItem(item)
   }
-  menu.addItem(.separator());let quit=NSMenuItem(title:"Quit SpeedChat",action:#selector(quit),keyEquivalent:"q");quit.target=self;menu.addItem(quit)
   statusItem?.menu=menu
  }
  @objc func showFromMenu() {show()}
@@ -137,6 +145,16 @@ import ChatCore
    hosting.layoutSubtreeIfNeeded();settingsWindow?.setContentSize(hosting.fittingSize)
   }
   NSApp.activate(ignoringOtherApps:true);settingsWindow?.makeKeyAndOrderFront(nil)
+ }
+ @objc func showAbout() {
+  if aboutWindow == nil {
+   let hosting=NSHostingView(rootView:AboutView(info:.current()))
+   hosting.layoutSubtreeIfNeeded()
+   let size=hosting.fittingSize
+   let window=NSWindow(contentRect:NSRect(origin:.zero,size:size),styleMask:[.titled,.closable],backing:.buffered,defer:false)
+   window.title="About SpeedChat";window.isReleasedWhenClosed=false;window.isRestorable=false;window.contentView=hosting;window.setContentSize(size);window.center();aboutWindow=window
+  }
+  NSApp.activate(ignoringOtherApps:true);aboutWindow?.makeKeyAndOrderFront(nil)
  }
  @objc func quit() {NSApp.terminate(nil)}
  func windowShouldClose(_ sender:NSWindow)->Bool {if sender === panel {hide();return false};return true}

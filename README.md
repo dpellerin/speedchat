@@ -23,6 +23,7 @@ Zero external dependencies, zero external Swift packages, and no Electron/WebVie
   - Compact, draggable, resizable `NSPanel` with semantic light/dark appearance (clean white chat surface in light mode, native contrast in dark mode).
   - Joins all Spaces and works over fullscreen apps; stays open when it loses focus. Dismiss it with Escape or Command-W while keeping your draft, conversation, and warm backend ready.
   - Native selectable prose, code blocks with one-click copy, and readable Unicode math normalization.
+  - The menu-bar bubble includes **About SpeedChat**, which shows the version, build number, the time the app bundle was built in the local time zone, and the copyright notice from the bundle.
 
 ---
 
@@ -80,9 +81,9 @@ scripts/smoke-ui.sh
 scripts/install-app.sh
 ```
 
-- `scripts/build-app.sh` compiles the release Swift executable, renders the `.icns` app icon natively with AppKit, bundles resources into `dist/SpeedChat.app`, and applies an ad-hoc code signature for local personal use.
+- `scripts/build-app.sh` compiles the release Swift executable, renders the `.icns` app icon natively with AppKit, bundles resources into `dist/SpeedChat.app`, stamps `SpeedChatBuildDate` in Info.plist with the UTC build time, and applies an ad-hoc code signature for local personal use. A launch without that key (for example an unpackaged `swift run`) shows a development build instead of a placeholder date.
 - `scripts/install-app.sh` validates the bundle signature and identifier (`local.speedchat`), stages the update, gracefully quits any running instance, retains a rollback copy (`SpeedChat.previous.app`), installs `/Applications/SpeedChat.app`, and launches it without altering your saved chats, preferences, or login items.
-- `scripts/package-release.sh` builds and packages `dist/SpeedChat-macos-arm64.zip` (with SHA-256 checksum) for attaching to a GitHub Release.
+- `scripts/package-release.sh` builds and packages `dist/SpeedChat-macos-arm64.zip` (with SHA-256 checksum) for attaching to a GitHub Release. Packaging uses `scripts/build-app.sh`, so the zip includes the same build timestamp, and it stops if that timestamp is missing.
 
 To run directly from the checkout without installing to `/Applications`:
 
