@@ -4,7 +4,7 @@
 
 SpeedChat is verified through two automated native layers:
 
-1. **Swift Testing Suite (`45/45 passing`)** — `scripts/test.sh`
+1. **Swift Testing Suite** — `scripts/test.sh`
    - **Standalone OpenRouter → Codex Handoff**: Restores a local `openrouter-…` conversation with either provider selected, creates a real Codex thread before sending, preserves visible history without forwarding private reasoning, persists the replacement ID, and avoids repeating history on subsequent turns. Failed or malformed thread creation preserves history and allows retry. These checks use a fake transport; the installed app and the user's saved chat are not changed by the tests.
    - **Beam Reasoning Continuity**: Replays private reasoning across follow-ups and restarts, keeps it out of visible responses and other providers, and supplies legacy/mixed-model history as quoted context rather than fabricating reasoning or disabling provider validation.
    - **Provider Error Diagnostics**: Retains HTTP status, provider name, nested upstream error messages, and typed error metadata for HTTP and SSE errors; prevents OpenRouter errors from being rewritten as Codex errors.
@@ -16,6 +16,7 @@ SpeedChat is verified through two automated native layers:
    - **Framing & Security Policy**: Tests `JSONLFramer` across arbitrary UTF-8 byte chunks and truncated EOF, and `LinkPolicy` validation (allowing only `http`/`https` URLs with a valid host and no credentials or control characters).
    - **Session & Keyboard State Machine**: Verifies `ChatSession` busy gating, `modelsUpdated` hot-reloading, `ChatModel.isOpenRouter` classification, and `KeyboardPolicy` (`↵` send, `⇧↵` newline, `Esc` stop/dismiss, `⌘W` dismiss without interrupting active streams, `⌘N`/`⌃N` new chat, `Page Up`/`Page Down`).
    - **Subprocess & Preferences Integration**: Tests cooperative Codex subprocess close timing, server tool refusal over stdio, symlinked executable discovery, and `Preferences` OpenRouter configuration persistence with `0600` permissions.
+   - **About Panel**: Formats the menu-bar About window from `CFBundleDisplayName` / `CFBundleName`, `CFBundleShortVersionString`, `CFBundleVersion`, and the build-time `SpeedChatBuildDate`. Missing version or date stays a development label; an unreadable date says the build date is unavailable. The status-menu titles and key equivalents, including the unchanged Settings, New Chat, and Quit shortcuts, are locked by the same suite.
 
 2. **Native UI Fixture Smoke** — `scripts/smoke-ui.sh`
    - **New Chat Transcript Reset**: Rebuilds the scroll container whenever a conversation loads. The focused run passed 24 checks, including five resets from a scrolled conversation at 580-point width and replies arriving while hidden. Run `dist/SpeedChat.app/Contents/MacOS/SpeedChat --ui-smoke --new-chat-smoke --smoke-output /tmp/speedchat-new-chat` after building. The full v1.1.4 fixture passed 30/32 checks. Its two provider-error popover checks still failed, matching the limitation reported for v1.1.3; all five new-chat checks passed.
@@ -29,6 +30,7 @@ SpeedChat is verified through two automated native layers:
      - Pixel-based link hover alignment against actual SwiftUI-rendered glyphs after multiple paragraphs, plus single-line, wrapped, and heading links at panel widths of 580 and 790 points. The regression caught TextKit line-height drift and mismatched heading font/padding; it does not synthesize a physical mouse click or open a browser.
      - Native clipboard copy (`NSPasteboard`, preserving/restoring user clipboard contents) and rejection of unsafe file URLs.
      - Non-scrolling Settings window fitting content cleanly and `Edit → Paste` (`⌘V`) menu wiring.
+     - About window opens with the running bundle's version, build number, and `SpeedChatBuildDate` stamp.
 
 ## Continuous Verification and CodeQL
 

@@ -93,6 +93,13 @@ extension AppDelegate {
     check("Edit menu enables Command-V paste in Settings fields",hasPasteMenu)
    } else {check("Settings window has no scroll bar and fits content",false)}
    settingsWindow?.orderOut(nil)
+   showAbout()
+   let about=AboutInfo.current()
+   let bundleVersion=(Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String) ?? ""
+   let bundleBuild=(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String) ?? ""
+   let stamped=(Bundle.main.object(forInfoDictionaryKey:"SpeedChatBuildDate") as? String) ?? ""
+   check("About window shows the bundled version and build time",aboutWindow?.isVisible == true && aboutWindow?.isKeyWindow == true && aboutWindow?.title == "About SpeedChat" && !bundleVersion.isEmpty && about.versionLine.contains(bundleVersion) && about.versionLine.contains("(\(bundleBuild))") && AboutInfo.parseBuildDate(stamped) != nil && about.buildDateLine.hasPrefix("Built "))
+   aboutWindow?.orderOut(nil)
    show()
    let warm=store.warmReopens;store.bridge=BridgeProcess();hide();show();check("Reopen reuses bridge",store.warmReopens == warm+1);store.stop()
    store.session.receive(ready);store.focusToken += 1

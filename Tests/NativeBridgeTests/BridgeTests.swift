@@ -130,3 +130,53 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
  reloaded.removeOpenRouterModel("meta/muse-spark-open")
  #expect(!reloaded.openRouterModels.contains{$0.model == "meta/muse-spark-open"})
 }
+@Test @MainActor func statusMenuKeepsShortcutsAndAddsAbout() {
+ #expect(AppDelegate.statusMenuSpec.map(\.title) == ["Show SpeedChat","New Chat","Settings…","About SpeedChat","Quit SpeedChat"])
+ #expect(AppDelegate.statusMenuSpec.map(\.key) == ["","n",",","","q"])
+ #expect(AppDelegate.statusMenuSpec.map(\.action) == [#selector(AppDelegate.showFromMenu),#selector(AppDelegate.newChat),#selector(AppDelegate.showSettings),#selector(AppDelegate.showAbout),#selector(AppDelegate.quit)])
+}
+@Test func aboutInfoFormatsVersionBuildAndRealTimestamp() {
+ let stamped=AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"2026-11-16T03:07:00Z")
+ #expect(stamped == AboutInfo(name:"SpeedChat",versionLine:"Version 1.1.5 (7)",buildDateLine:"Built Nov 16, 2026, 3:07 AM UTC"))
+ let shifted=AboutInfo.make(name:"SpeedChat",version:"1.1.5",build:"7",buildDate:"  2026-11-16T03:07:00-08:00 ")
+ #expect(shifted.buildDateLine == "Built Nov 16, 2026, 11:07 AM UTC")
+ let versionOnly=AboutInfo.make(name:"SpeedChat",version:"1.2.0",build:" ",buildDate:"")
+ #expect(versionOnly.versionLine == "Version 1.2.0")
+ #expect(versionOnly.buildDateLine == "Development build")
+ let missing=AboutInfo.make(name:" ",version:nil,build:nil,buildDate:nil)
+ #expect(missing == AboutInfo(name:"SpeedChat",versionLine:"Development",buildDateLine:"Development build"))
+ let unreadable=AboutInfo.make(name:nil,version:"1.1.5",build:"7",buildDate:"yesterday")
+ #expect(unreadable.versionLine == "Version 1.1.5 (7)")
+ #expect(unreadable.buildDateLine == "Build date unavailable")
+}
+@Test func aboutInfoReadsInfoPlistAndOmitsMissingBuildDate() throws {
+ var roots=[URL]()
+ defer {for root in roots {try? FileManager.default.removeItem(at:root)}}
+ func bundle(_ name:String,_ plist:String) throws -> Bundle {
+  let root=FileManager.default.temporaryDirectory.appendingPathComponent(name+"-"+UUID().uuidString+".app")
+  try FileManager.default.createDirectory(at:root.appendingPathComponent("Contents"),withIntermediateDirectories:true)
+  roots.append(root)
+  try plist.write(to:root.appendingPathComponent("Contents/Info.plist"),atomically:true,encoding:.utf8)
+  return try #require(Bundle(url:root))
+ }
+ let stamped=try bundle("about-stamped","""
+ <?xml version="1.0" encoding="UTF-8"?>
+ <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+ <plist version="1.0"><dict>
+ <key>CFBundleDisplayName</key><string>SpeedChat</string>
+ <key>CFBundleName</key><string>Ignored</string>
+ <key>CFBundleShortVersionString</key><string>9.9.9</string>
+ <key>CFBundleVersion</key><string>42</string>
+ <key>SpeedChatBuildDate</key><string>2026-01-02T15:04:00Z</string>
+ </dict></plist>
+ """)
+ #expect(AboutInfo.current(bundle:stamped) == AboutInfo(name:"SpeedChat",versionLine:"Version 9.9.9 (42)",buildDateLine:"Built Jan 2, 2026, 3:04 PM UTC"))
+ let development=try bundle("about-dev","""
+ <?xml version="1.0" encoding="UTF-8"?>
+ <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+ <plist version="1.0"><dict>
+ <key>CFBundleName</key><string>SpeedChat Dev</string>
+ </dict></plist>
+ """)
+ #expect(AboutInfo.current(bundle:development) == AboutInfo(name:"SpeedChat Dev",versionLine:"Development",buildDateLine:"Development build"))
+}
