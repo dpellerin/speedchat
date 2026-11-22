@@ -29,6 +29,7 @@ public struct BridgeEvent: Codable, Sendable {
     public var name: String?
     public var durationMs: Double?
     public var busy: Bool?
+    public var codexRetry: CodexRetry?
     public init(
         type: String,
         messages: [ChatMessage]? = nil,
@@ -41,7 +42,8 @@ public struct BridgeEvent: Codable, Sendable {
         notice: String? = nil,
         name: String? = nil,
         durationMs: Double? = nil,
-        busy: Bool? = nil
+        busy: Bool? = nil,
+        codexRetry: CodexRetry? = nil
     ) {
         self.type = type
         self.messages = messages
@@ -55,10 +57,11 @@ public struct BridgeEvent: Codable, Sendable {
         self.name = name
         self.durationMs = durationMs
         self.busy = busy
+        self.codexRetry = codexRetry
     }
 }
 public struct ChatSession: Sendable {
- public enum Phase: Sendable { case offline,connecting,ready,sending,selecting,resetting }
+ public enum Phase: Sendable { case offline,connecting,ready,sending,selecting,resetting,checkingDelivery }
  public private(set) var phase: Phase = .offline
  public private(set) var messages=[ChatMessage]()
  public private(set) var transcriptID=UUID()
@@ -67,19 +70,43 @@ public struct ChatSession: Sendable {
  public private(set) var activeModel=""
  public private(set) var notice="Connecting…"
  public private(set) var lastRequest=""
+ private var lastRequestWasOpenRouter=false
+ private var activeCodexPromptId:String?
+ private var codexRetry:CodexRetry?
+ private var failureDetails:String?
  public private(set) var failed=false
  public private(set) var metrics=[String:Double]()
  public var canInteract: Bool { phase == .ready }
- public var busy: Bool { [.sending,.selecting,.resetting].contains(phase) }
+ private var selectedOpenRouter:Bool {
+  models.first(where:{$0.model == selectedModel})?.isOpenRouter ?? selectedModel.contains("/")
+ }
+ public var visibleCodexRetry:CodexRetry? {canInteract && !selectedOpenRouter ? codexRetry : nil}
+ public var canSend:Bool {
+  canInteract && (visibleCodexRetry == nil || visibleCodexRetry?.action == .retry)
+ }
+ public var canRetryOpenRouter:Bool {canInteract && failed && lastRequestWasOpenRouter && !lastRequest.isEmpty}
+ public var errorDetails:String {failureDetails ?? notice}
+ public var busy: Bool { [.sending,.selecting,.resetting,.checkingDelivery].contains(phase) }
  public var streaming: Bool { phase == .sending }
  public init() {}
  public mutating func connecting() {phase = .connecting;notice="Connecting…";failed=false}
  public mutating func offline(_ reason:String) {phase = .offline;notice=reason}
  public mutating func beginSend(_ source:String) -> String? {
   let text=source.trimmingCharacters(in:.whitespacesAndNewlines)
-  guard canInteract, !text.isEmpty else {return nil}
-  phase = .sending;notice="Thinking…";lastRequest=text;failed=false;activeModel=selectedModel
-  messages.append(ChatMessage(id:UUID().uuidString,role:"user",text:text));return text
+  guard canSend, !text.isEmpty else {return nil}
+  let id=UUID().uuidString.lowercased()
+  phase = .sending;notice="Thinking…";lastRequest=text;failed=false;failureDetails=nil;activeModel=selectedModel
+  lastRequestWasOpenRouter=selectedOpenRouter
+  activeCodexPromptId=selectedOpenRouter ? nil : id
+  messages.append(ChatMessage(id:id,role:"user",text:text));return text
+ }
+ public mutating func beginCodexRetry(resend:Bool) -> String? {
+  guard let retry=visibleCodexRetry,resend == (retry.action == .resend) else {return nil}
+  phase = retry.action == .checkDelivery ? .checkingDelivery : .sending
+  notice = retry.action == .retry ? "Thinking…" : "Checking Codex delivery…"
+  failed=false;failureDetails=nil;activeModel=selectedModel
+  activeCodexPromptId=retry.userMessageId
+  return retry.userMessageId
  }
  public mutating func beginNewChat() -> Bool {guard canInteract else {return false};phase = .resetting;notice="Starting a new chat…";return true}
  public mutating func beginModelChange(_ model:String) -> Bool {
@@ -90,23 +117,60 @@ public struct ChatSession: Sendable {
  public func shouldStopIdle(hidden:Bool,elapsed:TimeInterval) -> Bool {hidden && !busy && elapsed >= 300}
  public mutating func receive(_ event:BridgeEvent) {
   switch event.type {
-  case "ready": transcriptID=UUID();messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel;phase = .ready;notice=event.notice ?? "Ready";failed=false
+  case "ready":
+   transcriptID=UUID();messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel
+   phase = .ready;notice=event.notice ?? "Ready";failed=false;failureDetails=nil
+   lastRequest="";lastRequestWasOpenRouter=false;activeCodexPromptId=nil
+   updateCodexRetry(event.codexRetry)
+  case "conversationUpdated":
+   guard streaming || phase == .checkingDelivery else {return}
+   messages=event.messages ?? messages
+   phase = .ready;notice=event.notice ?? "Ready";failed=false;failureDetails=nil;activeCodexPromptId=nil
+   updateCodexRetry(event.codexRetry)
   case "modelsUpdated":
    models=event.models ?? models
    if let updated=event.model, !updated.isEmpty { selectedModel=updated; if !streaming { activeModel=updated } }
-  case "modelSelected": guard phase == .selecting else {return}; selectedModel=event.model ?? selectedModel;activeModel=selectedModel;phase = .ready;notice="Ready"
-  case "activeModel": if streaming {activeModel=event.model ?? activeModel}
+   updateCodexRetry(event.codexRetry)
+  case "modelSelected":
+   guard phase == .selecting else {return}
+   selectedModel=event.model ?? selectedModel;activeModel=selectedModel;phase = .ready;notice="Ready"
+   failed=failed && lastRequestWasOpenRouter && selectedOpenRouter;failureDetails=nil
+   updateCodexRetry(event.codexRetry)
+  case "activeModel":
+   if streaming {
+    activeModel=event.model ?? activeModel
+    if notice == "Checking Codex delivery…" {notice="Thinking…"}
+   }
   case "delta","message":
    guard streaming else {return}
    let id=event.itemId ?? "assistant"
    if let i=messages.firstIndex(where:{$0.id==id}) {if event.type == "delta" {messages[i].text += event.delta ?? ""} else {messages[i].text=event.text ?? ""}}
-   else {messages.append(ChatMessage(id:id,role:"assistant",text:event.type == "delta" ? event.delta ?? "" : event.text ?? ""))}
+   else {
+    let reply=ChatMessage(id:id,role:"assistant",text:event.type == "delta" ? event.delta ?? "" : event.text ?? "")
+    let anchor=activeCodexPromptId.flatMap {promptId in messages.firstIndex {$0.id == promptId && $0.role == "user"}}
+    let nextUser=anchor.flatMap {messages[($0+1)...].firstIndex {$0.role == "user"}}
+    messages.insert(reply,at:nextUser ?? messages.count)
+   }
   case "searching": if streaming {notice="Searching the web…"}
-  case "done": guard streaming else {return};phase = .ready;if !failed {notice="Ready"}
-  case "error": guard phase != .offline else {return}; failed=true;notice=event.message ?? "Something went wrong.";phase = phase == .connecting ? .offline : (event.busy == true ? .sending : .ready)
+  case "done":
+   guard streaming else {return}
+   phase = .ready;activeCodexPromptId=nil;if !failed {notice="Ready"}
+   updateCodexRetry(event.codexRetry)
+  case "error":
+   guard phase != .offline else {return}
+   failed=true;notice=event.message ?? "Something went wrong.";failureDetails=notice
+   phase = phase == .connecting ? .offline : (event.busy == true ? .sending : .ready)
+   updateCodexRetry(event.codexRetry)
   case "fatal": failed=true;offline(event.message ?? "The backend disconnected.")
   case "metric": if let name=event.name,let ms=event.durationMs {metrics[name]=ms}
   default: break
   }
+ }
+ private mutating func updateCodexRetry(_ retry:CodexRetry?) {
+  codexRetry=retry
+  guard let visible=visibleCodexRetry else {return}
+  failed=true
+  if let warning=visible.notice {notice=warning}
+  else if failureDetails == nil {notice="Codex did not receive this message. Retry to send it."}
  }
 }

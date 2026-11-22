@@ -200,3 +200,39 @@ private func visibleDate(_ value:String)->String {
  """)
  #expect(AboutInfo.current(bundle:development) == AboutInfo(name:"SpeedChat Dev",versionLine:"Development",buildDateLine:"Development build",copyright:nil))
 }
+
+@MainActor @Test func panelChecksCodexDeliveryAndResendsOneVisibleMessage() throws {
+ let store=ChatStore()
+ store.fixtureMode=true
+ store.session.receive(BridgeEvent(type:"ready",model:"gpt-6-luna"))
+ store.draft="When does it open?"
+ store.send()
+ let prompt=try #require(store.session.messages.first)
+ #expect(store.fixtureCommands.last == ["type":"send","text":prompt.text,"itemId":prompt.id])
+
+ store.session.receive(BridgeEvent(type:"error",message:"turn/start timed out.",
+                                  codexRetry:CodexRetry(userMessageId:prompt.id,action:.checkDelivery)))
+ #expect(store.session.notice.contains("may already have received"))
+ store.retry()
+ #expect(store.fixtureCommands.last == ["type":"retryCodex","itemId":prompt.id])
+ #expect(store.session.messages == [prompt])
+
+ store.session.receive(BridgeEvent(type:"conversationUpdated",messages:[prompt],
+                                  codexRetry:CodexRetry(userMessageId:prompt.id,action:.resend)))
+ #expect(store.session.notice.contains("could duplicate"))
+ store.resend()
+ #expect(store.fixtureCommands.last == ["type":"resendCodex","itemId":prompt.id])
+ #expect(store.session.messages == [prompt])
+
+ store.session.receive(BridgeEvent(type:"error",message:"Codex reply failed after receipt."))
+ store.retry()
+ #expect(store.fixtureCommands.last?["type"] == "resendCodex")
+
+ store.session.receive(BridgeEvent(type:"ready",model:"example/router"))
+ store.draft="A router prompt"
+ store.send()
+ store.session.receive(BridgeEvent(type:"error",message:"OpenRouter request failed."))
+ store.retry()
+ #expect(store.fixtureCommands.suffix(2).allSatisfy { $0["type"] == "send" && $0["text"] == "A router prompt" })
+ #expect(store.session.messages.map(\.text) == ["A router prompt","A router prompt"])
+}

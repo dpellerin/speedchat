@@ -9,6 +9,7 @@ public struct PersistedState: Codable, Equatable, Sendable {
     public var updatedAt: String
     public var messages: [ChatMessage]?
     public var codexSyncedCount: Int?
+    var lastCodexSend: CodexSendAttempt?
 
     public init(
         version: Int = Self.currentVersion,
@@ -63,7 +64,7 @@ public enum StateStore {
             }
         }
         let codexSyncedCount = raw["codexSyncedCount"] as? Int
-        return PersistedState(
+        var state = PersistedState(
             version: PersistedState.currentVersion,
             threadId: threadId,
             model: model,
@@ -71,6 +72,11 @@ public enum StateStore {
             messages: validMessages,
             codexSyncedCount: codexSyncedCount
         )
+        if let attempt = raw["lastCodexSend"], JSONSerialization.isValidJSONObject(attempt),
+           let data = try? JSONSerialization.data(withJSONObject: attempt) {
+            state.lastCodexSend = try? JSONDecoder().decode(CodexSendAttempt.self, from: data)
+        }
+        return state
     }
 
     public static func save(
@@ -81,12 +87,25 @@ public enum StateStore {
         codexSyncedCount: Int? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) throws {
+        try save(threadId: threadId, model: model, to: url, messages: messages,
+                 codexSyncedCount: codexSyncedCount, lastCodexSend: nil, env: env)
+    }
+
+    static func save(
+        threadId: String,
+        model: String,
+        to url: URL?,
+        messages: [ChatMessage]?,
+        codexSyncedCount: Int?,
+        lastCodexSend: CodexSendAttempt?,
+        env: [String: String]
+    ) throws {
         let target = url ?? stateURL(env: env)
         let dir = target.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
 
-        let payload = PersistedState(
+        var payload = PersistedState(
             version: PersistedState.currentVersion,
             threadId: threadId,
             model: model,
@@ -94,6 +113,7 @@ public enum StateStore {
             messages: messages,
             codexSyncedCount: codexSyncedCount
         )
+        payload.lastCodexSend = lastCodexSend
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         var data = try encoder.encode(payload)

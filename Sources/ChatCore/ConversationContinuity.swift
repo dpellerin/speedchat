@@ -19,6 +19,7 @@ struct ConversationContinuity {
     var thread: Thread?
     var messages: [ChatMessage] = []
     var codexSyncedCount = 0
+    var lastCodexSend: CodexSendAttempt?
     var titleNeeded = false
     private var needsLegacyHistory = false
 
@@ -36,15 +37,39 @@ struct ConversationContinuity {
         thread = saved.threadId.hasPrefix("openrouter-") ? .standalone(saved.threadId) : .detached(saved.threadId)
         messages = saved.messages ?? []
         codexSyncedCount = min(max(saved.codexSyncedCount ?? 0, 0), messages.count)
+        if let attempt = saved.lastCodexSend, attempt.threadId == saved.threadId,
+           userIndex(messageId: attempt.userMessageId) != nil {
+            lastCodexSend = attempt
+        }
         needsLegacyHistory = saved.messages == nil
     }
 
-    mutating func recordCodexReceipt(_ attempt: CodexSendAttempt) -> Bool {
-        guard thread?.id == attempt.threadId,
-              attempt.syncedCount > 0, attempt.syncedCount <= messages.count else { return false }
-        let user = messages[attempt.syncedCount - 1]
-        guard user.id == attempt.userMessageId, user.role == "user" else { return false }
-        codexSyncedCount = max(codexSyncedCount, attempt.syncedCount)
+    mutating func recordCodexReceipt(_ attempt: CodexSendAttempt, turnId: String) -> Bool {
+        guard thread?.id == attempt.threadId, lastCodexSend?.clientId == attempt.clientId,
+              let anchor = userIndex(messageId: attempt.userMessageId) else { return false }
+        codexSyncedCount = max(codexSyncedCount, anchor + 1)
+        lastCodexSend?.turnId = turnId
+        lastCodexSend?.delivery = .confirmed
+        return true
+    }
+
+    @discardableResult
+    mutating func reconcileCodexSend(threadId: String, history: CodexHistory) -> Bool {
+        guard let attempt = lastCodexSend, attempt.threadId == threadId,
+              attempt.delivery != .rejected else { return false }
+
+        let matches = history.turns.flatMap { turn -> [(CodexHistory.Turn, String)] in
+            guard turn.isFull, let turnId = turn.id else { return [] }
+            return turn.items.compactMap { item in
+                guard let input = item.user, let itemId = input.id, !itemId.isEmpty,
+                      attempt.matchesReceipt(threadId: threadId, turnId: turnId,
+                                             clientId: input.clientId, wireText: input.wireText) else { return nil }
+                return (turn, itemId)
+            }
+        }
+        guard matches.count == 1, let (turn, itemId) = matches.first, let turnId = turn.id,
+              recordCodexReceipt(attempt, turnId: turnId) else { return false }
+        _ = recoverReplies(in: turn, threadId: threadId, after: itemId, for: attempt.userMessageId)
         return true
     }
 
@@ -65,11 +90,13 @@ struct ConversationContinuity {
         let inputsByClientId = Dictionary(grouping: inputs, by: \.clientId)
         let exchanges = history.turns.flatMap(\.exchanges)
         let repliesById = Dictionary(grouping: exchanges.flatMap(\.replies), by: \.id)
-        var recovered = false
+        var recovered = reconcileCodexSend(threadId: threadId, history: history)
         for exchange in exchanges {
             guard !exchange.replies.isEmpty,
                   exchange.replies.allSatisfy({ repliesById[$0.id]?.count == 1 }) else { continue }
             let input = exchange.input
+            if let attempt = lastCodexSend,
+               input.clientId == attempt.clientId || input.clientId == attempt.userMessageId { continue }
             let anchor: Int?
             if let id = input.id, !id.isEmpty,
                let clientId = input.clientId, !clientId.isEmpty, inputsByClientId[clientId]?.count == 1,
@@ -94,10 +121,26 @@ struct ConversationContinuity {
         return recoverReplies(exchange.replies, after: anchor)
     }
 
-    private func userIndex(messageId: String) -> Int? {
+    func userIndex(messageId: String) -> Int? {
         let matches = messages.indices.filter { messages[$0].id == messageId }
         guard matches.count == 1, let index = matches.first, messages[index].role == "user" else { return nil }
         return index
+    }
+
+    mutating func placeCodexReply(_ reply: ChatMessage, after userMessageId: String, followsConfirmedPrompt: Bool) {
+        if let index = messages.firstIndex(where: { $0.id == reply.id }) {
+            guard messages[index].role == "assistant" else { return }
+            messages[index] = reply
+            return
+        }
+        let nextUser = userIndex(messageId: userMessageId).flatMap { anchor in
+            messages[(anchor + 1)...].firstIndex { $0.role == "user" }
+        }
+        let index = nextUser ?? messages.count
+        messages.insert(reply, at: index)
+        if index < codexSyncedCount || (followsConfirmedPrompt && index == codexSyncedCount) {
+            codexSyncedCount += 1
+        }
     }
 
     private mutating func recoverReplies(_ replies: [ChatMessage], after userAnchor: Int?) -> Bool {
@@ -149,6 +192,7 @@ struct ConversationContinuity {
             to: url,
             messages: needsLegacyHistory && messages.isEmpty ? nil : messages,
             codexSyncedCount: codexSyncedCount,
+            lastCodexSend: lastCodexSend,
             env: env
         )
     }

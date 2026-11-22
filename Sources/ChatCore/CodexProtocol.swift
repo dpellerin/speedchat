@@ -31,10 +31,22 @@ public struct CodexRPCError: LocalizedError, @unchecked Sendable {
 
     public var errorDescription: String? { "\(message) (\(code))" }
 
+    func confirmsUnloadedThread(for threadId: String) -> Bool {
+        code == -32600 && message == "thread not found: \(threadId)"
+    }
+
+    var confirmsInputRejection: Bool {
+        code == -32602 && (data as? [String: Any])?["input_error_code"] as? String == "input_too_large"
+    }
+
     // Match the by-ID thread/resume response for a missing stored rollout.
     func confirmsMissingRollout(for threadId: String) -> Bool {
         code == -32600 && message == "no rollout found for thread id \(threadId)"
     }
+}
+
+struct CodexRequestNotSent: LocalizedError {
+    var errorDescription: String? { "Codex app-server is not running." }
 }
 
 public protocol CodexTransport: AnyObject, Sendable {
@@ -232,7 +244,7 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         let response: CodexPayload = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CodexPayload, Error>) in
             queue.async { [self] in
                 guard self.child != nil, self.input != nil else {
-                    continuation.resume(throwing: NSError(domain: "SpeedChat.Codex", code: -1, userInfo: [NSLocalizedDescriptionKey: "Codex app-server is not running."]))
+                    continuation.resume(throwing: CodexRequestNotSent())
                     return
                 }
                 let id = self.nextId

@@ -13,7 +13,12 @@ struct CodexHistory: Sendable {
                 guard part["type"] as? String == "text" else { return nil }
                 return part["text"] as? String
             }
-            wireText = parts.count == 1 ? text.first : nil
+            if parts.count == 1, let part = parts.first,
+               part["text_elements"] == nil || (part["text_elements"] as? [Any])?.isEmpty == true {
+                wireText = text.first
+            } else {
+                wireText = nil
+            }
             visibleText = text.joined(separator: "\n")
         }
 

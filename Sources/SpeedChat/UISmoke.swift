@@ -143,6 +143,29 @@ extension AppDelegate {
      })
      if let view=self.panel.contentView,let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds) {view.cacheDisplay(in:view.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/new-chat-\(reset).png"))}
     }
+    func accessibleElements(_ element:Any,depth:Int=0)->[any NSAccessibilityProtocol] {
+     guard depth < 30,let node=element as? any NSAccessibilityProtocol else {return []}
+     return [node]+(node.accessibilityChildren() ?? []).flatMap{accessibleElements($0,depth:depth+1)}
+    }
+    let pending=ChatMessage(id:"delivery-prompt",role:"user",text:"When does the orchard open?")
+    self.store.session.receive(BridgeEvent(type:"ready",messages:[pending],models:ready.models,model:"gpt-6-luna",
+                                          codexRetry:CodexRetry(userMessageId:pending.id,action:.checkDelivery)))
+    self.store.retry()
+    check("Retry checks delivery of the original prompt",
+          self.store.fixtureCommands.last == ["type":"retryCodex","itemId":pending.id] &&
+          self.store.session.messages == [pending])
+    self.store.session.receive(BridgeEvent(type:"conversationUpdated",messages:[pending],
+                                          codexRetry:CodexRetry(userMessageId:pending.id,action:.resend)))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    let warning="Codex may already have received this message. Sending it again could duplicate it."
+    check("Panel displays the uncertainty warning before resend",
+          self.panel.flatMap{accessibleElements($0).first{($0.accessibilityValue() as? String) == warning}} != nil)
+    self.store.resend()
+    check("Explicit resend dispatches the original prompt and preserves one row",
+          self.store.fixtureCommands.last == ["type":"resendCodex","itemId":pending.id] &&
+          self.store.session.messages == [pending])
+    self.store.session.receive(BridgeEvent(type:"done"))
     if CommandLine.arguments.contains("--new-chat-smoke") {
      let failures=checks.filter{($0["passed"] as? Bool) != true}.count
      let report:[String:Any]=["checks":checks,"passed":checks.count-failures,"failed":failures]
@@ -162,10 +185,6 @@ extension AppDelegate {
       self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
       check("Link hover matches \(name) text at width \(Int(width))",renderedLinkHoverMatches())
      }
-    }
-    func accessibleElements(_ element:Any,depth:Int=0)->[any NSAccessibilityProtocol] {
-     guard depth < 30,let node=element as? any NSAccessibilityProtocol else {return []}
-     return [node]+(node.accessibilityChildren() ?? []).flatMap{accessibleElements($0,depth:depth+1)}
     }
     let errorNotice="OpenRouter request failed (HTTP 400). "+String(repeating:"The provider rejected a request parameter. ",count:12)+"Diagnostic end marker."
     self.store.session.receive(BridgeEvent(type:"error",message:errorNotice))

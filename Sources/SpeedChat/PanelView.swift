@@ -253,16 +253,17 @@ struct PanelView:View {
        HStack {
         Text("Request failed").font(.headline)
         Spacer()
-        Button {NativeActions.copy(store.session.notice)} label:{Label("Copy",systemImage:"doc.on.doc")}.help("Copy full error").accessibilityLabel("Copy full error")
+        Button {NativeActions.copy(store.session.errorDetails)} label:{Label("Copy",systemImage:"doc.on.doc")}.help("Copy full error").accessibilityLabel("Copy full error")
        }
        ScrollView {
-        Text(store.session.notice).font(.callout).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading).fixedSize(horizontal:false,vertical:true)
+        Text(store.session.errorDetails).font(.callout).textSelection(.enabled).frame(maxWidth:.infinity,alignment:.leading).fixedSize(horizontal:false,vertical:true)
        }.frame(height:220)
       }.padding(16).frame(width:380)
      }
      .onChange(of:store.session.notice) {showingErrorDetails=false}
    }
-   if store.session.failed && store.session.canInteract && !store.session.lastRequest.isEmpty {Button("Retry",action:store.retry).controlSize(.small)}
+   if store.session.visibleCodexRetry?.action == .resend {Button("Resend",action:store.resend).controlSize(.small)}
+   else if store.session.visibleCodexRetry != nil || store.session.canRetryOpenRouter {Button("Retry",action:store.retry).controlSize(.small)}
    if store.session.phase == .offline {Button("Reconnect",action:store.connect).controlSize(.small).disabled(store.session.busy)}
   }
  }
@@ -272,7 +273,7 @@ struct PanelView:View {
     if store.draft.isEmpty {Text(store.session.streaming ? "Press Esc to stop" : "Message SpeedChat").foregroundStyle(.tertiary).padding(.leading,14).padding(.top,13).allowsHitTesting(false)}
     Composer(text:$store.draft,height:$store.composerHeight,enabled:true,focusToken:store.focusToken,send:store.send).frame(height:store.composerHeight)
    }
-   Button {if store.session.streaming {store.interrupt()} else {store.send()}} label:{Image(systemName:store.session.streaming ? "stop.fill" : "arrow.up").font(.system(size:15,weight:.semibold)).frame(width:30,height:30)}.buttonStyle(.borderedProminent).clipShape(Circle()).disabled(!store.session.streaming && (!store.session.canInteract || store.draft.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)).help(store.session.streaming ? "Stop response" : "Send message").padding(8)
+   Button {if store.session.streaming {store.interrupt()} else {store.send()}} label:{Image(systemName:store.session.streaming ? "stop.fill" : "arrow.up").font(.system(size:15,weight:.semibold)).frame(width:30,height:30)}.buttonStyle(.borderedProminent).clipShape(Circle()).disabled(!store.session.streaming && (!store.session.canSend || store.draft.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty)).help(store.session.streaming ? "Stop response" : "Send message").padding(8)
   }.background {RoundedRectangle(cornerRadius:16).fill(Color(nsColor:.textBackgroundColor).opacity(0.75))}.overlay(RoundedRectangle(cornerRadius:16).stroke(Color.secondary.opacity(0.2),lineWidth:1))
  }
  private var hints:some View {

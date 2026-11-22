@@ -12,6 +12,8 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
     var missingThreadId = false
     var threadStartModel = "gpt-6-luna"
     var resumeResult: Result<CodexPayload, Error> = .success(CodexPayload())
+    var readResult: Result<CodexPayload, Error> = .success(CodexPayload())
+    var turnStartError: Error?
     var holdTurnStart = false
     var holdSettings = false
     var holdFirstRename = false
@@ -107,6 +109,7 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
                 ],
             ]
         }
+        if method == "thread/read" { return try readResult.get().value }
         if method == "thread/resume" {
             return try resumeResult.get().value
         }
@@ -122,6 +125,7 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
             return ["thread": ["id": id], "model": threadStartModel]
         }
         if method == "turn/start" {
+            if let turnStartError { throw turnStartError }
             if (params["threadId"] as? String)?.hasPrefix("openrouter-") == true {
                 throw NSError(domain: "test", code: -32600, userInfo: [NSLocalizedDescriptionKey: "invalid thread id: expected UUID"])
             }
@@ -391,9 +395,9 @@ func restoredOpenRouterChatCanContinueOnCodex(savedModel: String) async throws {
     #expect(input.hasSuffix("What did I ask you to remember?"))
     let saved = try #require(StateStore.load(from: stateURL))
     #expect(saved.threadId == "dedicated")
-    #expect(saved.messages == history)
-    #expect(!rpc.calls.contains { ($0.params["threadId"] as? String)?.hasPrefix("openrouter-") == true })
     let clientId = try #require(turn.params["clientUserMessageId"] as? String)
+    #expect(saved.messages == history + [ChatMessage(id: clientId, role: "user", text: "What did I ask you to remember?")])
+    #expect(!rpc.calls.contains { ($0.params["threadId"] as? String)?.hasPrefix("openrouter-") == true })
     rpc.onNotification?(CodexNotification(method: "item/started", params: [
         "threadId": "dedicated", "turnId": "turn-1",
         "item": ["id": "codex-user", "type": "userMessage", "clientId": clientId,
@@ -851,6 +855,13 @@ func confirmedThreadLossUsesAReplacementWithSavedContext(lossAtConnect: Bool, re
     let renameCalls = rpc.calls.filter { $0.method == "thread/name/set" && ($0.params["name"] as? String) != "New chat" }
     #expect(renameCalls.last?.params["name"] as? String == "Plan a weekend trip to Yosemite")
     #expect(rpc.calls.contains(where: { $0.method == "turn/interrupt" }))
+    let started = try #require(rpc.calls.first { $0.method == "turn/start" })
+    let sentId = try #require(started.params["clientUserMessageId"] as? String)
+    let sentInput = try #require(started.params["input"] as? [[String: Any]])
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "dedicated", "turnId": "t1",
+        "item": ["id": "recorded-prompt", "type": "userMessage", "clientId": sentId, "content": sentInput],
+    ]))
 
     // Foreign and late events ignored; reroutes update active model; unknown tools & image tools handled
     final class EventCollector: @unchecked Sendable {
