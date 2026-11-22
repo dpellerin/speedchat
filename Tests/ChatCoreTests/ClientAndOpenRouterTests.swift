@@ -393,6 +393,12 @@ func restoredOpenRouterChatCanContinueOnCodex(savedModel: String) async throws {
     #expect(saved.threadId == "dedicated")
     #expect(saved.messages == history)
     #expect(!rpc.calls.contains { ($0.params["threadId"] as? String)?.hasPrefix("openrouter-") == true })
+    let clientId = try #require(turn.params["clientUserMessageId"] as? String)
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "dedicated", "turnId": "turn-1",
+        "item": ["id": "codex-user", "type": "userMessage", "clientId": clientId,
+                 "content": [["type": "text", "text": input]]],
+    ]))
     rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
         "threadId": "dedicated", "turn": ["id": "turn-1", "status": "completed"],
     ]))
@@ -444,6 +450,154 @@ private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
         continuation.finish()
     }
     return OpenRouterHTTPResponse(statusCode: 200, lines: lines)
+}
+
+@Test(arguments: ["timeout", "malformed response", "archived", "different ID", "different code", "transport error"])
+func retryResumesOriginalThreadAndSendsOnlyNewContext(failure: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-retry-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let history = [
+        ChatMessage(id: "original-prompt", role: "user", text: "Remember the orchard."),
+        ChatMessage(id: "original-reply", role: "assistant", text: "Orchard remembered."),
+        ChatMessage(id: "router-prompt", role: "user", text: "Remember the bakery too."),
+        ChatMessage(id: "router-reply", role: "assistant", text: "Bakery remembered.", reasoning: "Private Beam notes"),
+    ]
+    try StateStore.save(threadId: "original-thread", model: "gpt-6-luna", to: stateURL, messages: history, codexSyncedCount: 2)
+
+    let rpc = FakeCodexTransport()
+    switch failure {
+    case "malformed response":
+        rpc.resumeResult = .success(CodexPayload(["thread": ["id": "original-thread"]]))
+    case "archived":
+        rpc.resumeResult = .failure(CodexRPCError(code: -32600, message:
+            "session original-thread is archived. Run `codex unarchive original-thread` to unarchive it first."))
+    case "different ID":
+        rpc.resumeResult = .failure(CodexRPCError(code: -32600, message: "no rollout found for thread id original-thread-other"))
+    case "different code":
+        rpc.resumeResult = .failure(CodexRPCError(code: -32603, message: "no rollout found for thread id original-thread"))
+    case "transport error":
+        rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -32600, userInfo: [
+            NSLocalizedDescriptionKey: "no rollout found for thread id original-thread",
+        ]))
+    default:
+        rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+    }
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    #expect(ready.messages == history)
+    await #expect(throws: (any Error).self) { try await client.send("What do you remember?") }
+    #expect(!client.busy)
+    #expect(!rpc.calls.contains { $0.method == "thread/start" || $0.method == "turn/start" })
+
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "original-thread", "turns": []]]))
+    try await client.send("What do you remember?")
+    let turn = try #require(rpc.calls.first { $0.method == "turn/start" })
+    #expect(turn.params["threadId"] as? String == "original-thread")
+    let content = try #require(turn.params["input"] as? [[String: Any]])
+    #expect(content.first?["text"] as? String == """
+    [Earlier turns in this conversation from another model:
+    User: Remember the bakery too.
+
+    Assistant: Bakery remembered.]
+
+    What do you remember?
+    """)
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "original-thread", "turnId": "turn-1",
+        "item": ["id": "new-prompt", "type": "userMessage",
+                 "clientId": turn.params["clientUserMessageId"] as? String ?? "", "content": content],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
+        "threadId": "original-thread", "turnId": "turn-1",
+        "item": ["id": "new-reply", "type": "agentMessage", "text": "The orchard and bakery."],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
+        "threadId": "original-thread", "turn": ["id": "turn-1", "status": "completed"],
+    ]))
+    await client.close()
+
+    let reopened = ChatClient(rpc: rpc, options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == "original-thread")
+    #expect(restored.messages.prefix(history.count).elementsEqual(history))
+    #expect(restored.messages.dropFirst(history.count).map(\.text) == ["What do you remember?", "The orchard and bakery."])
+    await reopened.close()
+}
+
+@Test(arguments: [false, true], [false, true])
+func confirmedThreadLossUsesAReplacementWithSavedContext(lossAtConnect: Bool, replacementFirstFails: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-replacement-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let history = [
+        ChatMessage(id: "old-prompt", role: "user", text: "Remember the flour order."),
+        ChatMessage(id: "old-reply", role: "assistant", text: "It arrives Friday.", reasoning: "Private Beam notes"),
+    ]
+    try StateStore.save(threadId: "original-thread", model: "gpt-6-luna", to: stateURL, messages: history, codexSyncedCount: 2)
+
+    let missing = CodexRPCError(code: -32600, message: "no rollout found for thread id original-thread")
+    let transient = NSError(domain: "SpeedChat.Codex", code: -2)
+    let rpc = FakeCodexTransport()
+    rpc.resumeResult = .failure(lossAtConnect ? missing : transient)
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    #expect(ready.threadId == "original-thread")
+    #expect(ready.messages == history)
+    #expect(!rpc.calls.contains { $0.method == "thread/start" || $0.method == "turn/start" })
+
+    rpc.resumeResult = .failure(lossAtConnect ? transient : missing)
+    if replacementFirstFails {
+        rpc.failThreadStart = true
+        await #expect(throws: (any Error).self) { try await client.send("When was it arriving?") }
+        #expect(!client.busy)
+        #expect(!rpc.calls.contains { $0.method == "turn/start" })
+
+        let reopenRPC = FakeCodexTransport()
+        reopenRPC.resumeResult = .failure(transient)
+        let reopened = ChatClient(rpc: reopenRPC, options: options)
+        let restored = try await reopened.connect()
+        #expect(restored.threadId == "original-thread")
+        #expect(restored.messages == history)
+        await reopened.close()
+
+        rpc.resumeResult = .failure(transient)
+        rpc.failThreadStart = false
+    }
+    try await client.send("When was it arriving?")
+    let turn = try #require(rpc.calls.first { $0.method == "turn/start" })
+    #expect(turn.params["threadId"] as? String == "dedicated")
+    let content = try #require(turn.params["input"] as? [[String: Any]])
+    #expect(content.first?["text"] as? String == """
+    [Earlier turns in this conversation from another model:
+    User: Remember the flour order.
+
+    Assistant: It arrives Friday.]
+
+    When was it arriving?
+    """)
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "dedicated", "turnId": "turn-1",
+        "item": ["id": "new-prompt", "type": "userMessage",
+                 "clientId": turn.params["clientUserMessageId"] as? String ?? "", "content": content],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
+        "threadId": "dedicated", "turnId": "turn-1",
+        "item": ["id": "new-reply", "type": "agentMessage", "text": "Friday."],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
+        "threadId": "dedicated", "turn": ["id": "turn-1", "status": "completed"],
+    ]))
+    await client.close()
+
+    let reopened = ChatClient(rpc: FakeCodexTransport(), options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == "dedicated")
+    #expect(restored.messages.prefix(history.count).elementsEqual(history))
+    #expect(restored.messages.dropFirst(history.count).map(\.text) == ["When was it arriving?", "Friday."])
+    await reopened.close()
 }
 
 @Test func detachedConversationCanSelectModelsAndContinueOnOpenRouter() async throws {
@@ -715,7 +869,7 @@ private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
     rpc.onNotification?(CodexNotification(method: "item/agentMessage/delta", params: ["threadId": "dedicated", "turnId": "old", "delta": "old"]))
     #expect(collector.deltas.isEmpty)
 
-    rpc.onNotification?(CodexNotification(method: "model/rerouted", params: ["threadId": "dedicated", "toModel": "gpt-6-sol"]))
+    rpc.onNotification?(CodexNotification(method: "model/rerouted", params: ["threadId": "dedicated", "turnId": "t1", "toModel": "gpt-6-sol"]))
     #expect(collector.models.last == "gpt-6-sol")
 
     // Blocked tool item

@@ -5,11 +5,12 @@ struct ConversationContinuity {
     enum Thread {
         case standalone(String)
         case detached(String)
+        case missing(String)
         case attached(String)
 
         var id: String {
             switch self {
-            case .standalone(let id), .detached(let id), .attached(let id):
+            case .standalone(let id), .detached(let id), .missing(let id), .attached(let id):
                 return id
             }
         }
@@ -36,6 +37,15 @@ struct ConversationContinuity {
         messages = saved.messages ?? []
         codexSyncedCount = min(max(saved.codexSyncedCount ?? 0, 0), messages.count)
         needsLegacyHistory = saved.messages == nil
+    }
+
+    mutating func recordCodexReceipt(_ attempt: CodexSendAttempt) -> Bool {
+        guard thread?.id == attempt.threadId,
+              attempt.syncedCount > 0, attempt.syncedCount <= messages.count else { return false }
+        let user = messages[attempt.syncedCount - 1]
+        guard user.id == attempt.userMessageId, user.role == "user" else { return false }
+        codexSyncedCount = max(codexSyncedCount, attempt.syncedCount)
+        return true
     }
 
     mutating func didResume(threadId: String, name: String?, history: CodexHistory) -> Bool {
@@ -116,6 +126,19 @@ struct ConversationContinuity {
             }
         }
         return recovered
+    }
+
+    mutating func didConfirmThreadLoss(_ id: String) {
+        if case .detached(id) = thread {
+            thread = .missing(id)
+        }
+    }
+
+    mutating func didStartCodexThread(_ id: String) {
+        thread = .attached(id)
+        codexSyncedCount = 0
+        titleNeeded = true
+        needsLegacyHistory = false
     }
 
     func save(model: String, to url: URL?, env: [String: String]) throws {
