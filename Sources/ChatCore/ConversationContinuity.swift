@@ -38,6 +38,15 @@ struct ConversationContinuity {
         needsLegacyHistory = saved.messages == nil
     }
 
+    mutating func recordCodexReceipt(_ attempt: CodexSendAttempt) -> Bool {
+        guard thread?.id == attempt.threadId,
+              attempt.syncedCount > 0, attempt.syncedCount <= messages.count else { return false }
+        let user = messages[attempt.syncedCount - 1]
+        guard user.id == attempt.userMessageId, user.role == "user" else { return false }
+        codexSyncedCount = max(codexSyncedCount, attempt.syncedCount)
+        return true
+    }
+
     mutating func didResume(threadId: String, name: String?, codexMessages: [ChatMessage]) -> Bool {
         thread = .attached(threadId)
         titleNeeded = name == nil || name == "" || name == "SpeedChat" || name == "New chat"
