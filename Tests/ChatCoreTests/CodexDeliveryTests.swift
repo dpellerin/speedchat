@@ -2,6 +2,181 @@ import Foundation
 import Testing
 @testable import ChatCore
 
+@Test(arguments: ["acknowledgement", "receipt", "buffered completion"])
+func codexStopWaitsForBindingAndOnlyInterruptsTheActiveExecution(binding: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"),
+        stateURL: dir.appendingPathComponent("state.json"), env: [:]
+    )
+    let rpc = FakeCodexTransport()
+    let client = ChatClient(rpc: rpc, options: options)
+    let (events, recordedEvents) = AsyncStream<BridgeEvent>.makeStream()
+    client.onTurnEvent = { recordedEvents.yield($0) }
+    let original = try await client.connect()
+    let prompt = ChatMessage(id: "visit", role: "user", text: "Can I visit?")
+    let executionID = UUID()
+    try client.acceptSend(prompt.text, userMessageId: prompt.id, executionID: executionID)
+    await client.requestStop(executionID: executionID)?.value
+    rpc.holdTurnStart = true
+    let sending = Task { try await client.startSend(executionID: executionID) }
+    while !rpc.turnStartIsHeld { await Task.yield() }
+    defer { rpc.releaseTurnStart() }
+    await client.requestStop(executionID: executionID)?.value
+    #expect(!rpc.calls.contains { $0.method == "turn/interrupt" })
+
+    let sent = try #require(rpc.calls.last { $0.method == "turn/start" })
+    let input = try #require(sent.params["input"] as? [[String: Any]])
+    let receipt = CodexNotification(method: "item/started", params: [
+        "threadId": original.threadId, "turnId": "live",
+        "item": ["id": "recorded", "type": "userMessage", "clientId": prompt.id, "content": input],
+    ])
+    let completed = CodexNotification(method: "turn/completed", params: [
+        "threadId": original.threadId, "turn": ["id": "live", "status": "interrupted"],
+    ])
+    if binding == "buffered completion" { rpc.onNotification?(completed) }
+    if binding != "acknowledgement" { rpc.onNotification?(receipt) }
+    rpc.releaseTurnStart(turnId: "live")
+    try await sending.value
+    if binding == "acknowledgement" { rpc.onNotification?(receipt) }
+    if binding != "buffered completion" {
+        for _ in 0..<200 where !rpc.calls.contains(where: { $0.method == "turn/interrupt" }) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+    }
+    await client.requestStop(executionID: executionID)?.value
+    rpc.onNotification?(completed)
+    rpc.onNotification?(completed)
+    recordedEvents.finish()
+
+    let interrupts = rpc.calls.filter { $0.method == "turn/interrupt" }
+    #expect(interrupts.count == (binding == "buffered completion" ? 0 : 1))
+    #expect(interrupts.allSatisfy {
+        $0.params["threadId"] as? String == original.threadId && $0.params["turnId"] as? String == "live"
+    })
+    var outcomes = [BridgeEvent]()
+    for await event in events { outcomes.append(event) }
+    #expect(outcomes.map(\.type) == ["activeModel", "done"])
+    #expect(outcomes.allSatisfy { $0.executionID == executionID })
+    #expect(!client.busy)
+
+    await client.close()
+    let reopened = ChatClient(rpc: FakeCodexTransport(), options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.messages == [prompt])
+    #expect(restored.codexRetry == nil)
+    await reopened.close()
+}
+
+@Test(arguments: [false, true])
+func codexRetryAndResendIgnoreAnEarlierExecutionOfTheSamePrompt(uncertain: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"),
+        stateURL: dir.appendingPathComponent("state.json"), env: [:]
+    )
+    let rpc = FakeCodexTransport()
+    let client = ChatClient(rpc: rpc, options: options)
+    let (events, recordedEvents) = AsyncStream<BridgeEvent>.makeStream()
+    client.onTurnEvent = { recordedEvents.yield($0) }
+    let original = try await client.connect()
+    let prompt = ChatMessage(id: "visit", role: "user", text: "Can I visit?")
+    let firstID = UUID()
+    try client.acceptSend(prompt.text, userMessageId: prompt.id, executionID: firstID)
+    if uncertain {
+        rpc.turnStartError = NSError(domain: "test", code: -2)
+    } else {
+        rpc.turnStartError = CodexRPCError(code: -32602, message: "Input too large",
+                                          data: ["input_error_code": "input_too_large"])
+    }
+    await #expect(throws: (any Error).self) { try await client.startSend(executionID: firstID) }
+    let first = try #require(rpc.calls.last { $0.method == "turn/start" })
+    let firstInput = try #require(first.params["input"] as? [[String: Any]])
+    #expect(first.params["clientUserMessageId"] as? String == prompt.id)
+    #expect(client.codexRetry?.action == (uncertain ? .checkDelivery : .retry))
+
+    let checkID = UUID()
+    if uncertain {
+        try client.acceptCodexRetry(userMessageId: prompt.id, resend: false, executionID: checkID)
+        let checked = try #require(try await client.startCodexRetry(executionID: checkID))
+        #expect(checked.messages == [prompt])
+        #expect(checked.codexRetry?.action == .resend)
+        #expect(rpc.calls.last { $0.method == "thread/read" }?.params["threadId"] as? String == original.threadId)
+        #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 1)
+    }
+
+    let nextID = UUID()
+    try client.acceptCodexRetry(userMessageId: prompt.id, resend: uncertain, executionID: nextID)
+    await client.requestStop(executionID: firstID)?.value
+    rpc.holdTurnStart = true
+    rpc.turnStartError = nil
+    let retrying = Task { try await client.startCodexRetry(executionID: nextID) }
+    while !rpc.turnStartIsHeld { await Task.yield() }
+    defer { rpc.releaseTurnStart() }
+    let retried = try #require(rpc.calls.last { $0.method == "turn/start" })
+    let retryClientID = try #require(retried.params["clientUserMessageId"] as? String)
+    let secondInput = try #require(retried.params["input"] as? [[String: Any]])
+    #expect(retryClientID != prompt.id)
+    #expect(secondInput.first?["text"] as? String == firstInput.first?["text"] as? String)
+
+    let staleDelta = CodexNotification(method: "item/agentMessage/delta", params: [
+        "threadId": original.threadId, "turnId": "earlier-turn", "itemId": "late", "delta": "Wrong reply.",
+    ])
+    let staleCompletion = CodexNotification(method: "turn/completed", params: [
+        "threadId": original.threadId,
+        "turn": ["id": "earlier-turn", "status": "completed", "itemsView": "full", "items": [
+            ["id": "earlier-input", "type": "userMessage", "clientId": prompt.id, "content": firstInput],
+            ["id": "late", "type": "agentMessage", "text": "Wrong reply."],
+        ]],
+    ])
+    rpc.onNotification?(staleDelta)
+    rpc.onNotification?(staleCompletion)
+    rpc.releaseTurnStart(turnId: "current-turn")
+    _ = try await retrying.value
+    await client.requestStop(executionID: firstID)?.value
+    rpc.onNotification?(staleDelta)
+    rpc.onNotification?(staleCompletion)
+    #expect(client.busy)
+    #expect(!rpc.calls.contains { $0.method == "turn/interrupt" })
+
+    let reply = ChatMessage(id: "answer", role: "assistant", text: "At noon.")
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": original.threadId, "turnId": "current-turn",
+        "item": ["id": "recorded", "type": "userMessage", "clientId": retryClientID, "content": secondInput],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
+        "threadId": original.threadId, "turnId": "current-turn",
+        "item": ["id": reply.id, "type": "agentMessage", "text": reply.text],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
+        "threadId": original.threadId, "turn": ["id": "current-turn", "status": "completed"],
+    ]))
+    #expect(!client.busy)
+    #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 2)
+    recordedEvents.finish()
+    var outcomes = [BridgeEvent]()
+    for await event in events { outcomes.append(event) }
+    let firstFailure = try #require(outcomes.first { $0.executionID == firstID && $0.type == "error" })
+    #expect(firstFailure.busy == false)
+    #expect(firstFailure.codexRetry?.action == (uncertain ? .checkDelivery : .retry))
+    if uncertain {
+        let checked = try #require(outcomes.first { $0.executionID == checkID && $0.type == "conversationUpdated" })
+        #expect(checked.codexRetry?.action == .resend)
+    }
+    let nextEvents = outcomes.filter { $0.executionID == nextID }
+    #expect(nextEvents.map(\.type) == ["activeModel", "message", "done"])
+    #expect(nextEvents.first { $0.type == "message" }?.text == reply.text)
+
+    await client.close()
+    let reopened = ChatClient(rpc: FakeCodexTransport(), options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.messages == [prompt, reply])
+    #expect(restored.codexRetry == nil)
+    await reopened.close()
+}
+
 @Test func confirmedCodexDeliverySurvivesFailedReply() async throws {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("codex-delivery-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: dir) }
@@ -497,7 +672,12 @@ func retryKeepsOnlyAnAttachedInProgressCodexReplyStreaming(availability: String)
             ]],
         ],
     ]]))
-    let checked = try await client.retryCodexSend()
+    let retryID = UUID()
+    let (events, recordedEvents) = AsyncStream<BridgeEvent>.makeStream()
+    client.onTurnEvent = { recordedEvents.yield($0) }
+    try client.acceptCodexRetry(userMessageId: user.id, resend: false, executionID: retryID)
+    if availability == "attached" { await client.requestStop(executionID: retryID)?.value }
+    let checked = try await client.startCodexRetry(executionID: retryID)
 
     if availability == "stored" {
         #expect(!client.busy)
@@ -515,6 +695,23 @@ func retryKeepsOnlyAnAttachedInProgressCodexReplyStreaming(availability: String)
         #expect(updated.messages == [user, reply])
     }
     #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 1)
+    let interrupts = rpc.calls.filter { $0.method == "turn/interrupt" }
+    if availability == "attached" {
+        #expect(interrupts.count == 1)
+        #expect(interrupts.first?.params["threadId"] as? String == original.threadId)
+        #expect(interrupts.first?.params["turnId"] as? String == "live")
+    } else {
+        #expect(interrupts.isEmpty)
+    }
+    recordedEvents.finish()
+    var outcomes = [BridgeEvent]()
+    for await event in events { outcomes.append(event) }
+    #expect(outcomes.allSatisfy { $0.executionID == retryID })
+    if availability == "stored" {
+        #expect(outcomes.map(\.type) == ["conversationUpdated"])
+    } else {
+        #expect(outcomes.map(\.type) == ["codexReplyResumed", "message", "done"])
+    }
     await client.close()
 }
 

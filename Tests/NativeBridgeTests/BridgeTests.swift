@@ -215,19 +215,31 @@ private func visibleDate(_ value:String)->String {
                                   codexRetry:CodexRetry(userMessageId:prompt.id,action:.checkDelivery)))
  #expect(store.session.notice.contains("may already have received"))
  store.retry()
- #expect(store.fixtureCommands.last == ["type":"retryCodex","itemId":prompt.id])
+ let retryID=try #require(store.session.executionID)
+ #expect(retryID != executionID)
+ #expect(store.fixtureCommands.last == ["type":"retryCodex","itemId":prompt.id,"executionID":retryID.uuidString])
  #expect(store.session.messages == [prompt])
 
  store.session.receive(BridgeEvent(type:"conversationUpdated",messages:[prompt],
-                                  codexRetry:CodexRetry(userMessageId:prompt.id,action:.resend)))
+                                  codexRetry:CodexRetry(userMessageId:prompt.id,action:.resend),
+                                  executionID:retryID))
  #expect(store.session.notice.contains("could duplicate"))
  store.resend()
- #expect(store.fixtureCommands.last == ["type":"resendCodex","itemId":prompt.id])
+ let resendID=try #require(store.session.executionID)
+ #expect(resendID != executionID && resendID != retryID)
+ #expect(store.fixtureCommands.last == ["type":"resendCodex","itemId":prompt.id,"executionID":resendID.uuidString])
+ store.session.receive(BridgeEvent(type:"delta",itemId:"late-reply",delta:"Late reply",executionID:executionID))
+ store.session.receive(BridgeEvent(type:"conversationUpdated",messages:[],executionID:retryID))
+ store.session.receive(BridgeEvent(type:"done",executionID:executionID))
  #expect(store.session.messages == [prompt])
+ #expect(store.session.streaming)
+ store.interrupt()
+ #expect(store.fixtureCommands.last == ["type":"interrupt","executionID":resendID.uuidString])
 
- store.session.receive(BridgeEvent(type:"error",message:"Codex reply failed after receipt."))
+ store.session.receive(BridgeEvent(type:"error",message:"Codex reply failed after receipt.",executionID:resendID))
+ let commands=store.fixtureCommands
  store.retry()
- #expect(store.fixtureCommands.last?["type"] == "resendCodex")
+ #expect(store.fixtureCommands == commands)
 
  store.session.receive(BridgeEvent(type:"ready",model:"example/router"))
  store.draft="A router prompt"
@@ -307,7 +319,8 @@ private func visibleDate(_ value:String)->String {
             let text = try #require(draft)
             let prompt = try #require(session.messages.last)
             optimistic = prompt
-            bridge.send(["type": "send", "text": text, "itemId": prompt.id])
+            let executionID = try #require(session.executionID)
+            bridge.send(["type": "send", "text": text, "itemId": prompt.id, "executionID": executionID.uuidString])
         }
         if event.type == "historyRecovered" {
             #expect(session.streaming)

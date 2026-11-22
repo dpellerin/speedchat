@@ -105,14 +105,14 @@ import ChatCore
   command(stop)
  }
  func retry() {
-  if let id=session.beginCodexRetry(resend:false) {
-   command(["type":"retryCodex","itemId":id])
+  if let id=session.beginCodexRetry(resend:false),let executionID=session.executionID {
+   command(["type":"retryCodex","itemId":id,"executionID":executionID.uuidString])
   } else if session.canRetryOpenRouter {
    draft=session.lastRequest;send()
   }
  }
  func resend() {
-  guard let id=session.beginCodexRetry(resend:true) else {return}
-  command(["type":"resendCodex","itemId":id])
+  guard let id=session.beginCodexRetry(resend:true),let executionID=session.executionID else {return}
+  command(["type":"resendCodex","itemId":id,"executionID":executionID.uuidString])
  }
 }

@@ -6,7 +6,8 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
     private let lock = NSLock()
     var onNotification: (@Sendable (CodexNotification) -> Void)?
     var onExit: (@Sendable () -> Void)?
-    var calls = [(method: String, params: [String: Any])]()
+    private var recordedCalls = [(method: String, params: [String: Any])]()
+    var calls: [(method: String, params: [String: Any])] { sync { recordedCalls } }
     var failStart = false
     var failThreadStart = false
     var missingThreadId = false
@@ -75,7 +76,7 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
 
     func request(method: String, params: [String: Any], timeoutMs: Int) async throws -> [String: Any] {
         let (shouldHoldTurn, shouldHoldSettings, shouldHoldRename) = sync { () -> (Bool, Bool, Bool) in
-            calls.append((method: method, params: params))
+            recordedCalls.append((method: method, params: params))
             let holdT = (method == "turn/start" && holdTurnStart)
             let holdS = (method == "thread/settings/update" && holdSettings)
             let nameParam = (params["name"] as? String) ?? ""
