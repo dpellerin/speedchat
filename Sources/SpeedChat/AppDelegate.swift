@@ -160,7 +160,7 @@ import ChatCore
  func windowShouldClose(_ sender:NSWindow)->Bool {if sender === panel {hide();return false};return true}
  func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
   hotkey.remove();if let keyMonitor {NSEvent.removeMonitor(keyMonitor)}
-  store.stop {Task { @MainActor in NSApp.reply(toApplicationShouldTerminate:true) }}
+  store.quit {Task { @MainActor in NSApp.reply(toApplicationShouldTerminate:true) }}
   return .terminateLater
  }
 }

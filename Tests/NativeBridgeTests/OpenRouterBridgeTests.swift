@@ -118,6 +118,8 @@ func nativeBridgeStopsOpenRouterAndKeepsThePanelUsable(saveFails: Bool, blankRep
     #expect(store.session.notice == "Thinking…")
     firstSink.yield(#"data: {"choices":[{"delta":{"content":"Late text."}}]}"#)
     firstSink.finish(throwing: URLError(.networkConnectionLost))
+    store.bridge = bridge
+    store.hide()
     nextSink.yield(#"data: {"choices":[{"delta":{"content":"Complete reply."}}]}"#)
     nextSink.yield("data: [DONE]")
     nextSink.finish()
@@ -125,6 +127,8 @@ func nativeBridgeStopsOpenRouterAndKeepsThePanelUsable(saveFails: Bool, blankRep
     #expect(completed.executionID?.uuidString == nextSend["executionID"])
     #expect(store.session.messages.map(\.text) == stoppedTexts + ["Follow up", "Complete reply."])
     #expect(store.session.canSend)
+    store.show()
+    #expect(store.warmReopens == 1)
     // A late Stop after completion cannot replace the complete reply.
     bridge.send(["type": "interrupt", "executionID": try #require(nextSend["executionID"])])
     await withCheckedContinuation { continuation in bridge.close { continuation.resume() } }
@@ -162,4 +166,112 @@ private func receive(
     throw NSError(domain: "NativeBridgeTests", code: 1, userInfo: [
         NSLocalizedDescriptionKey: "Timed out waiting for \(type)",
     ])
+}
+
+@MainActor
+@Test func reconnectSavesTheAcceptedOpenRouterReplyBeforeRestoring() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("bridge-or-reconnect-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let configURL = root.appendingPathComponent("openrouter.json")
+    let stateURL = root.appendingPathComponent("state.json")
+    let model = OpenRouterClient.defaultModels[0].model
+    try OpenRouterClient.saveConfig(key: "test-key", to: configURL)
+    try StateStore.save(
+        threadId: "codex-history", model: model, to: stateURL,
+        messages: [ChatMessage(id: "earlier", role: "user", text: "Earlier prompt")], codexSyncedCount: 1
+    )
+
+    let (firstPass, firstSink) = AsyncThrowingStream<String, Error>.makeStream()
+    let (searchStarted, searchSink) = AsyncStream<Void>.makeStream()
+    let (searchReturned, returnedSink) = AsyncStream<Void>.makeStream()
+    let lateFetch = HeldOpenRouterFetch()
+    defer { Task { await lateFetch.release() } }
+    let options = ChatClientOptions(
+        openRouterFetch: { request in
+            let body = try #require(request.httpBody)
+            let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            let messages = try #require(payload["messages"] as? [[String: String]])
+            if messages.last?["content"] == "Follow up" {
+                #expect(messages.filter { $0["role"] != "system" }.compactMap { $0["content"] } ==
+                    ["Earlier prompt", "First prompt", "Keep this. [queued", "Follow up"])
+                return OpenRouterHTTPResponse(statusCode: 200, lines: AsyncThrowingStream { sink in
+                    sink.yield(#"data: {"choices":[{"delta":{"content":"New reply."}}]}"#)
+                    sink.finish()
+                })
+            }
+            if payload["plugins"] != nil {
+                let late = await lateFetch.response(onEntry: { searchSink.yield() })
+                returnedSink.yield()
+                return late
+            }
+            return OpenRouterHTTPResponse(statusCode: 200, lines: firstPass)
+        },
+        openRouterConfigURL: configURL, stateURL: stateURL, env: [:]
+    )
+    let codexPath = root.appendingPathComponent("missing-codex").path
+    let bridge = BridgeProcess()
+    let events = OpenRouterBridgeEvents()
+    bridge.start(codexOverride: codexPath, options: options, onEvent: events.append)
+    let panel = ChatStore()
+    panel.fixtureMode = true
+    _ = try await receive("ready", from: events, in: panel)
+    panel.draft = "First prompt"
+    panel.send()
+    bridge.send(try #require(panel.fixtureCommands.last))
+    firstSink.yield(#"data: {"choices":[{"delta":{"content":"Keep this. [queued"}}]}"#)
+    _ = try await receive("delta", from: events, in: panel)
+    #expect(panel.session.messages.map(\.text) == ["Earlier prompt", "First prompt", "Keep this. "])
+    firstSink.yield(#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"search","function":{"name":"web_search","arguments":"{}"}}]}}]}"#)
+    firstSink.finish()
+    let searchTimeout = Task {
+        try? await Task.sleep(for: .seconds(5))
+        searchSink.finish()
+        returnedSink.finish()
+    }
+    defer { searchTimeout.cancel() }
+    var search = searchStarted.makeAsyncIterator()
+    let searchWasDispatched = await search.next() != nil
+    try #require(searchWasDispatched)
+
+    await withCheckedContinuation { continuation in bridge.close { continuation.resume() } }
+    let replacement = BridgeProcess()
+    let replacementEvents = OpenRouterBridgeEvents()
+    replacement.start(codexOverride: codexPath, options: options, onEvent: replacementEvents.append)
+    let settled = try await receive("ready", from: replacementEvents, in: panel)
+    #expect(settled.messages?.map(\.text) == ["Earlier prompt", "First prompt", "Keep this. [queued"])
+
+    panel.draft = "Follow up"
+    panel.send()
+    replacement.send(try #require(panel.fixtureCommands.last))
+    _ = try await receive("done", from: replacementEvents, in: panel)
+    #expect(panel.session.messages.map(\.text) == ["Earlier prompt", "First prompt", "Keep this. [queued", "Follow up", "New reply."])
+    #expect(StateStore.load(from: stateURL)?.codexSyncedCount == 1)
+    let newerState = try Data(contentsOf: stateURL)
+    await lateFetch.release()
+    var oldResponse = searchReturned.makeAsyncIterator()
+    let oldResponseReturned = await oldResponse.next() != nil
+    #expect(oldResponseReturned)
+    await withCheckedContinuation { continuation in replacement.close { continuation.resume() } }
+    #expect(try Data(contentsOf: stateURL) == newerState)
+    #expect(events.pop()?.type == "searching")
+    #expect(events.pop() == nil)
+}
+
+private actor HeldOpenRouterFetch {
+    private var pending: CheckedContinuation<OpenRouterHTTPResponse, Never>?
+
+    func response(onEntry: @Sendable () -> Void) async -> OpenRouterHTTPResponse {
+        await withCheckedContinuation { continuation in
+            pending = continuation
+            onEntry()
+        }
+    }
+
+    func release() {
+        pending?.resume(returning: OpenRouterHTTPResponse(statusCode: 200, lines: AsyncThrowingStream { sink in
+            sink.yield(#"data: {"choices":[{"delta":{"content":"Late reply."}}]}"#)
+            sink.finish()
+        }))
+        pending = nil
+    }
 }

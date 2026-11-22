@@ -1,11 +1,18 @@
 import Foundation
 import ChatCore
 
+protocol ChatBackend: AnyObject, Sendable {
+    func start(codexOverride: String, options: ChatClientOptions, onEvent: @escaping @Sendable (BridgeEvent) -> Void)
+    func send(_ command: [String: String])
+    func close(completion: (@Sendable () -> Void)?)
+}
+
 /// In-process native chat backend that drives `ChatClient` and coalesces streaming token deltas at ~60fps (16ms).
-final class BridgeProcess: @unchecked Sendable {
+final class BridgeProcess: ChatBackend, @unchecked Sendable {
     private let queue = DispatchQueue(label: "SpeedChat.bridge", qos: .userInitiated)
     private var client: ChatClient?
     private var closing = false
+    private var closeCallbacks: [@Sendable () -> Void]?
     private enum Startup {
         case connecting(exitReason: String?)
         case finished
@@ -24,8 +31,8 @@ final class BridgeProcess: @unchecked Sendable {
         onEvent: @escaping @Sendable (BridgeEvent) -> Void
     ) {
         queue.async { [self] in
+            guard !closing, client == nil else { return }
             self.onEvent = onEvent
-            self.closing = false
             self.startup = .connecting(exitReason: nil)
             let rpc = JsonRpcProcess(codexOverride: codexOverride, env: options.env)
             let chatClient = ChatClient(rpc: rpc, options: options)
@@ -298,28 +305,40 @@ final class BridgeProcess: @unchecked Sendable {
                 return
             }
             if type == "close" {
-                close()
+                closeOnQueue(completion: nil)
             }
         }
     }
 
     func close(completion: (@Sendable () -> Void)? = nil) {
-        queue.async { [self] in
-            guard !closing else {
-                completion?()
-                return
-            }
-            closing = true
-            flushDelta()
-            let activeClient = client
-            client = nil
-            guard let activeClient else {
-                completion?()
-                return
-            }
-            Task {
-                await activeClient.close()
-                completion?()
+        queue.async { [self] in closeOnQueue(completion: completion) }
+    }
+
+    private func closeOnQueue(completion: (@Sendable () -> Void)?) {
+        if closing {
+            guard let completion else { return }
+            if closeCallbacks != nil { closeCallbacks?.append(completion) }
+            else { completion() }
+            return
+        }
+        closing = true
+        onEvent = nil
+        pendingDelta = nil
+        flushDelta()
+        let activeClient = client
+        client = nil
+        guard let activeClient else {
+            completion?()
+            return
+        }
+        closeCallbacks = completion.map { [$0] } ?? []
+        let teardown = activeClient.beginClose()
+        Task { [self] in
+            await teardown.value
+            queue.async { [self] in
+                let callbacks = closeCallbacks ?? []
+                closeCallbacks = nil
+                for callback in callbacks { callback() }
             }
         }
     }
