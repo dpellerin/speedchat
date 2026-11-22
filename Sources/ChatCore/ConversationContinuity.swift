@@ -38,15 +38,84 @@ struct ConversationContinuity {
         needsLegacyHistory = saved.messages == nil
     }
 
-    mutating func didResume(threadId: String, name: String?, codexMessages: [ChatMessage]) -> Bool {
+    mutating func didResume(threadId: String, name: String?, history: CodexHistory) -> Bool {
+        guard thread?.id == threadId else { return false }
         thread = .attached(threadId)
         titleNeeded = name == nil || name == "" || name == "SpeedChat" || name == "New chat"
-        let shouldImport = needsLegacyHistory && messages.isEmpty
+        if needsLegacyHistory && messages.isEmpty {
+            guard history.turns.allSatisfy(\.isFull) else { return false }
+            needsLegacyHistory = false
+            messages = history.legacyMessages
+            codexSyncedCount = messages.count
+            return true
+        }
         needsLegacyHistory = false
-        guard shouldImport else { return false }
-        messages = codexMessages
-        codexSyncedCount = codexMessages.count
-        return true
+
+        let inputs = history.turns.flatMap { $0.items.compactMap(\.user) }
+        let inputsByClientId = Dictionary(grouping: inputs, by: \.clientId)
+        let exchanges = history.turns.flatMap(\.exchanges)
+        let repliesById = Dictionary(grouping: exchanges.flatMap(\.replies), by: \.id)
+        var recovered = false
+        for exchange in exchanges {
+            guard !exchange.replies.isEmpty,
+                  exchange.replies.allSatisfy({ repliesById[$0.id]?.count == 1 }) else { continue }
+            let input = exchange.input
+            let anchor: Int?
+            if let id = input.id, !id.isEmpty,
+               let clientId = input.clientId, !clientId.isEmpty, inputsByClientId[clientId]?.count == 1,
+               let index = userIndex(messageId: clientId), input.containsPrompt(messages[index].text) {
+                anchor = index
+            } else {
+                anchor = nil
+            }
+            if recoverReplies(exchange.replies, after: anchor) {
+                recovered = true
+            }
+        }
+        return recovered
+    }
+
+    // The caller has verified that this Codex input belongs to the saved message.
+    mutating func recoverReplies(in turn: CodexHistory.Turn, threadId: String, after userItemId: String, for userMessageId: String) -> Bool {
+        guard thread?.id == threadId, !userItemId.isEmpty,
+              let anchor = userIndex(messageId: userMessageId) else { return false }
+        let matches = turn.exchanges.filter { $0.input.id == userItemId }
+        guard matches.count == 1, let exchange = matches.first else { return false }
+        return recoverReplies(exchange.replies, after: anchor)
+    }
+
+    private func userIndex(messageId: String) -> Int? {
+        let matches = messages.indices.filter { messages[$0].id == messageId }
+        guard matches.count == 1, let index = matches.first, messages[index].role == "user" else { return nil }
+        return index
+    }
+
+    private mutating func recoverReplies(_ replies: [ChatMessage], after userAnchor: Int?) -> Bool {
+        guard !replies.isEmpty, Set(replies.map(\.id)).count == replies.count else { return false }
+        var previousIndex = userAnchor ?? -1
+        var firstSavedReply: Int?
+        for reply in replies {
+            let matches = messages.indices.filter { messages[$0].id == reply.id }
+            guard !matches.isEmpty else { continue }
+            guard matches.count == 1, let index = matches.first, index > previousIndex,
+                  messages[index].role == "assistant" else { return false }
+            if firstSavedReply == nil { firstSavedReply = index }
+            previousIndex = index
+        }
+
+        guard var insertionIndex = userAnchor.map({ $0 + 1 }) ?? firstSavedReply else { return false }
+        var recovered = false
+        for reply in replies {
+            if let index = messages.firstIndex(where: { $0.id == reply.id }) {
+                insertionIndex = index + 1
+            } else {
+                messages.insert(reply, at: insertionIndex)
+                if insertionIndex <= codexSyncedCount { codexSyncedCount += 1 }
+                insertionIndex += 1
+                recovered = true
+            }
+        }
+        return recovered
     }
 
     func save(model: String, to url: URL?, env: [String: String]) throws {

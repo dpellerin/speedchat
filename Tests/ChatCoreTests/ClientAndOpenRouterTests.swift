@@ -187,7 +187,7 @@ func savedConversationTakesPriorityOverLongerCodexHistory(emptySavedConversation
             ["id": "codex-reply", "type": "agentMessage", "text": "Continuing."],
         ]],
         ["id": "unmatched", "items": [
-            ["id": "different-user", "type": "userMessage", "content": [["type": "text", "text": "Repeat."]]],
+            ["id": "different-user", "type": "userMessage", "content": [["type": "text", "text": "Continue."]]],
             ["id": "different-reply", "type": "agentMessage", "text": "New Codex history."],
         ]],
     ]
@@ -208,17 +208,33 @@ func savedConversationTakesPriorityOverLongerCodexHistory(emptySavedConversation
     let stateURL = dir.appendingPathComponent("state.json")
     let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
     try StateStore.save(threadId: "legacy-thread", model: "gpt-6-luna", to: stateURL)
+    let partial = FakeCodexTransport()
+    partial.resumeResult = .success(CodexPayload(["thread": [
+        "id": "legacy-thread", "turns": [["id": "legacy-turn", "itemsView": "summary", "items": []]],
+    ]]))
+    let partialClient = ChatClient(rpc: partial, options: options)
+    let incomplete = try await partialClient.connect()
+    #expect(incomplete.messages.isEmpty)
+    await partialClient.close()
+
     let rpc = FakeCodexTransport()
     let turns: [[String: Any]] = [
         ["id": "legacy-turn", "items": [
             ["id": "legacy-user", "type": "userMessage", "content": [["type": "text", "text": "Hello again."]]],
             ["id": "legacy-reply", "type": "agentMessage", "text": "Welcome back."],
         ]],
+        ["id": "legacy-handoff", "items": [
+            ["id": "quoted-user", "type": "userMessage", "content": [
+                ["type": "text", "text": "[Earlier turns in this conversation from another model:\nUser: Hello again.\n\nAssistant: Welcome back.]\n\nTell me more."],
+            ]],
+            ["id": "quoted-reply", "type": "agentMessage", "text": "Here are some more details."],
+        ]],
     ]
     rpc.resumeResult = .success(CodexPayload(["thread": ["id": "legacy-thread", "turns": turns]]))
     let messages = [
         ChatMessage(id: "legacy-user", role: "user", text: "Hello again."),
         ChatMessage(id: "legacy-reply", role: "assistant", text: "Welcome back."),
+        ChatMessage(id: "quoted-reply", role: "assistant", text: "Here are some more details."),
     ]
 
     let client = ChatClient(rpc: rpc, options: options)
@@ -233,6 +249,81 @@ func savedConversationTakesPriorityOverLongerCodexHistory(emptySavedConversation
     #expect(restored.threadId == "legacy-thread")
     #expect(restored.messages == messages)
     await reopened.close()
+}
+
+@Test(arguments: [false, true])
+func reopeningRecoversAMissingCodexReplyAfterItsVerifiedPrompt(quotedContext: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-reconcile-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let prompt = ChatMessage(id: "saved-codex-prompt", role: "user", text: "What is the forecast?")
+    let routerPrompt = ChatMessage(id: "saved-router-prompt", role: "user", text: "What is the forecast?")
+    let routerReply = ChatMessage(id: "saved-router-reply", role: "assistant", text: "Windy.", reasoning: "For Beam follow-ups.")
+    let earlierMessages: [ChatMessage] = quotedContext
+        ? [ChatMessage(id: "earlier", role: "user", text: "I live in Fresno.")]
+        : []
+    let input = quotedContext
+        ? "[Earlier turns in this conversation from another model:\nUser: I live in Fresno.]\n\nWhat is the forecast?"
+        : "What is the forecast?"
+    try StateStore.save(threadId: "forecast-thread", model: "gpt-6-luna", to: stateURL, messages: earlierMessages + [prompt, routerPrompt, routerReply], codexSyncedCount: earlierMessages.count + 1)
+
+    let turns: [[String: Any]] = [
+        ["id": "forecast-turn", "items": [
+            ["id": "codex-prompt", "clientId": prompt.id, "type": "userMessage", "content": [["type": "text", "text": input]]],
+            ["id": "private-reasoning", "type": "reasoning", "content": ["Private Codex reasoning."]],
+            ["id": "commentary", "type": "agentMessage", "phase": "commentary", "text": "Checking the forecast."],
+            ["id": "search", "type": "webSearch", "results": [["ref_id": "turn0search0", "url": "https://example.com/forecast", "title": "Forecast"]]],
+            ["id": "codex-reply", "type": "agentMessage", "phase": "final_answer", "text": "Sunny. \u{E200}cite\u{E202}turn0search0\u{E201}"],
+        ]],
+    ]
+    let expected = earlierMessages + [prompt, ChatMessage(id: "codex-reply", role: "assistant", text: "Sunny. [Forecast](https://example.com/forecast)"), routerPrompt, routerReply]
+    for (reopen, resumeSucceeds) in [true, false, true].enumerated() {
+        let rpc = FakeCodexTransport()
+        rpc.resumeResult = resumeSucceeds
+            ? .success(CodexPayload(["thread": ["id": "forecast-thread", "turns": turns]]))
+            : .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+        let client = ChatClient(rpc: rpc, options: options)
+        let ready = try await client.connect()
+        #expect(ready.messages == expected)
+        if reopen == 2 {
+            try await client.send("Is that tomorrow?")
+            let turn = try #require(rpc.calls.last { $0.method == "turn/start" })
+            let input = turn.params["input"] as? [[String: String]]
+            #expect(input?.first?["text"] == "[Earlier turns in this conversation from another model:\nUser: What is the forecast?\n\nAssistant: Windy.]\n\nIs that tomorrow?")
+        }
+        await client.close()
+    }
+}
+
+@Test(arguments: ["full", "summary"])
+func reopeningUsesASavedCodexReplyToPlaceAMissingReplyInTheSameExchange(itemsView: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-assistant-anchor-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let original = ChatMessage(id: "saved-prompt", role: "user", text: "Where should I hike?")
+    let savedReply = ChatMessage(id: "saved-codex-reply", role: "assistant", text: "The trail is closed in winter.")
+    let routerReply = ChatMessage(id: "router-reply", role: "assistant", text: "Consider an alternative trail.")
+    let saved = [original, savedReply, routerReply]
+    try StateStore.save(threadId: "trail-thread", model: "gpt-6-luna", to: stateURL, messages: saved, codexSyncedCount: 2)
+
+    let rpc = FakeCodexTransport()
+    let turns: [[String: Any]] = [
+        ["id": "trail-turn", "itemsView": itemsView, "items": [
+            ["id": "old-codex-prompt", "type": "userMessage", "content": [["type": "text", "text": "Where should I hike?"]]],
+            ["id": "missing-codex-reply", "type": "agentMessage", "text": "Try Eagle Trail."],
+            ["id": savedReply.id, "type": "agentMessage", "text": "A conflicting copy of the saved reply."],
+            ["id": "another-prompt", "type": "userMessage", "content": [["type": "text", "text": "Where should I hike?"]]],
+            ["id": "unmatched-reply", "type": "agentMessage", "text": "Try another route."],
+        ]],
+    ]
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "trail-thread", "turns": turns]]))
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    let recovered = ChatMessage(id: "missing-codex-reply", role: "assistant", text: "Try Eagle Trail.")
+    #expect(ready.messages == (itemsView == "full" ? [original, recovered, savedReply, routerReply] : saved))
+    await client.close()
 }
 
 @Test(arguments: ["deepseek/deepseek-v4.1-flash", "gpt-6-luna"])

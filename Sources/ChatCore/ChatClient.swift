@@ -284,15 +284,15 @@ public final class ChatClient: @unchecked Sendable {
            let resumed = try? await resumeCodexThread(id: threadId, model: resumeModel, cwdPath: dir.path) {
             sync {
                 guard codexAvailable else { return }
-                let importedLegacyHistory = conversation.didResume(
+                let recoveredHistory = conversation.didResume(
                     threadId: threadId,
                     name: resumed.name,
-                    codexMessages: StateStore.messagesFromTurns(resumed.turns)
+                    history: CodexHistory(turns: resumed.turns)
                 )
                 if !isOpenRouterModel(model), let resumedModel = resumed.model, !resumedModel.isEmpty {
                     model = resumedModel
                 }
-                if importedLegacyHistory || state.model != model {
+                if recoveredHistory || state.model != model {
                     saveCurrentState()
                 }
             }
@@ -520,7 +520,7 @@ public final class ChatClient: @unchecked Sendable {
                 let formattedInput: String
                 if !unsent.isEmpty {
                     let historyText = unsent.map { "\($0.role == "user" ? "User" : "Assistant"): \($0.text)" }.joined(separator: "\n\n")
-                    formattedInput = "[Earlier turns in this conversation from another model:\n\(historyText)]\n\n\(text)"
+                    formattedInput = "\(ChatPrompt.quotedHistoryPrefix)\(historyText)]\n\n\(text)"
                 } else {
                     formattedInput = text
                 }

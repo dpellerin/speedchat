@@ -103,34 +103,7 @@ public enum StateStore {
     }
 
     public static func messagesFromTurns(_ turns: [[String: Any]]) -> [ChatMessage] {
-        var result = [ChatMessage]()
-        for turn in turns {
-            let items = (turn["items"] as? [[String: Any]]) ?? []
-            let sources = items.flatMap { item -> [CitationSource] in
-                guard (item["type"] as? String) == "webSearch" else { return [] }
-                return RenderNormalizer.citationSources(from: item["results"])
-            }
-            for item in items {
-                guard let id = item["id"] as? String, let type = item["type"] as? String else { continue }
-                if type == "userMessage" {
-                    let parts = (item["content"] as? [[String: Any]]) ?? []
-                    let text = parts.compactMap { part -> String? in
-                        guard (part["type"] as? String) == "text" else { return nil }
-                        return part["text"] as? String
-                    }.joined(separator: "\n")
-                    if !text.isEmpty {
-                        result.append(ChatMessage(id: id, role: "user", text: text))
-                    }
-                } else if type == "agentMessage" {
-                    let phase = item["phase"] as? String
-                    let text = item["text"] as? String ?? ""
-                    if phase != "commentary" && !text.isEmpty {
-                        result.append(ChatMessage(id: id, role: "assistant", text: RenderNormalizer.normalizeAssistantText(text, sources: sources)))
-                    }
-                }
-            }
-        }
-        return result
+        CodexHistory(turns: turns).legacyMessages
     }
 
     public static func friendlyError(_ error: Error) -> String {

@@ -17,4 +17,5 @@ public enum ChatPrompt {
     public static let personality = "friendly"
     public static let reasoningEffort = "low"
     public static let defaultOpenAIModel = "gpt-6-luna"
+    static let quotedHistoryPrefix = "[Earlier turns in this conversation from another model:\n"
 }
