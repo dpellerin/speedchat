@@ -365,3 +365,43 @@ private func visibleDate(_ value:String)->String {
     #expect(initial?.messages == [saved])
     #expect(initial?.models == [])
 }
+
+func writeBridgeCodexFixture(in root: URL) throws -> String {
+    let executable = root.appendingPathComponent("fake-codex")
+    let script = """
+    #!/usr/bin/env python3
+    import json, sys
+    for raw in sys.stdin:
+        message = json.loads(raw)
+        if "id" not in message:
+            continue
+        method, result = message["method"], {}
+        if method == "model/list":
+            result = {"data": [{"model": "gpt-6-luna", "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}
+        elif method == "thread/resume":
+            result = {"thread": {"id": message["params"]["threadId"], "name": "Conversation", "turns": []}}
+        print(json.dumps({"id": message["id"], "result": result}), flush=True)
+    """
+    try script.write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+    return executable.path
+}
+
+@Test func retiringCodexWhileItChecksOwnershipRejectsTheUnsentRequest() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("rpc-retire-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let rpc = JsonRpcProcess(codexOverride: try writeBridgeCodexFixture(in: root), env: [:])
+    try await rpc.start(cwd: root)
+
+    do {
+        _ = try await rpc.request(method: "turn/start", params: [:], timeoutMs: 200, whileCurrent: {
+            rpc.retire()
+            return true
+        })
+        Issue.record("Retirement should reject the request without sending it.")
+    } catch {
+        #expect(error.localizedDescription == "Codex app-server is not running.")
+    }
+    await rpc.stop()
+}

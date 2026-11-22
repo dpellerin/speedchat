@@ -27,6 +27,7 @@ public struct CodexRetry: Codable, Equatable, Sendable {
     public enum Action: String, Codable, Sendable {
         case retry
         case checkDelivery
+        case recoverReply
         case resend
     }
 
@@ -42,6 +43,7 @@ public struct CodexRetry: Codable, Equatable, Sendable {
         switch action {
         case .retry: return nil
         case .checkDelivery: return "Codex may already have received this message. Retry checks delivery."
+        case .recoverReply: return "Codex received this message. Retry to recover the reply."
         case .resend: return "Codex may already have received this message. Sending it again could duplicate it."
         }
     }

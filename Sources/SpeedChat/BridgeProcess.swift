@@ -9,6 +9,9 @@ protocol ChatBackend: AnyObject, Sendable {
 
 /// In-process native chat backend that drives `ChatClient` and coalesces streaming token deltas at ~60fps (16ms).
 final class BridgeProcess: ChatBackend, @unchecked Sendable {
+    typealias TurnOperation = @Sendable () async -> Void
+
+    private let launchTurn: @Sendable (@escaping TurnOperation) -> Void
     private let queue = DispatchQueue(label: "SpeedChat.bridge", qos: .userInitiated)
     private var client: ChatClient?
     private var closing = false
@@ -24,6 +27,12 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
     private var activeExecutionID: UUID?
     private var pendingDelta: BridgeEvent?
     private var deltaTimer: DispatchWorkItem?
+
+    init(launchTurn: @escaping @Sendable (@escaping TurnOperation) -> Void = { operation in
+        Task { await operation() }
+    }) {
+        self.launchTurn = launchTurn
+    }
 
     func start(
         codexOverride: String = "",
@@ -119,7 +128,7 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
         }
 
         switch event.type {
-        case "message", "historyRecovered", "conversationUpdated", "error", "done", "fatal":
+        case "message", "replyPlaceholderRemoved", "historyRecovered", "conversationUpdated", "error", "done", "fatal":
             flushDelta()
         default:
             break
@@ -184,7 +193,7 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                 activeExecutionID = executionID
                 turnStartedAt = Date()
                 firstTokenSeen = false
-                Task {
+                launchTurn {
                     // ChatCore publishes failures with the execution that
                     // produced them and the resulting retry state.
                     if type == "send" {
