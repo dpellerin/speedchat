@@ -132,6 +132,8 @@ scripts/smoke-ui.sh
 
 See [docs/verification.md](docs/verification.md) for detailed test coverage and verification notes.
 
+See the [repo guide](docs/agents/repo-guide.md) for source entry points and request flow.
+
 ---
 
 ## Attribution & License
