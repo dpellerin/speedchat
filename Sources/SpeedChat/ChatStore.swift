@@ -20,6 +20,7 @@ import ChatCore
  var codexOverride=""
  var fixtureMode=false
  var fixtureCommands=[[String:String]]()
+ var fixtureStatusNotice=""
  var changed:(()->Void)?
  func show() {
   hiddenAt=nil;idleTimer?.invalidate();idleTimer=nil
@@ -59,8 +60,8 @@ import ChatCore
  }
  func command(_ value:[String:String]) {if fixtureMode {fixtureCommands.append(value)} else {bridge?.send(value)}}
  func send() {
-  guard let text=session.beginSend(draft) else {return}
-  draft="";followBottom=true;command(["type":"send","text":text])
+  guard let text=session.beginSend(draft),let id=session.messages.last?.id else {return}
+  draft="";followBottom=true;command(["type":"send","text":text,"itemId":id])
  }
  func newChat() {guard session.beginNewChat() else {return};followBottom=true;command(["type":"newChat"])}
  func selectModel(_ model:String) {guard session.beginModelChange(model) else {return};command(["type":"selectModel","model":model])}
@@ -69,5 +70,15 @@ import ChatCore
   else if !fixtureMode {connect()}
  }
  func interrupt() {guard session.streaming else {return};session.stopping();command(["type":"interrupt"])}
- func retry() {guard session.canInteract,!session.lastRequest.isEmpty else {return};draft=session.lastRequest;send()}
+ func retry() {
+  if let id=session.beginCodexRetry(resend:false) {
+   command(["type":"retryCodex","itemId":id])
+  } else if session.canRetryOpenRouter {
+   draft=session.lastRequest;send()
+  }
+ }
+ func resend() {
+  guard let id=session.beginCodexRetry(resend:true) else {return}
+  command(["type":"resendCodex","itemId":id])
+ }
 }

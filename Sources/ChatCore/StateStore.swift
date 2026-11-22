@@ -9,6 +9,7 @@ public struct PersistedState: Codable, Equatable, Sendable {
     public var updatedAt: String
     public var messages: [ChatMessage]?
     public var codexSyncedCount: Int?
+    var lastCodexSend: CodexSendAttempt?
 
     public init(
         version: Int = Self.currentVersion,
@@ -63,7 +64,7 @@ public enum StateStore {
             }
         }
         let codexSyncedCount = raw["codexSyncedCount"] as? Int
-        return PersistedState(
+        var state = PersistedState(
             version: PersistedState.currentVersion,
             threadId: threadId,
             model: model,
@@ -71,6 +72,11 @@ public enum StateStore {
             messages: validMessages,
             codexSyncedCount: codexSyncedCount
         )
+        if let attempt = raw["lastCodexSend"], JSONSerialization.isValidJSONObject(attempt),
+           let data = try? JSONSerialization.data(withJSONObject: attempt) {
+            state.lastCodexSend = try? JSONDecoder().decode(CodexSendAttempt.self, from: data)
+        }
+        return state
     }
 
     public static func save(
@@ -81,12 +87,25 @@ public enum StateStore {
         codexSyncedCount: Int? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) throws {
+        try save(threadId: threadId, model: model, to: url, messages: messages,
+                 codexSyncedCount: codexSyncedCount, lastCodexSend: nil, env: env)
+    }
+
+    static func save(
+        threadId: String,
+        model: String,
+        to url: URL?,
+        messages: [ChatMessage]?,
+        codexSyncedCount: Int?,
+        lastCodexSend: CodexSendAttempt?,
+        env: [String: String]
+    ) throws {
         let target = url ?? stateURL(env: env)
         let dir = target.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
 
-        let payload = PersistedState(
+        var payload = PersistedState(
             version: PersistedState.currentVersion,
             threadId: threadId,
             model: model,
@@ -94,6 +113,7 @@ public enum StateStore {
             messages: messages,
             codexSyncedCount: codexSyncedCount
         )
+        payload.lastCodexSend = lastCodexSend
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         var data = try encoder.encode(payload)
@@ -103,34 +123,7 @@ public enum StateStore {
     }
 
     public static func messagesFromTurns(_ turns: [[String: Any]]) -> [ChatMessage] {
-        var result = [ChatMessage]()
-        for turn in turns {
-            let items = (turn["items"] as? [[String: Any]]) ?? []
-            let sources = items.flatMap { item -> [CitationSource] in
-                guard (item["type"] as? String) == "webSearch" else { return [] }
-                return RenderNormalizer.citationSources(from: item["results"])
-            }
-            for item in items {
-                guard let id = item["id"] as? String, let type = item["type"] as? String else { continue }
-                if type == "userMessage" {
-                    let parts = (item["content"] as? [[String: Any]]) ?? []
-                    let text = parts.compactMap { part -> String? in
-                        guard (part["type"] as? String) == "text" else { return nil }
-                        return part["text"] as? String
-                    }.joined(separator: "\n")
-                    if !text.isEmpty {
-                        result.append(ChatMessage(id: id, role: "user", text: text))
-                    }
-                } else if type == "agentMessage" {
-                    let phase = item["phase"] as? String
-                    let text = item["text"] as? String ?? ""
-                    if phase != "commentary" && !text.isEmpty {
-                        result.append(ChatMessage(id: id, role: "assistant", text: RenderNormalizer.normalizeAssistantText(text, sources: sources)))
-                    }
-                }
-            }
-        }
-        return result
+        CodexHistory(turns: turns).legacyMessages
     }
 
     public static func friendlyError(_ error: Error) -> String {

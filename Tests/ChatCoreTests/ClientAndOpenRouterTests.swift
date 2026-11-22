@@ -10,6 +10,11 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
     var failStart = false
     var failThreadStart = false
     var missingThreadId = false
+    var threadStartModel = "gpt-6-luna"
+    var resumeResult: Result<CodexPayload, Error> = .success(CodexPayload())
+    var beforeThreadRead: (() -> Void)?
+    var readResult: Result<CodexPayload, Error> = .success(CodexPayload())
+    var turnStartError: Error?
     var holdTurnStart = false
     var holdSettings = false
     var holdFirstRename = false
@@ -32,14 +37,20 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
 
     func stop() async {}
 
-    func releaseTurnStart(turnId: String = "t") {
+    var turnStartIsHeld: Bool { sync { turnStartContinuation != nil } }
+
+    func releaseTurnStart(turnId: String = "t", turn: [String: Any]? = nil, error: Error? = nil) {
         let cont = sync { () -> CheckedContinuation<CodexPayload, Error>? in
             let c = turnStartContinuation
             turnStartContinuation = nil
             holdTurnStart = false
             return c
         }
-        cont?.resume(returning: CodexPayload(["turn": ["id": turnId]]))
+        if let error {
+            cont?.resume(throwing: error)
+        } else {
+            cont?.resume(returning: CodexPayload(["turn": turn ?? ["id": turnId]]))
+        }
     }
 
     func releaseSettings() {
@@ -105,6 +116,13 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
                 ],
             ]
         }
+        if method == "thread/read" {
+            beforeThreadRead?()
+            return try readResult.get().value
+        }
+        if method == "thread/resume" {
+            return try resumeResult.get().value
+        }
         if method == "thread/start" {
             if failThreadStart { throw NSError(domain: "test", code: 500) }
             if missingThreadId { return ["thread": [:]] }
@@ -114,9 +132,10 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
                 return c
             }
             let id = count == 0 ? "dedicated" : "thread-\(count)"
-            return ["thread": ["id": id], "model": "gpt-6-luna"]
+            return ["thread": ["id": id], "model": threadStartModel]
         }
         if method == "turn/start" {
+            if let turnStartError { throw turnStartError }
             if (params["threadId"] as? String)?.hasPrefix("openrouter-") == true {
                 throw NSError(domain: "test", code: -32600, userInfo: [NSLocalizedDescriptionKey: "invalid thread id: expected UUID"])
             }
@@ -124,6 +143,233 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
         }
         return [:]
     }
+}
+
+@Test(arguments: ["rejected", "timed out", "malformed", "wrong thread"])
+func savedConversationReopensWhenCodexResumeFails(failure: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-reopen-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let messages = [
+        ChatMessage(id: "saved-user", role: "user", text: "Keep my original prompt."),
+        ChatMessage(id: "saved-reply", role: "assistant", text: "Your prompt is saved."),
+    ]
+    try StateStore.save(threadId: "original-thread", model: "gpt-6-luna", to: stateURL, messages: messages, codexSyncedCount: 2)
+
+    for _ in 0..<2 {
+        let rpc = FakeCodexTransport()
+        switch failure {
+        case "rejected":
+            rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -32600))
+        case "timed out":
+            rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+        case "wrong thread":
+            rpc.resumeResult = .success(CodexPayload(["thread": ["id": "unrelated-thread", "turns": []]]))
+        default:
+            rpc.resumeResult = .success(CodexPayload(["thread": [:]]))
+        }
+        let client = ChatClient(rpc: rpc, options: options)
+        let ready = try await client.connect()
+        #expect(ready.resumed)
+        #expect(ready.threadId == "original-thread")
+        #expect(ready.messages == messages)
+        #expect(rpc.calls.first { $0.method == "thread/resume" }?.params["threadId"] as? String == "original-thread")
+        #expect(!rpc.calls.contains { $0.method == "thread/start" || $0.method == "turn/start" })
+        await client.close()
+    }
+}
+
+@Test(arguments: [false, true])
+func savedConversationTakesPriorityOverLongerCodexHistory(emptySavedConversation: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-conflict-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let messages: [ChatMessage] = emptySavedConversation ? [] : [
+        ChatMessage(id: "saved-user", role: "user", text: "Remember orchard."),
+        ChatMessage(id: "saved-router", role: "assistant", text: "Orchard remembered."),
+        ChatMessage(id: "saved-follow-up", role: "user", text: "Continue."),
+    ]
+    try StateStore.save(threadId: "mixed-thread", model: "gpt-6-luna", to: stateURL, messages: messages, codexSyncedCount: messages.count)
+
+    let rpc = FakeCodexTransport()
+    let turns: [[String: Any]] = [
+        ["id": "handoff", "items": [
+            ["id": "quoted", "type": "userMessage", "content": [
+                ["type": "text", "text": "[Earlier turns in this conversation from another model:\nUser: Remember orchard.\n\nAssistant: Orchard remembered.]\n\nContinue."],
+            ]],
+            ["id": "codex-reply", "type": "agentMessage", "text": "Continuing."],
+        ]],
+        ["id": "unmatched", "items": [
+            ["id": "different-user", "type": "userMessage", "content": [["type": "text", "text": "Continue."]]],
+            ["id": "different-reply", "type": "agentMessage", "text": "New Codex history."],
+        ]],
+    ]
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "mixed-thread", "turns": turns]]))
+    let client = ChatClient(rpc: rpc, options: ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]))
+    let ready = try await client.connect()
+
+    #expect(ready.resumed)
+    #expect(ready.messages == messages)
+    #expect(!rpc.calls.contains { $0.method == "turn/start" || $0.method == "thread/name/set" })
+    await client.close()
+}
+
+@Test func legacyConversationRecoversFromCodexAndReopensFromSavedMessages() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-legacy-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    try StateStore.save(threadId: "legacy-thread", model: "gpt-6-luna", to: stateURL)
+    let partial = FakeCodexTransport()
+    partial.resumeResult = .success(CodexPayload(["thread": [
+        "id": "legacy-thread", "turns": [["id": "legacy-turn", "itemsView": "summary", "items": []]],
+    ]]))
+    let partialClient = ChatClient(rpc: partial, options: options)
+    let incomplete = try await partialClient.connect()
+    #expect(incomplete.messages.isEmpty)
+    await partialClient.close()
+
+    let rpc = FakeCodexTransport()
+    let turns: [[String: Any]] = [
+        ["id": "legacy-turn", "items": [
+            ["id": "legacy-user", "type": "userMessage", "content": [["type": "text", "text": "Hello again."]]],
+            ["id": "legacy-reply", "type": "agentMessage", "text": "Welcome back."],
+        ]],
+        ["id": "legacy-handoff", "items": [
+            ["id": "quoted-user", "type": "userMessage", "content": [
+                ["type": "text", "text": "[Earlier turns in this conversation from another model:\nUser: Hello again.\n\nAssistant: Welcome back.]\n\nTell me more."],
+            ]],
+            ["id": "quoted-reply", "type": "agentMessage", "text": "Here are some more details."],
+        ]],
+    ]
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "legacy-thread", "turns": turns]]))
+    let messages = [
+        ChatMessage(id: "legacy-user", role: "user", text: "Hello again."),
+        ChatMessage(id: "legacy-reply", role: "assistant", text: "Welcome back."),
+        ChatMessage(id: "quoted-reply", role: "assistant", text: "Here are some more details."),
+    ]
+
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    #expect(ready.messages == messages)
+    await client.close()
+
+    let unavailable = FakeCodexTransport()
+    unavailable.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+    let reopened = ChatClient(rpc: unavailable, options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == "legacy-thread")
+    #expect(restored.messages == messages)
+    await reopened.close()
+}
+
+@Test(arguments: [false, true])
+func reopeningRecoversAMissingCodexReplyAfterItsVerifiedPrompt(quotedContext: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-reconcile-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let prompt = ChatMessage(id: "saved-codex-prompt", role: "user", text: "What is the forecast?")
+    let routerPrompt = ChatMessage(id: "saved-router-prompt", role: "user", text: "What is the forecast?")
+    let routerReply = ChatMessage(id: "saved-router-reply", role: "assistant", text: "Windy.", reasoning: "For Beam follow-ups.")
+    let earlierMessages: [ChatMessage] = quotedContext
+        ? [ChatMessage(id: "earlier", role: "user", text: "I live in Fresno.")]
+        : []
+    let input = quotedContext
+        ? "[Earlier turns in this conversation from another model:\nUser: I live in Fresno.]\n\nWhat is the forecast?"
+        : "What is the forecast?"
+    try StateStore.save(threadId: "forecast-thread", model: "gpt-6-luna", to: stateURL, messages: earlierMessages + [prompt, routerPrompt, routerReply], codexSyncedCount: earlierMessages.count + 1)
+
+    let turns: [[String: Any]] = [
+        ["id": "forecast-turn", "items": [
+            ["id": "codex-prompt", "clientId": prompt.id, "type": "userMessage", "content": [["type": "text", "text": input]]],
+            ["id": "private-reasoning", "type": "reasoning", "content": ["Private Codex reasoning."]],
+            ["id": "commentary", "type": "agentMessage", "phase": "commentary", "text": "Checking the forecast."],
+            ["id": "search", "type": "webSearch", "results": [["ref_id": "turn0search0", "url": "https://example.com/forecast", "title": "Forecast"]]],
+            ["id": "codex-reply", "type": "agentMessage", "phase": "final_answer", "text": "Sunny. \u{E200}cite\u{E202}turn0search0\u{E201}"],
+        ]],
+    ]
+    let expected = earlierMessages + [prompt, ChatMessage(id: "codex-reply", role: "assistant", text: "Sunny. [Forecast](https://example.com/forecast)"), routerPrompt, routerReply]
+    for (reopen, resumeSucceeds) in [true, false, true].enumerated() {
+        let rpc = FakeCodexTransport()
+        rpc.resumeResult = resumeSucceeds
+            ? .success(CodexPayload(["thread": ["id": "forecast-thread", "turns": turns]]))
+            : .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+        let client = ChatClient(rpc: rpc, options: options)
+        let ready = try await client.connect()
+        #expect(ready.messages == expected)
+        if reopen == 2 {
+            try await client.send("Is that tomorrow?")
+            let turn = try #require(rpc.calls.last { $0.method == "turn/start" })
+            let input = turn.params["input"] as? [[String: String]]
+            #expect(input?.first?["text"] == "[Earlier turns in this conversation from another model:\nUser: What is the forecast?\n\nAssistant: Windy.]\n\nIs that tomorrow?")
+        }
+        await client.close()
+    }
+}
+
+@Test(arguments: ["full", "summary"])
+func reopeningUsesASavedCodexReplyToPlaceAMissingReplyInTheSameExchange(itemsView: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-assistant-anchor-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let original = ChatMessage(id: "saved-prompt", role: "user", text: "Where should I hike?")
+    let savedReply = ChatMessage(id: "saved-codex-reply", role: "assistant", text: "The trail is closed in winter.")
+    let routerReply = ChatMessage(id: "router-reply", role: "assistant", text: "Consider an alternative trail.")
+    let saved = [original, savedReply, routerReply]
+    try StateStore.save(threadId: "trail-thread", model: "gpt-6-luna", to: stateURL, messages: saved, codexSyncedCount: 2)
+
+    let rpc = FakeCodexTransport()
+    let turns: [[String: Any]] = [
+        ["id": "trail-turn", "itemsView": itemsView, "items": [
+            ["id": "old-codex-prompt", "type": "userMessage", "content": [["type": "text", "text": "Where should I hike?"]]],
+            ["id": "missing-codex-reply", "type": "agentMessage", "text": "Try Eagle Trail."],
+            ["id": savedReply.id, "type": "agentMessage", "text": "A conflicting copy of the saved reply."],
+            ["id": "another-prompt", "type": "userMessage", "content": [["type": "text", "text": "Where should I hike?"]]],
+            ["id": "unmatched-reply", "type": "agentMessage", "text": "Try another route."],
+        ]],
+    ]
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "trail-thread", "turns": turns]]))
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    let recovered = ChatMessage(id: "missing-codex-reply", role: "assistant", text: "Try Eagle Trail.")
+    #expect(ready.messages == (itemsView == "full" ? [original, recovered, savedReply, routerReply] : saved))
+    await client.close()
+}
+
+@Test(arguments: ["deepseek/deepseek-v4.1-flash", "gpt-6-luna"])
+func newChatClearsTheConversationAndKeepsTheSelectedModel(selectedModel: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-reset-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let configURL = dir.appendingPathComponent("openrouter.json")
+    try OpenRouterClient.saveConfig(key: "test-or-key", to: configURL)
+    try StateStore.save(threadId: "previous-thread", model: "gpt-6-luna", to: stateURL, messages: [
+        ChatMessage(id: "previous-user", role: "user", text: "Previous conversation."),
+    ])
+    let options = ChatClientOptions(openRouterConfigURL: configURL, stateURL: stateURL, env: [:])
+    let rpc = FakeCodexTransport()
+    rpc.threadStartModel = "gpt-6-reroute"
+    let client = ChatClient(rpc: rpc, options: options)
+    _ = try await client.connect()
+    let selected = try await client.selectModel(selectedModel)
+    #expect(!selected.messages.isEmpty)
+
+    let ready = try await client.newChat()
+    #expect(ready.threadId != selected.threadId)
+    #expect(ready.messages.isEmpty)
+    #expect(ready.model == selectedModel)
+    await client.close()
+
+    let reopened = ChatClient(rpc: FakeCodexTransport(), options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == ready.threadId)
+    #expect(restored.messages.isEmpty)
+    #expect(restored.model == selectedModel)
+    await reopened.close()
 }
 
 @Test(arguments: ["deepseek/deepseek-v4.1-flash", "gpt-6-luna"])
@@ -159,8 +405,14 @@ func restoredOpenRouterChatCanContinueOnCodex(savedModel: String) async throws {
     #expect(input.hasSuffix("What did I ask you to remember?"))
     let saved = try #require(StateStore.load(from: stateURL))
     #expect(saved.threadId == "dedicated")
-    #expect(saved.messages == history)
+    let clientId = try #require(turn.params["clientUserMessageId"] as? String)
+    #expect(saved.messages == history + [ChatMessage(id: clientId, role: "user", text: "What did I ask you to remember?")])
     #expect(!rpc.calls.contains { ($0.params["threadId"] as? String)?.hasPrefix("openrouter-") == true })
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "dedicated", "turnId": "turn-1",
+        "item": ["id": "codex-user", "type": "userMessage", "clientId": clientId,
+                 "content": [["type": "text", "text": input]]],
+    ]))
     rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
         "threadId": "dedicated", "turn": ["id": "turn-1", "status": "completed"],
     ]))
@@ -185,19 +437,26 @@ func failedCodexHandoffPreservesHistoryAndCanRetry(malformedResponse: Bool) asyn
     let client = ChatClient(rpc: rpc, options: ChatClientOptions(
         openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]))
     _ = try await client.connect()
-    await #expect(throws: (any Error).self) { try await client.send("Try again") }
+    let prompt = ChatMessage(id: "handoff-prompt", role: "user", text: "Try again")
+    await #expect(throws: (any Error).self) { try await client.send(prompt.text, userMessageId: prompt.id) }
     #expect(!client.busy)
-    #expect(StateStore.load(from: stateURL)?.threadId == localId)
-    #expect(StateStore.load(from: stateURL)?.messages == history)
     #expect(!rpc.calls.contains { $0.method == "turn/start" })
+
+    let reopened = ChatClient(rpc: rpc, options: ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]))
+    await client.close()
+    let saved = try await reopened.connect()
+    #expect(saved.threadId == localId)
+    #expect(saved.messages == history + [prompt])
+    #expect(saved.codexRetry == CodexRetry(userMessageId: prompt.id, action: .retry))
     rpc.failThreadStart = false
     rpc.missingThreadId = false
-    try await client.send("Try again")
+    _ = try await reopened.retryCodexSend()
     let turn = try #require(rpc.calls.first { $0.method == "turn/start" })
     let input = try #require((turn.params["input"] as? [[String: Any]])?.first?["text"] as? String)
     #expect(input.contains("Keep this message."))
     #expect(StateStore.load(from: stateURL)?.threadId == "dedicated")
-    await client.close()
+    await reopened.close()
 }
 
 private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
@@ -212,6 +471,220 @@ private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
         continuation.finish()
     }
     return OpenRouterHTTPResponse(statusCode: 200, lines: lines)
+}
+
+@Test(arguments: ["timeout", "malformed response", "archived", "different ID", "different code", "transport error"])
+func retryResumesOriginalThreadAndSendsOnlyNewContext(failure: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-retry-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let history = [
+        ChatMessage(id: "original-prompt", role: "user", text: "Remember the orchard."),
+        ChatMessage(id: "original-reply", role: "assistant", text: "Orchard remembered."),
+        ChatMessage(id: "router-prompt", role: "user", text: "Remember the bakery too."),
+        ChatMessage(id: "router-reply", role: "assistant", text: "Bakery remembered.", reasoning: "Private Beam notes"),
+    ]
+    try StateStore.save(threadId: "original-thread", model: "gpt-6-luna", to: stateURL, messages: history, codexSyncedCount: 2)
+
+    let rpc = FakeCodexTransport()
+    switch failure {
+    case "malformed response":
+        rpc.resumeResult = .success(CodexPayload(["thread": ["id": "original-thread"]]))
+    case "archived":
+        rpc.resumeResult = .failure(CodexRPCError(code: -32600, message:
+            "session original-thread is archived. Run `codex unarchive original-thread` to unarchive it first."))
+    case "different ID":
+        rpc.resumeResult = .failure(CodexRPCError(code: -32600, message: "no rollout found for thread id original-thread-other"))
+    case "different code":
+        rpc.resumeResult = .failure(CodexRPCError(code: -32603, message: "no rollout found for thread id original-thread"))
+    case "transport error":
+        rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -32600, userInfo: [
+            NSLocalizedDescriptionKey: "no rollout found for thread id original-thread",
+        ]))
+    default:
+        rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+    }
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    #expect(ready.messages == history)
+    await #expect(throws: (any Error).self) { try await client.send("What do you remember?") }
+    #expect(!client.busy)
+    #expect(!rpc.calls.contains { $0.method == "thread/start" || $0.method == "turn/start" })
+
+    let reopened = ChatClient(rpc: FakeCodexTransport(), options: options)
+    let saved = try await reopened.connect()
+    #expect(saved.threadId == "original-thread")
+    #expect(saved.messages.dropLast().elementsEqual(history))
+    #expect(saved.messages.last?.text == "What do you remember?")
+    #expect(saved.codexRetry?.userMessageId == saved.messages.last?.id)
+    #expect(saved.codexRetry?.action == .retry)
+    await reopened.close()
+
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "original-thread", "turns": []]]))
+    _ = try await client.retryCodexSend()
+    let turn = try #require(rpc.calls.first { $0.method == "turn/start" })
+    #expect(turn.params["threadId"] as? String == "original-thread")
+    let content = try #require(turn.params["input"] as? [[String: Any]])
+    #expect(content.first?["text"] as? String == """
+    [Earlier turns in this conversation from another model:
+    User: Remember the bakery too.
+
+    Assistant: Bakery remembered.]
+
+    What do you remember?
+    """)
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "original-thread", "turnId": "turn-1",
+        "item": ["id": "new-prompt", "type": "userMessage",
+                 "clientId": turn.params["clientUserMessageId"] as? String ?? "", "content": content],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
+        "threadId": "original-thread", "turnId": "turn-1",
+        "item": ["id": "new-reply", "type": "agentMessage", "text": "The orchard and bakery."],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
+        "threadId": "original-thread", "turn": ["id": "turn-1", "status": "completed"],
+    ]))
+    await client.close()
+
+    let afterReply = ChatClient(rpc: rpc, options: options)
+    let restored = try await afterReply.connect()
+    #expect(restored.threadId == "original-thread")
+    #expect(restored.messages.prefix(history.count).elementsEqual(history))
+    #expect(restored.messages.dropFirst(history.count).map(\.text) == ["What do you remember?", "The orchard and bakery."])
+    await afterReply.close()
+}
+
+@Test(arguments: [false, true], [false, true])
+func confirmedThreadLossUsesAReplacementWithSavedContext(lossAtConnect: Bool, replacementFirstFails: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-replacement-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let history = [
+        ChatMessage(id: "old-prompt", role: "user", text: "Remember the flour order."),
+        ChatMessage(id: "old-reply", role: "assistant", text: "It arrives Friday.", reasoning: "Private Beam notes"),
+    ]
+    try StateStore.save(threadId: "original-thread", model: "gpt-6-luna", to: stateURL, messages: history, codexSyncedCount: 2)
+
+    let missing = CodexRPCError(code: -32600, message: "no rollout found for thread id original-thread")
+    let transient = NSError(domain: "SpeedChat.Codex", code: -2)
+    let rpc = FakeCodexTransport()
+    rpc.resumeResult = .failure(lossAtConnect ? missing : transient)
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    #expect(ready.threadId == "original-thread")
+    #expect(ready.messages == history)
+    #expect(!rpc.calls.contains { $0.method == "thread/start" || $0.method == "turn/start" })
+
+    rpc.resumeResult = .failure(lossAtConnect ? transient : missing)
+    if replacementFirstFails {
+        rpc.failThreadStart = true
+        await #expect(throws: (any Error).self) { try await client.send("When was it arriving?") }
+        #expect(!client.busy)
+        #expect(!rpc.calls.contains { $0.method == "turn/start" })
+
+        let reopenRPC = FakeCodexTransport()
+        reopenRPC.resumeResult = .failure(transient)
+        let reopened = ChatClient(rpc: reopenRPC, options: options)
+        let restored = try await reopened.connect()
+        #expect(restored.threadId == "original-thread")
+        #expect(restored.messages.dropLast().elementsEqual(history))
+        #expect(restored.messages.last?.text == "When was it arriving?")
+        #expect(restored.codexRetry?.action == .retry)
+        await reopened.close()
+
+        rpc.resumeResult = .failure(transient)
+        rpc.failThreadStart = false
+        _ = try await client.retryCodexSend()
+    } else {
+        try await client.send("When was it arriving?")
+    }
+    let turn = try #require(rpc.calls.first { $0.method == "turn/start" })
+    #expect(turn.params["threadId"] as? String == "dedicated")
+    let content = try #require(turn.params["input"] as? [[String: Any]])
+    #expect(content.first?["text"] as? String == """
+    [Earlier turns in this conversation from another model:
+    User: Remember the flour order.
+
+    Assistant: It arrives Friday.]
+
+    When was it arriving?
+    """)
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "dedicated", "turnId": "turn-1",
+        "item": ["id": "new-prompt", "type": "userMessage",
+                 "clientId": turn.params["clientUserMessageId"] as? String ?? "", "content": content],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
+        "threadId": "dedicated", "turnId": "turn-1",
+        "item": ["id": "new-reply", "type": "agentMessage", "text": "Friday."],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
+        "threadId": "dedicated", "turn": ["id": "turn-1", "status": "completed"],
+    ]))
+    await client.close()
+
+    let reopened = ChatClient(rpc: FakeCodexTransport(), options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == "dedicated")
+    #expect(restored.messages.prefix(history.count).elementsEqual(history))
+    #expect(restored.messages.dropFirst(history.count).map(\.text) == ["When was it arriving?", "Friday."])
+    await reopened.close()
+}
+
+@Test func detachedConversationCanSelectModelsAndContinueOnOpenRouter() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-detached-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let configURL = dir.appendingPathComponent("openrouter.json")
+    let routerModel = "deepseek/deepseek-v4.1-flash"
+    try OpenRouterClient.saveConfig(key: "test-or-key", to: configURL)
+    let history = [
+        ChatMessage(id: "saved-user", role: "user", text: "Remember orchard."),
+        ChatMessage(id: "saved-reply", role: "assistant", text: "Orchard remembered."),
+    ]
+    try StateStore.save(threadId: "original-thread", model: routerModel, to: stateURL, messages: history, codexSyncedCount: 2)
+    let fetch: OpenRouterFetch = { request in
+        let data = try #require(request.httpBody)
+        let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        #expect(body["model"] as? String == routerModel)
+        #expect(messages.filter { $0["role"] as? String != "system" }.compactMap { $0["content"] as? String } == [
+            "Remember orchard.", "Orchard remembered.", "What did I ask you to remember?",
+        ])
+        return sseStream([["choices": [["delta": ["content": "Orchard."]]]]])
+    }
+    let options = ChatClientOptions(openRouterFetch: fetch, openRouterConfigURL: configURL, stateURL: stateURL, env: [:])
+    let rpc = FakeCodexTransport()
+    rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    #expect(ready.messages == history)
+    let openAI = try await client.selectModel("gpt-6-luna")
+    #expect(openAI.model == "gpt-6-luna")
+    let openRouter = try await client.selectModel(routerModel)
+    #expect(openRouter.model == routerModel)
+    #expect(openRouter.messages == history)
+
+    let (done, completion) = AsyncStream<Bool>.makeStream()
+    client.onDone = { completion.yield(true) }
+    client.onError = { _ in completion.yield(false) }
+    try await client.send("What did I ask you to remember?")
+    var responses = done.makeAsyncIterator()
+    #expect(await responses.next() == true)
+    #expect(rpc.calls.filter { $0.method.hasPrefix("thread/") || $0.method.hasPrefix("turn/") }.map(\.method) == ["thread/resume"])
+    await client.close()
+
+    let unavailable = FakeCodexTransport()
+    unavailable.failStart = true
+    let reopened = ChatClient(rpc: unavailable, options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == "original-thread")
+    #expect(restored.messages.prefix(2).elementsEqual(history))
+    #expect(restored.messages.dropFirst(2).map(\.text) == ["What did I ask you to remember?", "Orchard."])
+    await reopened.close()
 }
 
 @Test func chooserIncludesOnlyVisibleModelsSupportingLowEffortAndPrefersLuna() {
@@ -412,6 +885,13 @@ private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
     let renameCalls = rpc.calls.filter { $0.method == "thread/name/set" && ($0.params["name"] as? String) != "New chat" }
     #expect(renameCalls.last?.params["name"] as? String == "Plan a weekend trip to Yosemite")
     #expect(rpc.calls.contains(where: { $0.method == "turn/interrupt" }))
+    let started = try #require(rpc.calls.first { $0.method == "turn/start" })
+    let sentId = try #require(started.params["clientUserMessageId"] as? String)
+    let sentInput = try #require(started.params["input"] as? [[String: Any]])
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "dedicated", "turnId": "t1",
+        "item": ["id": "recorded-prompt", "type": "userMessage", "clientId": sentId, "content": sentInput],
+    ]))
 
     // Foreign and late events ignored; reroutes update active model; unknown tools & image tools handled
     final class EventCollector: @unchecked Sendable {
@@ -430,7 +910,7 @@ private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
     rpc.onNotification?(CodexNotification(method: "item/agentMessage/delta", params: ["threadId": "dedicated", "turnId": "old", "delta": "old"]))
     #expect(collector.deltas.isEmpty)
 
-    rpc.onNotification?(CodexNotification(method: "model/rerouted", params: ["threadId": "dedicated", "toModel": "gpt-6-sol"]))
+    rpc.onNotification?(CodexNotification(method: "model/rerouted", params: ["threadId": "dedicated", "turnId": "t1", "toModel": "gpt-6-sol"]))
     #expect(collector.models.last == "gpt-6-sol")
 
     // Blocked tool item
@@ -511,4 +991,100 @@ private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
     ])
 
     await client.close()
+}
+
+@Test func savedConversationReopensWithoutAnAvailableProvider() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]
+    )
+    let rpc = FakeCodexTransport()
+    rpc.failStart = true
+    let emptyClient = ChatClient(rpc: rpc, options: options)
+    await #expect(throws: (any Error).self) { _ = try await emptyClient.connect() }
+    await emptyClient.close()
+
+    let messages = [ChatMessage(id: "saved-reply", role: "assistant", text: "You can visit after noon.")]
+    try StateStore.save(threadId: "original-thread", model: "gpt-6-luna", to: stateURL, messages: messages)
+    let client = ChatClient(rpc: rpc, options: options)
+    let saved = try await client.connect()
+    #expect(saved.threadId == "original-thread")
+    #expect(saved.messages == messages)
+    #expect(saved.model == "gpt-6-luna")
+    #expect(saved.models.isEmpty)
+    #expect(saved.offlineReason?.contains("OpenAI sign-in") == true)
+    #expect(rpc.calls.isEmpty)
+    await client.close()
+}
+
+@Test(arguments: [false, true])
+func recoveryKeepsRepliesWithinTheirVerifiedPromptSegment(conflictingAnchor: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]
+    )
+    let prompt = ChatMessage(id: "first", role: "user", text: "Where can I hike?")
+    let next = ChatMessage(id: "second", role: "user", text: "When does it open?")
+    let existing = ChatMessage(id: "recorded-reply", role: "assistant", text: "Try Eagle Trail.")
+    let missing = ChatMessage(id: "missing-reply", role: "assistant", text: "Take water.")
+    let saved = conflictingAnchor ? [prompt, next, existing] : [prompt, existing, next]
+    try StateStore.save(threadId: "trail", model: "gpt-6-luna", to: stateURL, messages: saved)
+
+    let rpc = FakeCodexTransport()
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "trail", "turns": [
+        ["id": "hike", "items": [
+            ["id": "wire-prompt", "type": "userMessage", "clientId": prompt.id,
+             "content": [["type": "text", "text": prompt.text]]],
+            ["id": existing.id, "type": "agentMessage", "text": existing.text],
+            ["id": missing.id, "type": "agentMessage", "text": missing.text],
+        ]],
+    ]]]))
+    let client = ChatClient(rpc: rpc, options: options)
+    let restored = try await client.connect()
+    #expect(restored.messages == (conflictingAnchor ? saved : [prompt, existing, missing, next]))
+    await client.close()
+}
+
+@Test func disconnectDuringSendPreparationKeepsTheOriginalThreadAndSyncedContext() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]
+    )
+    let original = ChatMessage(id: "saved", role: "user", text: "Where can I hike?")
+    let reply = ChatMessage(id: "reply", role: "assistant", text: "Try Eagle Trail.")
+    let prompt = ChatMessage(id: "follow-up", role: "user", text: "When does it open?")
+    try StateStore.save(threadId: "trail", model: "gpt-6-luna", to: stateURL, messages: [original], codexSyncedCount: 1)
+    let rpc = FakeCodexTransport()
+    let client = ChatClient(rpc: rpc, options: options)
+    _ = try await client.connect()
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "trail", "turns": [
+        ["id": "previous", "items": [
+            ["id": "recorded", "type": "userMessage", "clientId": original.id,
+             "content": [["type": "text", "text": original.text]]],
+            ["id": reply.id, "type": "agentMessage", "text": reply.text],
+        ]],
+    ]]]))
+    client.onHistoryRecovered = { _ in rpc.onExit?() }
+    await #expect(throws: (any Error).self) { try await client.send(prompt.text, userMessageId: prompt.id) }
+    #expect(!rpc.calls.contains { $0.method == "thread/start" || $0.method == "turn/start" })
+    await client.close()
+
+    let retryRPC = FakeCodexTransport()
+    retryRPC.resumeResult = rpc.resumeResult
+    let reopened = ChatClient(rpc: retryRPC, options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == "trail")
+    #expect(restored.messages == [original, reply, prompt])
+    #expect(restored.codexRetry == CodexRetry(userMessageId: prompt.id, action: .retry))
+    _ = try await reopened.retryCodexSend()
+    let dispatched = try #require(retryRPC.calls.last { $0.method == "turn/start" })
+    #expect(dispatched.params["threadId"] as? String == "trail")
+    #expect((dispatched.params["input"] as? [[String: Any]])?.first?["text"] as? String == prompt.text)
+    await reopened.close()
 }

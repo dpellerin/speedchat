@@ -143,6 +143,61 @@ extension AppDelegate {
      })
      if let view=self.panel.contentView,let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds) {view.cacheDisplay(in:view.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/new-chat-\(reset).png"))}
     }
+    func accessibleElements(_ element:Any,depth:Int=0)->[any NSAccessibilityProtocol] {
+     guard depth < 30,let node=element as? any NSAccessibilityProtocol else {return []}
+     return [node]+(node.accessibilityChildren() ?? []).flatMap{accessibleElements($0,depth:depth+1)}
+    }
+    let pending=ChatMessage(id:"delivery-prompt",role:"user",text:"When does the orchard open?")
+    self.store.session.receive(BridgeEvent(type:"ready",messages:[pending],models:ready.models,model:"gpt-6-luna",
+                                          codexRetry:CodexRetry(userMessageId:pending.id,action:.checkDelivery)))
+    self.store.retry()
+    check("Retry checks delivery of the original prompt",
+          self.store.fixtureCommands.last == ["type":"retryCodex","itemId":pending.id] &&
+          self.store.session.messages == [pending])
+    self.store.session.receive(BridgeEvent(type:"conversationUpdated",messages:[pending],
+                                          codexRetry:CodexRetry(userMessageId:pending.id,action:.resend)))
+    let warning="Codex may already have received this message. Sending it again could duplicate it."
+    for _ in 0..<30 {
+     if self.store.fixtureStatusNotice == warning {break}
+     try? await Task.sleep(for:.milliseconds(25))
+    }
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    check("Panel displays the uncertainty warning before resend",
+          self.panel.isVisible && self.store.fixtureStatusNotice == warning)
+    self.store.resend()
+    check("Explicit resend dispatches the original prompt and preserves one row",
+          self.store.fixtureCommands.last == ["type":"resendCodex","itemId":pending.id] &&
+          self.store.session.messages == [pending])
+    self.store.session.receive(BridgeEvent(type:"done"))
+
+    let later=ChatMessage(id:"later-prompt",role:"user",text:"Are the trails open?")
+    self.store.session.receive(BridgeEvent(type:"ready",messages:[pending,later],models:ready.models,model:"gpt-6-luna",
+                                          codexRetry:CodexRetry(userMessageId:pending.id,action:.checkDelivery)))
+    self.store.retry()
+    self.store.session.receive(BridgeEvent(type:"codexReplyResumed",messages:[pending,later],itemId:pending.id))
+    let commands=self.store.fixtureCommands.count
+    self.store.draft="Another question"
+    self.store.send()
+    check("Panel gates Send while the original Codex reply streams",
+          self.store.session.streaming && self.store.fixtureCommands.count == commands)
+    let reply=ChatMessage(id:"live-reply",role:"assistant",text:"The orchard opens at noon.")
+    self.store.session.receive(BridgeEvent(type:"delta",itemId:reply.id,delta:"The orchard"))
+    self.store.session.receive(BridgeEvent(type:"message",itemId:reply.id,text:reply.text))
+    self.store.session.receive(BridgeEvent(type:"done"))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    check("Panel renders the original Codex reply in its own turn",
+          self.store.session.messages == [pending,reply,later] && self.store.session.canSend &&
+          (self.panel.contentView.map(findProse) ?? []).contains {$0.storage.string == reply.text && !$0.visibleRect.isEmpty})
+
+    let offlineNotice="Codex is offline. Reconnect to continue."
+    self.store.session.receive(BridgeEvent(type:"offlineConversation",messages:[pending,reply],models:[],model:"gpt-6-luna",notice:offlineNotice))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    check("Panel shows the saved conversation while offline",
+          self.store.session.phase == .offline && !self.store.session.canSend && self.store.fixtureStatusNotice == offlineNotice &&
+          (self.panel.contentView.map(findProse) ?? []).contains {$0.storage.string == reply.text && !$0.visibleRect.isEmpty})
+
     if CommandLine.arguments.contains("--new-chat-smoke") {
      let failures=checks.filter{($0["passed"] as? Bool) != true}.count
      let report:[String:Any]=["checks":checks,"passed":checks.count-failures,"failed":failures]
@@ -162,10 +217,6 @@ extension AppDelegate {
       self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
       check("Link hover matches \(name) text at width \(Int(width))",renderedLinkHoverMatches())
      }
-    }
-    func accessibleElements(_ element:Any,depth:Int=0)->[any NSAccessibilityProtocol] {
-     guard depth < 30,let node=element as? any NSAccessibilityProtocol else {return []}
-     return [node]+(node.accessibilityChildren() ?? []).flatMap{accessibleElements($0,depth:depth+1)}
     }
     let errorNotice="OpenRouter request failed (HTTP 400). "+String(repeating:"The provider rejected a request parameter. ",count:12)+"Diagnostic end marker."
     self.store.session.receive(BridgeEvent(type:"error",message:errorNotice))

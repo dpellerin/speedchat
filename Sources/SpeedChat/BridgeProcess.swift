@@ -6,6 +6,11 @@ final class BridgeProcess: @unchecked Sendable {
     private let queue = DispatchQueue(label: "SpeedChat.bridge", qos: .userInitiated)
     private var client: ChatClient?
     private var closing = false
+    private enum Startup {
+        case connecting(exitReason: String?)
+        case finished
+    }
+    private var startup = Startup.connecting(exitReason: nil)
     private var onEvent: (@Sendable (BridgeEvent) -> Void)?
     private var turnStartedAt: Date?
     private var firstTokenSeen = false
@@ -21,6 +26,7 @@ final class BridgeProcess: @unchecked Sendable {
         queue.async { [self] in
             self.onEvent = onEvent
             self.closing = false
+            self.startup = .connecting(exitReason: nil)
             let rpc = JsonRpcProcess(codexOverride: codexOverride, env: options.env)
             let chatClient = ChatClient(rpc: rpc, options: options)
             self.client = chatClient
@@ -49,12 +55,26 @@ final class BridgeProcess: @unchecked Sendable {
                     self.onEvent?(BridgeEvent(type: "message", itemId: itemId, text: text))
                 }
             }
-            chatClient.onDone = { [weak self] in
+            chatClient.onHistoryRecovered = { [weak self] messages in
+                self?.queue.async { [weak self] in
+                    guard let self, !self.closing else { return }
+                    self.flushDelta()
+                    self.onEvent?(BridgeEvent(type: "historyRecovered", messages: messages))
+                }
+            }
+            chatClient.onCodexReplyResumed = { [weak self] promptId, messages in
+                self?.queue.async { [weak self] in
+                    guard let self, !self.closing else { return }
+                    self.onEvent?(BridgeEvent(type: "codexReplyResumed", messages: messages, itemId: promptId))
+                }
+            }
+            chatClient.onDone = { [weak self, weak chatClient] in
+                let retry = chatClient?.codexRetry
                 self?.queue.async { [weak self] in
                     guard let self, !self.closing else { return }
                     self.flushDelta()
                     self.emitMetric("response")
-                    self.onEvent?(BridgeEvent(type: "done"))
+                    self.onEvent?(BridgeEvent(type: "done", codexRetry: retry))
                 }
             }
             chatClient.onSearching = { [weak self] in
@@ -69,22 +89,31 @@ final class BridgeProcess: @unchecked Sendable {
                     self.onEvent?(BridgeEvent(type: "activeModel", model: activeModel))
                 }
             }
-            chatClient.onError = { [weak self] error in
+            chatClient.onError = { [weak self, weak chatClient] error in
+                let busy = chatClient?.busy
+                let retry = chatClient?.codexRetry
                 self?.queue.async { [weak self] in
                     guard let self, !self.closing else { return }
                     self.flushDelta()
                     self.onEvent?(BridgeEvent(
                         type: "error",
                         message: StateStore.friendlyError(error),
-                        busy: chatClient.busy
+                        busy: busy,
+                        codexRetry: retry
                     ))
                 }
             }
             chatClient.onFatal = { [weak self] error in
                 self?.queue.async { [weak self] in
                     guard let self, !self.closing else { return }
+                    let reason = StateStore.friendlyError(error)
+                    if case .connecting = self.startup {
+                        // The connection attempt still has to load the saved conversation.
+                        self.startup = .connecting(exitReason: reason)
+                        return
+                    }
                     self.flushDelta()
-                    self.onEvent?(BridgeEvent(type: "fatal", message: StateStore.friendlyError(error)))
+                    self.onEvent?(BridgeEvent(type: "fatal", message: reason))
                 }
             }
 
@@ -93,18 +122,31 @@ final class BridgeProcess: @unchecked Sendable {
                     let ready = try await chatClient.connect()
                     self?.queue.async { [weak self] in
                         guard let self, !self.closing else { return }
+                        let startup = self.startup
+                        self.startup = .finished
+                        var offlineReason = ready.offlineReason
+                        if case .connecting(let exitReason?) = startup {
+                            guard ready.resumed else {
+                                self.onEvent?(BridgeEvent(type: "fatal", message: exitReason))
+                                return
+                            }
+                            offlineReason = offlineReason ?? exitReason
+                        }
                         let notice = (ready.resumed && !ready.messages.isEmpty) ? "Resumed previous chat" : "Ready"
                         self.onEvent?(BridgeEvent(
-                            type: "ready",
+                            type: offlineReason == nil ? "ready" : "offlineConversation",
                             messages: ready.messages,
-                            models: ready.models,
+                            models: offlineReason == nil ? ready.models : [],
                             model: ready.model,
-                            notice: notice
+                            notice: offlineReason.map { "Offline · \($0)" } ?? notice,
+                            stateSaveError: ready.stateSaveError,
+                            codexRetry: ready.codexRetry
                         ))
                     }
                 } catch {
                     self?.queue.async { [weak self] in
                         guard let self, !self.closing else { return }
+                        self.startup = .finished
                         self.onEvent?(BridgeEvent(type: "fatal", message: StateStore.friendlyError(error)))
                     }
                 }
@@ -140,18 +182,36 @@ final class BridgeProcess: @unchecked Sendable {
                 return
             }
             let type = command["type"] ?? ""
-            if type == "send" {
+            if type == "send" || type == "retryCodex" || type == "resendCodex" {
                 let text = (command["text"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty else { return }
+                guard type != "send" || !text.isEmpty else { return }
                 turnStartedAt = Date()
                 firstTokenSeen = false
                 Task { [weak self] in
                     do {
-                        try await chatClient.send(text)
+                        if type == "send" {
+                            if let id = command["itemId"] {
+                                try await chatClient.send(text, userMessageId: id)
+                            } else {
+                                try await chatClient.send(text)
+                            }
+                        } else if let id = command["itemId"],
+                                  let checked = try await chatClient.retryCodexSend(userMessageId: id, resend: type == "resendCodex") {
+                            self?.queue.async { [weak self] in
+                                guard let self, !self.closing else { return }
+                                self.onEvent?(BridgeEvent(
+                                    type: "conversationUpdated",
+                                    messages: checked.messages,
+                                    notice: checked.codexRetry == nil ? "Codex received this message." : nil,
+                                    stateSaveError: checked.stateSaveError,
+                                    codexRetry: checked.codexRetry
+                                ))
+                            }
+                        }
                     } catch {
                         self?.queue.async { [weak self] in
                             guard let self, !self.closing else { return }
-                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy))
+                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy, codexRetry: chatClient.codexRetry))
                         }
                     }
                 }
@@ -174,7 +234,7 @@ final class BridgeProcess: @unchecked Sendable {
                     } catch {
                         self?.queue.async { [weak self] in
                             guard let self, !self.closing else { return }
-                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy))
+                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy, codexRetry: chatClient.codexRetry))
                         }
                     }
                 }
@@ -187,12 +247,12 @@ final class BridgeProcess: @unchecked Sendable {
                         let ready = try await chatClient.selectModel(model)
                         self?.queue.async { [weak self] in
                             guard let self, !self.closing else { return }
-                            self.onEvent?(BridgeEvent(type: "modelSelected", model: ready.model))
+                            self.onEvent?(BridgeEvent(type: "modelSelected", model: ready.model, codexRetry: ready.codexRetry))
                         }
                     } catch {
                         self?.queue.async { [weak self] in
                             guard let self, !self.closing else { return }
-                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy))
+                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy, codexRetry: chatClient.codexRetry))
                         }
                     }
                 }
@@ -203,7 +263,7 @@ final class BridgeProcess: @unchecked Sendable {
                     let ready = await chatClient.reloadOpenRouter()
                     self?.queue.async { [weak self] in
                         guard let self, !self.closing else { return }
-                        self.onEvent?(BridgeEvent(type: "modelsUpdated", models: ready.models, model: ready.model))
+                        self.onEvent?(BridgeEvent(type: "modelsUpdated", models: ready.models, model: ready.model, codexRetry: ready.codexRetry))
                     }
                 }
                 return
