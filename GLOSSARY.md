@@ -31,6 +31,12 @@ A user submission or an assistant reply in a conversation.
 **Turn**:
 One exchange initiated by sending a user message. A turn can complete, fail, or be stopped.
 
+**Active turn**:
+The turn whose response SpeedChat is preparing or receiving. It can be active before the provider starts work.
+
+**Stop**:
+The action that ends a turn’s response and keeps the submitted message in the conversation.
+
 **New Chat**:
 The action that starts a fresh conversation with an empty transcript and carries over the selected model.
 
