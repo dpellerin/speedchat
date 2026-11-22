@@ -34,7 +34,7 @@ public struct OpenRouterStreamOptions: Sendable {
     public var onCitation: (@Sendable (CitationSource) -> Void)?
     public var onReasoning: (@Sendable (String) -> Void)?
     public var fetch: OpenRouterFetch?
-    var checkDispatch: (@Sendable () throws -> Void)?
+    var dispatch: (@Sendable (URLRequest, @escaping OpenRouterFetch) throws -> Task<OpenRouterHTTPResponse, Error>)?
 
     public init(
         key: String,
@@ -261,6 +261,7 @@ public enum OpenRouterClient {
     }
 
     public static let liveFetch: OpenRouterFetch = { request in
+        try Task.checkCancellation()
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
         let http = response as? HTTPURLResponse
         let status = http?.statusCode ?? 200
@@ -358,8 +359,12 @@ public enum OpenRouterClient {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         try Task.checkCancellation()
-        try options.checkDispatch?()
-        let response = try await fetchFn(request)
+        let response: OpenRouterHTTPResponse
+        if let dispatch = options.dispatch {
+            response = try await dispatch(request, fetchFn).value
+        } else {
+            response = try await fetchFn(request)
+        }
         if !(200..<300).contains(response.statusCode) {
             throw extractError(status: response.statusCode, bodyText: response.errorBody)
         }

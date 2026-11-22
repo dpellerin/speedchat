@@ -71,6 +71,11 @@ func nativeBridgeStopsOpenRouterAndKeepsThePanelUsable(saveFails: Bool, blankRep
     #expect(firstStop["executionID"] == firstID)
     bridge.send(firstStop)
     bridge.send(firstStop)
+    if blankReply {
+        let removal = try await receive("replyPlaceholderRemoved", from: events, in: store)
+        #expect(removal.executionID?.uuidString == firstID)
+        #expect(store.session.messages.map(\.text) == ["First prompt"])
+    }
     let stopped = try await receive("done", from: events, in: store)
     let stoppedMessages = store.session.messages
     #expect(stoppedMessages.map(\.text) == stoppedTexts)
@@ -274,4 +279,73 @@ private actor HeldOpenRouterFetch {
         }))
         pending = nil
     }
+}
+
+@MainActor
+@Test(arguments: [false, true])
+func nativeStopBeforeProviderStartupKeepsThePromptAndSkipsOpenRouter(attached: Bool) async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("bridge-early-stop-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let configURL = root.appendingPathComponent("openrouter.json")
+    let stateURL = root.appendingPathComponent("state.json")
+    let model = OpenRouterClient.defaultModels[0].model
+    let threadID = attached ? "codex-history" : "openrouter-history"
+    let earlier = ChatMessage(id: "earlier", role: "user", text: "Earlier prompt")
+    try OpenRouterClient.saveConfig(key: "test-key", to: configURL)
+    try StateStore.save(threadId: threadID, model: model, to: stateURL, messages: [earlier],
+                        codexSyncedCount: attached ? 1 : 0)
+    let codexPath = attached ? try writeBridgeCodexFixture(in: root) : root.appendingPathComponent("missing-codex").path
+    let options = ChatClientOptions(
+        openRouterFetch: { request in
+            let body = try #require(request.httpBody)
+            let payload = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            let messages = try #require(payload["messages"] as? [[String: String]])
+            try #require(messages.last?["content"] == "Follow up", "The stopped turn must never reach OpenRouter.")
+            #expect(messages.filter { $0["role"] != "system" }.compactMap { $0["content"] } ==
+                ["Earlier prompt", "Stop this prompt", "Follow up"])
+            return OpenRouterHTTPResponse(statusCode: 200, lines: AsyncThrowingStream { sink in
+                sink.yield(#"data: {"choices":[{"delta":{"content":"New reply."}}]}"#)
+                sink.finish()
+            })
+        },
+        openRouterConfigURL: configURL, stateURL: stateURL, env: [:]
+    )
+    let (launches, holder) = AsyncStream<BridgeProcess.TurnOperation>.makeStream()
+    let timeout = Task {
+        try? await Task.sleep(for: .seconds(5))
+        holder.finish()
+    }
+    defer { timeout.cancel() }
+    let bridge = BridgeProcess(launchTurn: { holder.yield($0) })
+    let events = OpenRouterBridgeEvents()
+    let store = ChatStore()
+    store.bridge = bridge
+    bridge.start(codexOverride: codexPath, options: options, onEvent: events.append)
+    let ready = try await receive("ready", from: events, in: store)
+    #expect(ready.model == model)
+    #expect(ready.models?.contains { $0.provider == "openai" } == attached)
+
+    store.draft = "Stop this prompt"
+    store.send()
+    let executionID = try #require(store.session.executionID)
+    var pendingLaunches = launches.makeAsyncIterator()
+    let stoppedTurn = try #require(await pendingLaunches.next())
+    store.interrupt()
+    let stopped = try await receive("done", from: events, in: store)
+    #expect(stopped.executionID == executionID)
+    #expect(store.session.canSend)
+    #expect(store.session.messages.map(\.text) == ["Earlier prompt", "Stop this prompt"])
+    let saved = StateStore.load(from: stateURL)
+    #expect(saved?.messages == store.session.messages)
+    #expect(saved?.threadId == threadID)
+    #expect(saved?.codexSyncedCount == (attached ? 1 : 0))
+    await stoppedTurn()
+
+    store.draft = "Follow up"
+    store.send()
+    let nextTurn = try #require(await pendingLaunches.next())
+    await nextTurn()
+    _ = try await receive("done", from: events, in: store)
+    #expect(store.session.messages.map(\.text) == ["Earlier prompt", "Stop this prompt", "Follow up", "New reply."])
+    await withCheckedContinuation { continuation in bridge.close { continuation.resume() } }
 }

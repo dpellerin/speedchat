@@ -278,13 +278,21 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         let boxed = CodexPayload(params)
         let response: CodexPayload = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CodexPayload, Error>) in
             queue.async { [self] in
-                guard self.child != nil, self.input != nil, !retirementLock.withLock({ retired }),
-                      whileCurrent() else {
+                // Ownership may take the ChatClient lock. Evaluate it before
+                // entering the retirement gate to preserve the lock order.
+                guard self.child != nil, self.input != nil, whileCurrent() else {
                     continuation.resume(throwing: CodexRequestNotSent())
                     return
                 }
                 let id = self.nextId
                 self.nextId += 1
+                do {
+                    try self.write(["id": id, "method": method, "params": boxed.value])
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                // Replies are handled on this same queue, after registration.
                 let timer = DispatchWorkItem { [weak self] in
                     guard let self, let pending = self.pending.removeValue(forKey: id) else { return }
                     pending.reject(NSError(domain: "SpeedChat.Codex", code: -2, userInfo: [NSLocalizedDescriptionKey: "\(method) timed out."]))
@@ -295,7 +303,6 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
                     timer: timer
                 )
                 self.queue.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timer)
-                self.write(["id": id, "method": method, "params": boxed.value])
             }
         }
         return response.value
@@ -304,7 +311,7 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
     public func notify(method: String, params: [String: Any]) {
         let boxed = CodexPayload(params)
         queue.async { [self] in
-            self.write(["method": method, "params": boxed.value])
+            try? self.write(["method": method, "params": boxed.value])
         }
     }
 
@@ -335,12 +342,16 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         }
     }
 
-    private func write(_ object: [String: Any]) {
-        guard let input,
-              var data = try? JSONSerialization.data(withJSONObject: object) else { return }
+    private func write(_ object: [String: Any]) throws {
+        guard let input, JSONSerialization.isValidJSONObject(object),
+              var data = try? JSONSerialization.data(withJSONObject: object) else {
+            throw CodexRequestNotSent()
+        }
         data.append(10)
-        guard !retirementLock.withLock({ retired }) else { return }
-        try? input.write(contentsOf: data)
+        try retirementLock.withLock {
+            guard !retired else { throw CodexRequestNotSent() }
+            try input.write(contentsOf: data)
+        }
     }
 
     private func handleStdout(_ data: Data, handle: FileHandle) {
@@ -360,7 +371,7 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
             return
         }
         if let method = message["method"] as? String, let reqId = message["id"] {
-            write([
+            try? write([
                 "id": reqId,
                 "error": [
                     "code": -32601,

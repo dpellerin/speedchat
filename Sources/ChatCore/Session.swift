@@ -110,8 +110,12 @@ public struct ChatSession: Sendable {
  }
  public mutating func beginCodexRetry(resend:Bool) -> String? {
   guard let retry=visibleCodexRetry,resend == (retry.action == .resend) else {return nil}
-  phase = retry.action == .checkDelivery ? .checkingDelivery : .sending
-  notice = retry.action == .retry ? "Thinking…" : "Checking Codex delivery…"
+  switch retry.action {
+  case .retry: phase = .sending;notice="Thinking…"
+  case .checkDelivery: phase = .checkingDelivery;notice="Checking Codex delivery…"
+  case .recoverReply: phase = .checkingDelivery;notice="Recovering the Codex reply…"
+  case .resend: phase = .sending;notice="Checking Codex delivery…"
+  }
   failed=false;failureDetails=nil;activeModel=selectedModel
   activeCodexPromptId=retry.userMessageId
   lastRequestWasOpenRouter=false
@@ -150,6 +154,9 @@ public struct ChatSession: Sendable {
    phase = .ready;notice=event.stateSaveError ?? event.notice ?? "Ready";activeCodexPromptId=nil;executionID=nil
    failed=event.stateSaveError != nil;failureDetails=event.stateSaveError
    updateCodexRetry(event.codexRetry)
+  case "codexDeliveryUpdated":
+   updateCodexRetry(event.codexRetry)
+   if let warning=event.stateSaveError, visibleCodexRetry != nil {notice=warning;failureDetails=warning}
   case "modelsUpdated":
    models=event.models ?? models
    if let updated=event.model, !updated.isEmpty { selectedModel=updated; if !streaming { activeModel=updated } }
@@ -164,13 +171,12 @@ public struct ChatSession: Sendable {
     activeModel=event.model ?? activeModel
     if notice == "Checking Codex delivery…" {notice="Thinking…"}
    }
+  case "replyPlaceholderRemoved":
+   guard streaming, let id=event.itemId else {return}
+   messages.removeAll {$0.id == id && $0.role == "assistant"}
   case "delta","message":
    guard streaming else {return}
    let id=event.itemId ?? "assistant"
-   if event.type == "message", event.executionID != nil, event.text == "" {
-    messages.removeAll {$0.id == id && $0.role == "assistant"}
-    return
-   }
    if let i=messages.firstIndex(where:{$0.id==id}) {if event.type == "delta" {messages[i].text += event.delta ?? ""} else {messages[i].text=event.text ?? ""}}
    else {
     let reply=ChatMessage(id:id,role:"assistant",text:event.type == "delta" ? event.delta ?? "" : event.text ?? "")

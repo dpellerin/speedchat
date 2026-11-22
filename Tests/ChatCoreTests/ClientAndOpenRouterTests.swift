@@ -16,6 +16,9 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
     var beforeThreadRead: (() -> Void)?
     var readResult: Result<CodexPayload, Error> = .success(CodexPayload())
     var turnStartError: Error?
+    var beforeTurnStartDispatch: (() -> Void)?
+    var turnInterruptError: Error?
+    var beforeTurnInterrupt: (() -> Void)?
     var holdTurnStart = false
     var holdSettings = false
     var holdFirstRename = false
@@ -72,6 +75,14 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
             return c
         }
         cont?.resume(returning: CodexPayload([:]))
+    }
+
+    func request(
+        method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
+    ) async throws -> [String: Any] {
+        if method == "turn/start" { beforeTurnStartDispatch?() }
+        guard whileCurrent() else { throw CodexRequestNotSent() }
+        return try await request(method: method, params: params, timeoutMs: timeoutMs)
     }
 
     func request(method: String, params: [String: Any], timeoutMs: Int) async throws -> [String: Any] {
@@ -134,6 +145,10 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
             }
             let id = count == 0 ? "dedicated" : "thread-\(count)"
             return ["thread": ["id": id], "model": threadStartModel]
+        }
+        if method == "turn/interrupt" {
+            beforeTurnInterrupt?()
+            if let turnInterruptError { throw turnInterruptError }
         }
         if method == "turn/start" {
             if let turnStartError { throw turnStartError }
