@@ -124,6 +124,7 @@ public final class ChatClient: @unchecked Sendable {
         return try body()
     }
 
+    private var closeTask: Task<Void, Never>?
     private var conversation = ConversationContinuity()
     private var turnId: String?
     private var turnBlocked = false
@@ -272,11 +273,16 @@ public final class ChatClient: @unchecked Sendable {
     }
 
     private func ensureCodexRunning() async throws {
-        let (available, dir) = sync { (codexAvailable, runtimeDir) }
+        let (available, dir) = try sync {
+            try requireOpen()
+            return (codexAvailable, runtimeDir)
+        }
         guard !available else { return }
         try await rpc.start(cwd: dir)
+        try sync { try requireOpen() }
         try await loadModels()
-        sync {
+        try sync {
+            try requireOpen()
             codexAvailable = true
             rebuildModelCatalog()
         }
@@ -284,7 +290,7 @@ public final class ChatClient: @unchecked Sendable {
 
     private func nameFromContent(_ text: String, threadId expectedThread: String? = nil) async {
         let namingRequest = sync { () -> (threadId: String, prompt: String)? in
-            guard let threadId = conversation.attachedThreadId,
+            guard closeTask == nil, let threadId = conversation.attachedThreadId,
                   expectedThread == nil || threadId == expectedThread,
                   conversation.titleNeeded, codexAvailable else { return nil }
             let prompt = conversation.messages.first { $0.role == "user" }?.text ?? text
@@ -298,7 +304,7 @@ public final class ChatClient: @unchecked Sendable {
                 timeoutMs: 30_000
             )
             sync {
-                if conversation.attachedThreadId == currentThread {
+                if closeTask == nil, conversation.attachedThreadId == currentThread {
                     conversation.titleNeeded = false
                 }
             }
@@ -307,11 +313,18 @@ public final class ChatClient: @unchecked Sendable {
         }
     }
 
+    // The caller holds the conversation lock.
+    private func requireOpen() throws {
+        if closeTask != nil { throw CancellationError() }
+    }
+
     private func saveCurrentState() {
+        guard closeTask == nil else { return }
         try? conversation.save(model: model, to: options.stateURL, env: options.env)
     }
 
     private func saveCodexState() throws {
+        try requireOpen()
         do {
             try conversation.save(model: model, to: options.stateURL, env: options.env)
         } catch {
@@ -331,12 +344,13 @@ public final class ChatClient: @unchecked Sendable {
     }
 
     public func connect() async throws -> ReadyState {
-        let dir = try RuntimeDiscovery.createRuntimeDirectory()
         let loadedOR = OpenRouterClient.loadConfig(from: options.openRouterConfigURL, env: options.env)
-
-        sync {
+        let dir = try sync {
+            try requireOpen()
+            let dir = try RuntimeDiscovery.createRuntimeDirectory()
             runtimeDir = dir
             openRouterConfig = loadedOR
+            return dir
         }
 
         var codexError: Error?
@@ -344,31 +358,33 @@ public final class ChatClient: @unchecked Sendable {
             try await ensureCodexRunning()
         } catch {
             codexError = error
-            sync {
+            try sync {
+                try requireOpen()
                 codexAvailable = false
                 openAiModels = []
             }
         }
 
-        let currentModels: [ChatModel] = sync {
+        let (currentModels, state) = try sync {
+            try requireOpen()
             rebuildModelCatalog()
-            return models
+            return (models, StateStore.load(from: options.stateURL, env: options.env))
         }
-
-        let state = StateStore.load(from: options.stateURL, env: options.env)
         if currentModels.isEmpty {
             let error = codexError ?? NSError(domain: "SpeedChat.Client", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "No available models support low reasoning effort.",
             ])
             guard let state else { throw error }
-            return sync {
+            return try sync {
+                try requireOpen()
                 model = state.model
                 conversation = ConversationContinuity(restoring: state)
                 return readyStateLocked(offlineReason: StateStore.friendlyError(error))
             }
         }
 
-        let resumeRequest = sync { () -> (threadId: String, model: String)? in
+        let resumeRequest = try sync { () -> (threadId: String, model: String)? in
+            try requireOpen()
             if let state, models.contains(where: { $0.model == state.model }) {
                 model = state.model
             } else {
@@ -386,7 +402,7 @@ public final class ChatClient: @unchecked Sendable {
             do {
                 let resumed = try await resumeCodexThread(id: threadId, model: resumeModel, cwdPath: dir.path)
                 sync {
-                    guard codexAvailable, conversation.thread?.id == threadId else { return }
+                    guard closeTask == nil, codexAvailable, conversation.thread?.id == threadId else { return }
                     let recoveredHistory = conversation.didResume(
                         threadId: threadId,
                         name: resumed.name,
@@ -402,12 +418,13 @@ public final class ChatClient: @unchecked Sendable {
                     }
                 }
             } catch let error as CodexRPCError where error.confirmsMissingRollout(for: threadId) {
-                sync { conversation.didConfirmThreadLoss(threadId) }
+                sync { if closeTask == nil { conversation.didConfirmThreadLoss(threadId) } }
             } catch {
                 // Keep the saved conversation ready while thread availability is unknown.
             }
         }
-        return sync {
+        return try sync {
+            try requireOpen()
             let offlineReason = models.isEmpty ? "The Codex app-server stopped unexpectedly." : nil
             return readyStateLocked(offlineReason: offlineReason, stateSaveError: saveFailure?.localizedDescription)
         }
@@ -444,6 +461,7 @@ public final class ChatClient: @unchecked Sendable {
     public func reloadOpenRouter() async -> ReadyState {
         let updated = OpenRouterClient.loadConfig(from: options.openRouterConfigURL, env: options.env)
         return sync {
+            guard closeTask == nil else { return readyStateLocked() }
             openRouterConfig = updated
             rebuildModelCatalog()
             if !models.contains(where: { $0.model == model }) {
@@ -530,6 +548,7 @@ public final class ChatClient: @unchecked Sendable {
 
     public func newChat() async throws -> ReadyState {
         let (isCodexUp, codexModel, cwdPath) = try sync { () -> (Bool, String, String) in
+            try requireOpen()
             if activeExecution != nil || mutationPending {
                 throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [NSLocalizedDescriptionKey: "Wait for the current response or change to finish."])
             }
@@ -547,7 +566,8 @@ public final class ChatClient: @unchecked Sendable {
         } else {
             thread = .standalone("openrouter-\(UUID().uuidString.lowercased())")
         }
-        let ready = sync {
+        let ready = try sync {
+            try requireOpen()
             conversation = ConversationContinuity(thread: thread, titleNeeded: isCodexUp)
             checkedCodexSendId = nil
             undispatchedCodexMessage = nil
@@ -564,6 +584,7 @@ public final class ChatClient: @unchecked Sendable {
 
     public func selectModel(_ candidate: String) async throws -> ReadyState {
         let (currentThread, shouldUpdateCodex) = try sync { () -> (String, Bool) in
+            try requireOpen()
             if activeExecution != nil || mutationPending {
                 throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [NSLocalizedDescriptionKey: "Wait for the current response or change to finish."])
             }
@@ -585,7 +606,8 @@ public final class ChatClient: @unchecked Sendable {
         if shouldUpdateCodex {
             _ = try await rpc.request(method: "thread/settings/update", params: ["threadId": currentThread, "model": candidate], timeoutMs: 30_000)
         }
-        return sync {
+        return try sync {
+            try requireOpen()
             model = candidate
             saveCurrentState()
             return readyStateLocked()
@@ -721,6 +743,7 @@ public final class ChatClient: @unchecked Sendable {
     }
 
     private func threadForNewTurn() throws -> ConversationContinuity.Thread {
+        try requireOpen()
         guard !busy else {
             throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [NSLocalizedDescriptionKey: "Wait for the current response or change to finish."])
         }
@@ -1126,6 +1149,7 @@ public final class ChatClient: @unchecked Sendable {
         } catch {
             saveWarning = "Couldn’t save this turn locally. It may be missing after reopening."
         }
+        guard closeTask == nil else { return }
         if !text.isEmpty || !reply.streamedText.isEmpty {
             emitTurnEvent(BridgeEvent(type: "message", itemId: reply.itemId, text: text), executionID: executionID) {
                 if !text.isEmpty { onMessage?(reply.itemId, text) }
@@ -1161,27 +1185,39 @@ public final class ChatClient: @unchecked Sendable {
         await requestStop()?.value
     }
 
-    public func close() async {
-        let (task, dir) = sync {
-            let task = activeExecution?.openRouter?.task
-            if activeExecution?.openRouter != nil { activeExecution = nil }
+    /// Settle accepted content and retire this client before the bridge releases its command queue.
+    public func beginClose() -> Task<Void, Never> {
+        sync {
+            if let closeTask { return closeTask }
+            rpc.retire()
             let dir = runtimeDir
             runtimeDir = nil
-            return (task, dir)
+            let teardown = Task { [rpc] in
+                await rpc.stop()
+                if let dir {
+                    try? FileManager.default.removeItem(at: dir)
+                }
+            }
+            closeTask = teardown
+            if let executionID = activeExecution?.id {
+                finishOpenRouterTurn(executionID: executionID, outcome: .stopped)
+            }
+            finishCodexTurn()
+            codexAvailable = false
+            return teardown
         }
+    }
 
-        task?.cancel()
-        await rpc.stop()
-        if let dir {
-            try? FileManager.default.removeItem(at: dir)
-        }
+    public func close() async {
+        await beginClose().value
     }
 
     private func loadModels() async throws {
         let response = try await rpc.request(method: "model/list", params: ["limit": 100, "includeHidden": false], timeoutMs: 30_000)
         let rawList = (response["data"] as? [[String: Any]]) ?? []
         let filtered = Self.availableModels(from: rawList)
-        let hasORKey = sync { () -> Bool in
+        let hasORKey = try sync { () -> Bool in
+            try requireOpen()
             openAiModels = filtered
             return !openRouterConfig.key.isEmpty
         }
