@@ -54,7 +54,19 @@ public protocol CodexTransport: AnyObject, Sendable {
     var onExit: (@Sendable () -> Void)? { get set }
     func start(cwd: URL?) async throws
     func request(method: String, params: [String: Any], timeoutMs: Int) async throws -> [String: Any]
+    func request(
+        method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
+    ) async throws -> [String: Any]
     func stop() async
+}
+
+extension CodexTransport {
+    public func request(
+        method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
+    ) async throws -> [String: Any] {
+        guard whileCurrent() else { throw CodexRequestNotSent() }
+        return try await request(method: method, params: params, timeoutMs: timeoutMs)
+    }
 }
 
 public enum CodexProtocol {
@@ -240,10 +252,16 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
     }
 
     public func request(method: String, params: [String: Any], timeoutMs: Int = 30_000) async throws -> [String: Any] {
+        try await request(method: method, params: params, timeoutMs: timeoutMs, whileCurrent: { true })
+    }
+
+    public func request(
+        method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
+    ) async throws -> [String: Any] {
         let boxed = CodexPayload(params)
         let response: CodexPayload = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CodexPayload, Error>) in
             queue.async { [self] in
-                guard self.child != nil, self.input != nil else {
+                guard self.child != nil, self.input != nil, whileCurrent() else {
                     continuation.resume(throwing: CodexRequestNotSent())
                     return
                 }
@@ -330,7 +348,11 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
                     "message": "SpeedChat does not permit client tools or local actions.",
                 ],
             ])
-            onNotification?(CodexNotification(method: "speedchat/blockedRequest", params: ["method": method]))
+            let requestParams = message["params"] as? [String: Any]
+            var blocked = ["method": method]
+            blocked["threadId"] = requestParams?["threadId"] as? String
+            blocked["turnId"] = requestParams?["turnId"] as? String
+            onNotification?(CodexNotification(method: "speedchat/blockedRequest", params: blocked))
             return
         }
         if let id = message["id"] as? Int, let entry = pending.removeValue(forKey: id) {

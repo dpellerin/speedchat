@@ -114,7 +114,8 @@ public struct ChatSession: Sendable {
   notice = retry.action == .retry ? "Thinking…" : "Checking Codex delivery…"
   failed=false;failureDetails=nil;activeModel=selectedModel
   activeCodexPromptId=retry.userMessageId
-  executionID=nil
+  lastRequestWasOpenRouter=false
+  executionID=UUID()
   return retry.userMessageId
  }
  public mutating func beginNewChat() -> Bool {guard canInteract else {return false};phase = .resetting;notice="Starting a new chat…";return true}
