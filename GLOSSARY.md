@@ -16,8 +16,11 @@ The text entry area where the user writes and sends a message.
 The unsent text in the composer. Hiding the panel preserves it while the app is running.
 
 **Conversation**:
-The user's ongoing exchange with SpeedChat. It can continue after a model or provider switch.
+The user's ongoing exchange with SpeedChat. It can continue across model and provider switches and can be reopened from saved messages if its Codex thread is unavailable.
 _Avoid_: Codex thread, session
+
+**Saved conversation**:
+SpeedChat's local record of the conversation. Its messages are the primary history when the conversation is reopened.
 
 **Transcript**:
 The messages shown in the panel for the current conversation, including the reply as it streams.
