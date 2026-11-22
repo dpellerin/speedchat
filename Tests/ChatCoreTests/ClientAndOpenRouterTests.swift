@@ -302,6 +302,12 @@ func restoredOpenRouterChatCanContinueOnCodex(savedModel: String) async throws {
     #expect(saved.threadId == "dedicated")
     #expect(saved.messages == history)
     #expect(!rpc.calls.contains { ($0.params["threadId"] as? String)?.hasPrefix("openrouter-") == true })
+    let clientId = try #require(turn.params["clientUserMessageId"] as? String)
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": "dedicated", "turnId": "turn-1",
+        "item": ["id": "codex-user", "type": "userMessage", "clientId": clientId,
+                 "content": [["type": "text", "text": input]]],
+    ]))
     rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
         "threadId": "dedicated", "turn": ["id": "turn-1", "status": "completed"],
     ]))
@@ -772,7 +778,7 @@ func confirmedThreadLossUsesAReplacementWithSavedContext(lossAtConnect: Bool, re
     rpc.onNotification?(CodexNotification(method: "item/agentMessage/delta", params: ["threadId": "dedicated", "turnId": "old", "delta": "old"]))
     #expect(collector.deltas.isEmpty)
 
-    rpc.onNotification?(CodexNotification(method: "model/rerouted", params: ["threadId": "dedicated", "toModel": "gpt-6-sol"]))
+    rpc.onNotification?(CodexNotification(method: "model/rerouted", params: ["threadId": "dedicated", "turnId": "t1", "toModel": "gpt-6-sol"]))
     #expect(collector.models.last == "gpt-6-sol")
 
     // Blocked tool item
