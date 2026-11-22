@@ -58,6 +58,12 @@ public protocol CodexTransport: AnyObject, Sendable {
         method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
     ) async throws -> [String: Any]
     func stop() async
+    /// Reject new dispatch from the outgoing backend before asynchronous cleanup.
+    func retire()
+}
+
+public extension CodexTransport {
+    func retire() {}
 }
 
 extension CodexTransport {
@@ -121,6 +127,8 @@ public enum CodexProtocol {
 
 public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
     private let queue = DispatchQueue(label: "SpeedChat.codex-rpc", qos: .userInitiated)
+    private let retirementLock = NSLock()
+    private var retired = false
     private var child: Process?
     private var input: FileHandle?
     private var framer = JSONLFramer()
@@ -144,9 +152,17 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         self.envOverride = env
     }
 
+    public func retire() {
+        retirementLock.withLock { retired = true }
+    }
+
     public func start(cwd: URL? = nil) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in
+                guard !retirementLock.withLock({ retired }) else {
+                    continuation.resume(throwing: CodexRequestNotSent())
+                    return
+                }
                 if self.child != nil {
                     continuation.resume()
                     return
@@ -232,7 +248,10 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
                         }
                     }
 
-                    try proc.run()
+                    try retirementLock.withLock {
+                        guard !retired else { throw CodexRequestNotSent() }
+                        try proc.run()
+                    }
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
@@ -321,6 +340,7 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         guard let input,
               var data = try? JSONSerialization.data(withJSONObject: object) else { return }
         data.append(10)
+        guard !retirementLock.withLock({ retired }) else { return }
         try? input.write(contentsOf: data)
     }
 
