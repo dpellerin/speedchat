@@ -10,6 +10,8 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
     var failStart = false
     var failThreadStart = false
     var missingThreadId = false
+    var threadStartModel = "gpt-6-luna"
+    var resumeResult: Result<CodexPayload, Error> = .success(CodexPayload())
     var holdTurnStart = false
     var holdSettings = false
     var holdFirstRename = false
@@ -105,6 +107,9 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
                 ],
             ]
         }
+        if method == "thread/resume" {
+            return try resumeResult.get().value
+        }
         if method == "thread/start" {
             if failThreadStart { throw NSError(domain: "test", code: 500) }
             if missingThreadId { return ["thread": [:]] }
@@ -114,7 +119,7 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
                 return c
             }
             let id = count == 0 ? "dedicated" : "thread-\(count)"
-            return ["thread": ["id": id], "model": "gpt-6-luna"]
+            return ["thread": ["id": id], "model": threadStartModel]
         }
         if method == "turn/start" {
             if (params["threadId"] as? String)?.hasPrefix("openrouter-") == true {
@@ -124,6 +129,142 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
         }
         return [:]
     }
+}
+
+@Test(arguments: ["rejected", "timed out", "malformed", "wrong thread"])
+func savedConversationReopensWhenCodexResumeFails(failure: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-reopen-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    let messages = [
+        ChatMessage(id: "saved-user", role: "user", text: "Keep my original prompt."),
+        ChatMessage(id: "saved-reply", role: "assistant", text: "Your prompt is saved."),
+    ]
+    try StateStore.save(threadId: "original-thread", model: "gpt-6-luna", to: stateURL, messages: messages, codexSyncedCount: 2)
+
+    for _ in 0..<2 {
+        let rpc = FakeCodexTransport()
+        switch failure {
+        case "rejected":
+            rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -32600))
+        case "timed out":
+            rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+        case "wrong thread":
+            rpc.resumeResult = .success(CodexPayload(["thread": ["id": "unrelated-thread", "turns": []]]))
+        default:
+            rpc.resumeResult = .success(CodexPayload(["thread": [:]]))
+        }
+        let client = ChatClient(rpc: rpc, options: options)
+        let ready = try await client.connect()
+        #expect(ready.resumed)
+        #expect(ready.threadId == "original-thread")
+        #expect(ready.messages == messages)
+        #expect(rpc.calls.first { $0.method == "thread/resume" }?.params["threadId"] as? String == "original-thread")
+        #expect(!rpc.calls.contains { $0.method == "thread/start" || $0.method == "turn/start" })
+        await client.close()
+    }
+}
+
+@Test(arguments: [false, true])
+func savedConversationTakesPriorityOverLongerCodexHistory(emptySavedConversation: Bool) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-conflict-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let messages: [ChatMessage] = emptySavedConversation ? [] : [
+        ChatMessage(id: "saved-user", role: "user", text: "Remember orchard."),
+        ChatMessage(id: "saved-router", role: "assistant", text: "Orchard remembered."),
+        ChatMessage(id: "saved-follow-up", role: "user", text: "Continue."),
+    ]
+    try StateStore.save(threadId: "mixed-thread", model: "gpt-6-luna", to: stateURL, messages: messages, codexSyncedCount: messages.count)
+
+    let rpc = FakeCodexTransport()
+    let turns: [[String: Any]] = [
+        ["id": "handoff", "items": [
+            ["id": "quoted", "type": "userMessage", "content": [
+                ["type": "text", "text": "[Earlier turns in this conversation from another model:\nUser: Remember orchard.\n\nAssistant: Orchard remembered.]\n\nContinue."],
+            ]],
+            ["id": "codex-reply", "type": "agentMessage", "text": "Continuing."],
+        ]],
+        ["id": "unmatched", "items": [
+            ["id": "different-user", "type": "userMessage", "content": [["type": "text", "text": "Repeat."]]],
+            ["id": "different-reply", "type": "agentMessage", "text": "New Codex history."],
+        ]],
+    ]
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "mixed-thread", "turns": turns]]))
+    let client = ChatClient(rpc: rpc, options: ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]))
+    let ready = try await client.connect()
+
+    #expect(ready.resumed)
+    #expect(ready.messages == messages)
+    #expect(!rpc.calls.contains { $0.method == "turn/start" || $0.method == "thread/name/set" })
+    await client.close()
+}
+
+@Test func legacyConversationRecoversFromCodexAndReopensFromSavedMessages() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-legacy-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:])
+    try StateStore.save(threadId: "legacy-thread", model: "gpt-6-luna", to: stateURL)
+    let rpc = FakeCodexTransport()
+    let turns: [[String: Any]] = [
+        ["id": "legacy-turn", "items": [
+            ["id": "legacy-user", "type": "userMessage", "content": [["type": "text", "text": "Hello again."]]],
+            ["id": "legacy-reply", "type": "agentMessage", "text": "Welcome back."],
+        ]],
+    ]
+    rpc.resumeResult = .success(CodexPayload(["thread": ["id": "legacy-thread", "turns": turns]]))
+    let messages = [
+        ChatMessage(id: "legacy-user", role: "user", text: "Hello again."),
+        ChatMessage(id: "legacy-reply", role: "assistant", text: "Welcome back."),
+    ]
+
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    #expect(ready.messages == messages)
+    await client.close()
+
+    let unavailable = FakeCodexTransport()
+    unavailable.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+    let reopened = ChatClient(rpc: unavailable, options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == "legacy-thread")
+    #expect(restored.messages == messages)
+    await reopened.close()
+}
+
+@Test(arguments: ["deepseek/deepseek-v4.1-flash", "gpt-6-luna"])
+func newChatClearsTheConversationAndKeepsTheSelectedModel(selectedModel: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-reset-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let configURL = dir.appendingPathComponent("openrouter.json")
+    try OpenRouterClient.saveConfig(key: "test-or-key", to: configURL)
+    try StateStore.save(threadId: "previous-thread", model: "gpt-6-luna", to: stateURL, messages: [
+        ChatMessage(id: "previous-user", role: "user", text: "Previous conversation."),
+    ])
+    let options = ChatClientOptions(openRouterConfigURL: configURL, stateURL: stateURL, env: [:])
+    let rpc = FakeCodexTransport()
+    rpc.threadStartModel = "gpt-6-reroute"
+    let client = ChatClient(rpc: rpc, options: options)
+    _ = try await client.connect()
+    let selected = try await client.selectModel(selectedModel)
+    #expect(!selected.messages.isEmpty)
+
+    let ready = try await client.newChat()
+    #expect(ready.threadId != selected.threadId)
+    #expect(ready.messages.isEmpty)
+    #expect(ready.model == selectedModel)
+    await client.close()
+
+    let reopened = ChatClient(rpc: FakeCodexTransport(), options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == ready.threadId)
+    #expect(restored.messages.isEmpty)
+    #expect(restored.model == selectedModel)
+    await reopened.close()
 }
 
 @Test(arguments: ["deepseek/deepseek-v4.1-flash", "gpt-6-luna"])
@@ -212,6 +353,59 @@ private func sseStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
         continuation.finish()
     }
     return OpenRouterHTTPResponse(statusCode: 200, lines: lines)
+}
+
+@Test func detachedConversationCanSelectModelsAndContinueOnOpenRouter() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("conversation-detached-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let configURL = dir.appendingPathComponent("openrouter.json")
+    let routerModel = "deepseek/deepseek-v4.1-flash"
+    try OpenRouterClient.saveConfig(key: "test-or-key", to: configURL)
+    let history = [
+        ChatMessage(id: "saved-user", role: "user", text: "Remember orchard."),
+        ChatMessage(id: "saved-reply", role: "assistant", text: "Orchard remembered."),
+    ]
+    try StateStore.save(threadId: "original-thread", model: routerModel, to: stateURL, messages: history, codexSyncedCount: 2)
+    let fetch: OpenRouterFetch = { request in
+        let data = try #require(request.httpBody)
+        let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        #expect(body["model"] as? String == routerModel)
+        #expect(messages.filter { $0["role"] as? String != "system" }.compactMap { $0["content"] as? String } == [
+            "Remember orchard.", "Orchard remembered.", "What did I ask you to remember?",
+        ])
+        return sseStream([["choices": [["delta": ["content": "Orchard."]]]]])
+    }
+    let options = ChatClientOptions(openRouterFetch: fetch, openRouterConfigURL: configURL, stateURL: stateURL, env: [:])
+    let rpc = FakeCodexTransport()
+    rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
+    let client = ChatClient(rpc: rpc, options: options)
+    let ready = try await client.connect()
+    #expect(ready.messages == history)
+    let openAI = try await client.selectModel("gpt-6-luna")
+    #expect(openAI.model == "gpt-6-luna")
+    let openRouter = try await client.selectModel(routerModel)
+    #expect(openRouter.model == routerModel)
+    #expect(openRouter.messages == history)
+
+    let (done, completion) = AsyncStream<Bool>.makeStream()
+    client.onDone = { completion.yield(true) }
+    client.onError = { _ in completion.yield(false) }
+    try await client.send("What did I ask you to remember?")
+    var responses = done.makeAsyncIterator()
+    #expect(await responses.next() == true)
+    #expect(rpc.calls.filter { $0.method.hasPrefix("thread/") || $0.method.hasPrefix("turn/") }.map(\.method) == ["thread/resume"])
+    await client.close()
+
+    let unavailable = FakeCodexTransport()
+    unavailable.failStart = true
+    let reopened = ChatClient(rpc: unavailable, options: options)
+    let restored = try await reopened.connect()
+    #expect(restored.threadId == "original-thread")
+    #expect(restored.messages.prefix(2).elementsEqual(history))
+    #expect(restored.messages.dropFirst(2).map(\.text) == ["What did I ask you to remember?", "Orchard."])
+    await reopened.close()
 }
 
 @Test func chooserIncludesOnlyVisibleModelsSupportingLowEffortAndPrefersLuna() {
