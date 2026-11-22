@@ -64,10 +64,8 @@ public protocol CodexTransport: AnyObject, Sendable {
 
 public extension CodexTransport {
     func retire() {}
-}
 
-extension CodexTransport {
-    public func request(
+    func request(
         method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
     ) async throws -> [String: Any] {
         guard whileCurrent() else { throw CodexRequestNotSent() }
@@ -280,7 +278,8 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         let boxed = CodexPayload(params)
         let response: CodexPayload = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CodexPayload, Error>) in
             queue.async { [self] in
-                guard self.child != nil, self.input != nil, whileCurrent() else {
+                guard self.child != nil, self.input != nil, !retirementLock.withLock({ retired }),
+                      whileCurrent() else {
                     continuation.resume(throwing: CodexRequestNotSent())
                     return
                 }

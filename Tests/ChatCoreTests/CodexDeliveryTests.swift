@@ -672,7 +672,12 @@ func retryKeepsOnlyAnAttachedInProgressCodexReplyStreaming(availability: String)
             ]],
         ],
     ]]))
-    let checked = try await client.retryCodexSend()
+    let retryID = UUID()
+    let (events, recordedEvents) = AsyncStream<BridgeEvent>.makeStream()
+    client.onTurnEvent = { recordedEvents.yield($0) }
+    try client.acceptCodexRetry(userMessageId: user.id, resend: false, executionID: retryID)
+    if availability == "attached" { await client.requestStop(executionID: retryID)?.value }
+    let checked = try await client.startCodexRetry(executionID: retryID)
 
     if availability == "stored" {
         #expect(!client.busy)
@@ -690,6 +695,23 @@ func retryKeepsOnlyAnAttachedInProgressCodexReplyStreaming(availability: String)
         #expect(updated.messages == [user, reply])
     }
     #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 1)
+    let interrupts = rpc.calls.filter { $0.method == "turn/interrupt" }
+    if availability == "attached" {
+        #expect(interrupts.count == 1)
+        #expect(interrupts.first?.params["threadId"] as? String == original.threadId)
+        #expect(interrupts.first?.params["turnId"] as? String == "live")
+    } else {
+        #expect(interrupts.isEmpty)
+    }
+    recordedEvents.finish()
+    var outcomes = [BridgeEvent]()
+    for await event in events { outcomes.append(event) }
+    #expect(outcomes.allSatisfy { $0.executionID == retryID })
+    if availability == "stored" {
+        #expect(outcomes.map(\.type) == ["conversationUpdated"])
+    } else {
+        #expect(outcomes.map(\.type) == ["codexReplyResumed", "message", "done"])
+    }
     await client.close()
 }
 

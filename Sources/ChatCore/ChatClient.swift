@@ -264,6 +264,7 @@ public final class ChatClient: @unchecked Sendable {
 
     private func handleProcessExit() {
         sync {
+            guard closeTask == nil else { return }
             if let attached = conversation.attachedThreadId {
                 conversation.thread = .detached(attached)
             }
@@ -707,7 +708,7 @@ public final class ChatClient: @unchecked Sendable {
         enum DeliveryCheck {
             case checked(ReadyState?)
             case streaming(interrupt: Task<Void, Never>?)
-            case resend(ConversationContinuity.Thread)
+            case resend
         }
 
         let history = await readCodexHistory(threadId: attempt.threadId, executionID: executionID)
@@ -761,7 +762,7 @@ public final class ChatClient: @unchecked Sendable {
                 }
             }
             if pending.resend, conversation.lastCodexSend?.delivery == .unconfirmed {
-                return .resend(conversation.thread ?? pending.send.thread)
+                return .resend
             }
             return .checked(finishCodexCheck(executionID: executionID))
         }
@@ -771,9 +772,8 @@ public final class ChatClient: @unchecked Sendable {
         case .streaming(let interrupt):
             await interrupt?.value
             return nil
-        case .resend(let currentThread):
-            let send = PendingSend(user: pending.send.user, thread: currentThread, model: pending.send.model, openRouterKey: nil)
-            return try await sendCodex(send, executionID: executionID, replacing: attempt)
+        case .resend:
+            return try await sendCodex(pending.send, executionID: executionID, replacing: attempt)
         }
     }
 
@@ -1324,7 +1324,8 @@ public final class ChatClient: @unchecked Sendable {
             if let executionID = activeExecution?.id {
                 finishOpenRouterTurn(executionID: executionID, outcome: .stopped)
             }
-            finishCodexTurn()
+            activeExecution = nil
+            uncheckedCodexReply = nil
             codexAvailable = false
             return teardown
         }
@@ -1354,14 +1355,14 @@ public final class ChatClient: @unchecked Sendable {
             let method = notification.method
             let params = notification.params
             if method == "speedchat/blockedRequest" {
-                guard let execution = activeExecution, let attempt = execution.codexReply?.attempt,
-                      params["threadId"] as? String ?? attempt.threadId == attempt.threadId else { return }
-                if params["turnId"] is String, attempt.turnId == nil {
+                guard let execution = activeExecution, let attempt = execution.codexReply?.attempt else { return }
+                if let threadID = params["threadId"] as? String, threadID != attempt.threadId { return }
+                let reportedTurnID = params["turnId"] as? String
+                if reportedTurnID != nil, attempt.turnId == nil {
                     activeExecution?.codexReply?.deferredNotifications.append(notification)
                     return
                 }
-                guard let boundTurn = attempt.turnId,
-                      params["turnId"] as? String ?? boundTurn == boundTurn else { return }
+                guard let boundTurn = attempt.turnId, reportedTurnID == nil || reportedTurnID == boundTurn else { return }
                 requestStop(executionID: execution.id)
                 emitCodexError(NSError(domain: "SpeedChat.Client", code: 8, userInfo: [
                     NSLocalizedDescriptionKey: "Blocked an unexpected client tool or local action request.",
