@@ -414,3 +414,230 @@ func uncertainCodexSendWaitsForExplicitResend(relaunch: Bool) async throws {
     #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 1)
     await client.close()
 }
+
+@Test func matchingCodexReceiptKeepsReplyStreamingAfterAcknowledgementTimeout() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"),
+        stateURL: dir.appendingPathComponent("state.json"), env: [:]
+    )
+    let rpc = FakeCodexTransport()
+    let client = ChatClient(rpc: rpc, options: options)
+    let original = try await client.connect()
+    rpc.holdTurnStart = true
+    let sending = Task { try await client.send("Can I visit?", userMessageId: "visit") }
+    while !rpc.turnStartIsHeld { await Task.yield() }
+    let sent = try #require(rpc.calls.last { $0.method == "turn/start" })
+    let input = try #require(sent.params["input"] as? [[String: Any]])
+    rpc.onNotification?(CodexNotification(method: "item/started", params: [
+        "threadId": original.threadId, "turnId": "live",
+        "item": ["id": "recorded", "type": "userMessage", "clientId": "visit", "content": input],
+    ]))
+    rpc.releaseTurnStart(error: NSError(domain: "test", code: -2))
+    do {
+        try await sending.value
+    } catch {
+        Issue.record("The matching input already confirmed delivery: \(error)")
+    }
+    #expect(client.busy)
+    #expect(client.codexRetry == nil)
+
+    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
+        "threadId": original.threadId, "turnId": "live",
+        "item": ["id": "visiting", "type": "agentMessage", "text": "Yes, after noon."],
+    ]))
+    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
+        "threadId": original.threadId, "turn": ["id": "live", "status": "completed"],
+    ]))
+    let updated = try await client.selectModel(original.model)
+    #expect(updated.messages == [
+        ChatMessage(id: "visit", role: "user", text: "Can I visit?"),
+        ChatMessage(id: "visiting", role: "assistant", text: "Yes, after noon."),
+    ])
+    #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 1)
+    await client.close()
+}
+
+@Test(arguments: ["attached", "completed during read", "already completed", "stored"])
+func retryKeepsOnlyAnAttachedInProgressCodexReplyStreaming(availability: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"),
+        stateURL: dir.appendingPathComponent("state.json"), env: [:]
+    )
+    let rpc = FakeCodexTransport()
+    let client = ChatClient(rpc: rpc, options: options)
+    let original = try await client.connect()
+    rpc.turnStartError = NSError(domain: "test", code: -2)
+    await #expect(throws: (any Error).self) { try await client.send("Can I visit?", userMessageId: "visit") }
+    let submitted = try #require(rpc.calls.last { $0.method == "turn/start" })
+    let input = try #require(submitted.params["input"] as? [[String: Any]])
+    let user = ChatMessage(id: "visit", role: "user", text: "Can I visit?")
+    let reply = ChatMessage(id: "visiting", role: "assistant", text: "Yes, after noon.")
+    let finishReply = {
+        rpc.onNotification?(CodexNotification(method: "item/completed", params: [
+            "threadId": original.threadId, "turnId": "live",
+            "item": ["id": reply.id, "type": "agentMessage", "text": reply.text],
+        ]))
+        rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
+            "threadId": original.threadId, "turn": ["id": "live", "status": "completed"],
+        ]))
+    }
+    if availability == "stored" { rpc.onExit?() }
+    if availability == "completed during read" || availability == "already completed" {
+        rpc.beforeThreadRead = finishReply
+    }
+    let isActive = availability != "already completed"
+    rpc.readResult = .success(CodexPayload(["thread": [
+        "id": original.threadId, "status": ["type": isActive ? "active" : "idle"], "turns": [
+            ["id": "live", "status": isActive ? "inProgress" : "completed", "items": [
+                ["id": "recorded", "type": "userMessage", "clientId": user.id, "content": input],
+            ]],
+        ],
+    ]]))
+    let checked = try await client.retryCodexSend()
+
+    if availability == "stored" {
+        #expect(!client.busy)
+        #expect(checked?.messages == [user])
+        #expect(checked?.codexRetry == nil)
+    } else {
+        #expect(checked == nil)
+        if availability == "attached" {
+            #expect(client.busy)
+            await #expect(throws: (any Error).self) { try await client.send("Another prompt") }
+            finishReply()
+        }
+        #expect(!client.busy)
+        let updated = try await client.selectModel(original.model)
+        #expect(updated.messages == [user, reply])
+    }
+    #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 1)
+    await client.close()
+}
+
+@Test(arguments: ["acknowledgement", "completion", "completion after timeout", "different bytes"])
+func fullCodexTurnPayloadProvesTheExactPromptAndPublishesItsReplyOnce(source: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"),
+        stateURL: dir.appendingPathComponent("state.json"), env: [:]
+    )
+    let (replies, replyEvents) = AsyncStream<String>.makeStream()
+    let rpc = FakeCodexTransport()
+    let client = ChatClient(rpc: rpc, options: options)
+    client.onMessage = { _, text in replyEvents.yield(text) }
+    let original = try await client.connect()
+    let prompt = ChatMessage(id: "cafe", role: "user", text: "Café")
+    let reply = ChatMessage(id: "answer", role: "assistant", text: "The café opens at noon.")
+    rpc.holdTurnStart = true
+    let sending = Task { try await client.send(prompt.text, userMessageId: prompt.id) }
+    while !rpc.turnStartIsHeld { await Task.yield() }
+    let agentItem = ["id": reply.id, "type": "agentMessage", "phase": "final_answer", "text": reply.text]
+    let items: [[String: Any]] = [
+        ["id": "receipt", "type": "userMessage", "clientId": prompt.id,
+         "content": [["type": "text", "text": source == "different bytes" ? "Cafe\u{301}" : prompt.text]]],
+        agentItem,
+    ]
+    let completion = CodexNotification(method: "turn/completed", params: [
+        "threadId": original.threadId,
+        "turn": ["id": "cafe-turn", "status": "completed", "itemsView": "full", "items": items],
+    ])
+    if source == "acknowledgement" {
+        rpc.releaseTurnStart(turn: ["id": "cafe-turn", "status": "inProgress", "itemsView": "full", "items": items])
+        try await sending.value
+        rpc.onNotification?(CodexNotification(method: "item/completed", params: [
+            "threadId": original.threadId, "turnId": "cafe-turn", "item": agentItem,
+        ]))
+        rpc.onNotification?(completion)
+    } else if source == "completion after timeout" {
+        rpc.releaseTurnStart(error: NSError(domain: "test", code: -2))
+        await #expect(throws: (any Error).self) { try await sending.value }
+        rpc.onNotification?(completion)
+        _ = try await client.retryCodexSend()
+    } else {
+        rpc.onNotification?(completion)
+        rpc.releaseTurnStart(error: NSError(domain: "test", code: -2))
+        if source == "different bytes" {
+            await #expect(throws: (any Error).self) { try await sending.value }
+        } else {
+            do {
+                try await sending.value
+            } catch {
+                Issue.record("The full completion already confirmed delivery: \(error)")
+            }
+        }
+    }
+    replyEvents.finish()
+    var visibleReplies: [String] = []
+    for await text in replies { visibleReplies.append(text) }
+    let confirmed = source != "different bytes"
+    #expect(visibleReplies == (confirmed ? [reply.text] : []))
+    #expect(!client.busy)
+    let updated = try await client.selectModel(original.model)
+    #expect(updated.messages == (confirmed ? [prompt, reply] : [prompt]))
+    #expect(updated.codexRetry?.action == (confirmed ? nil : .checkDelivery))
+    #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 1)
+    await client.close()
+}
+
+@Test(arguments: ["receipt", "rejection"])
+func codexDeliveryReportsFailedSavesAndKeepsTheLastReadableJournal(outcome: String) async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let stateURL = dir.appendingPathComponent("state.json")
+    let options = ChatClientOptions(
+        openRouterConfigURL: dir.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]
+    )
+    let rpc = FakeCodexTransport()
+    let client = ChatClient(rpc: rpc, options: options)
+    let (errors, errorEvents) = AsyncStream<String>.makeStream()
+    client.onError = { error in errorEvents.yield(error.localizedDescription) }
+    let original = try await client.connect()
+    let prompt = ChatMessage(id: "visit", role: "user", text: "Can I visit?")
+    rpc.holdTurnStart = true
+    let sending = Task { try await client.send(prompt.text, userMessageId: prompt.id) }
+    while !rpc.turnStartIsHeld { await Task.yield() }
+    defer { rpc.releaseTurnStart() }
+    let sent = try #require(rpc.calls.last { $0.method == "turn/start" })
+    let input = try #require(sent.params["input"] as? [[String: Any]])
+    try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: stateURL.path)
+    defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: stateURL.path) }
+
+    if outcome == "receipt" {
+        rpc.onNotification?(CodexNotification(method: "item/started", params: [
+            "threadId": original.threadId, "turnId": "live",
+            "item": ["id": "recorded", "type": "userMessage", "clientId": prompt.id, "content": input],
+        ]))
+        rpc.releaseTurnStart(turnId: "live")
+        try await sending.value
+        #expect(client.busy)
+        #expect(client.codexRetry == nil)
+    } else {
+        rpc.releaseTurnStart(error: CodexRPCError(
+            code: -32600, message: "thread not found: \(original.threadId)"
+        ))
+        do {
+            try await sending.value
+            Issue.record("A rejected send should report its failed journal save.")
+        } catch {
+            errorEvents.yield(error.localizedDescription)
+        }
+        #expect(client.codexRetry?.action == .retry)
+    }
+    errorEvents.finish()
+    var reported = [String]()
+    for await error in errors { reported.append(error) }
+    #expect(reported.contains { $0.contains("save the conversation") })
+
+    let independent = ChatClient(rpc: FakeCodexTransport(), options: options)
+    let saved = try await independent.connect()
+    #expect(saved.messages == [prompt])
+    #expect(saved.codexRetry?.action == .checkDelivery)
+    #expect(rpc.calls.filter { $0.method == "turn/start" }.count == 1)
+    await independent.close()
+    await client.close()
+}

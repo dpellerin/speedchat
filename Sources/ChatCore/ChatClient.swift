@@ -8,6 +8,8 @@ public struct ReadyState: Equatable, Sendable {
     public var reasoningEffort: String
     public var models: [ChatModel]
     public var openRouterConfigured: Bool
+    public var offlineReason: String?
+    public var stateSaveError: String?
     public var codexRetry: CodexRetry?
 
     public init(
@@ -18,6 +20,8 @@ public struct ReadyState: Equatable, Sendable {
         reasoningEffort: String = ChatPrompt.reasoningEffort,
         models: [ChatModel],
         openRouterConfigured: Bool = false,
+        offlineReason: String? = nil,
+        stateSaveError: String? = nil,
         codexRetry: CodexRetry? = nil
     ) {
         self.threadId = threadId
@@ -27,6 +31,8 @@ public struct ReadyState: Equatable, Sendable {
         self.reasoningEffort = reasoningEffort
         self.models = models
         self.openRouterConfigured = openRouterConfigured
+        self.offlineReason = offlineReason
+        self.stateSaveError = stateSaveError
         self.codexRetry = codexRetry
     }
 }
@@ -130,6 +136,7 @@ public final class ChatClient: @unchecked Sendable {
     private struct ActiveCodexTurn {
         var attempt: CodexSendAttempt
         var receiptConfirmed = false
+        var awaitingDeliveryCheck = false
         var deferredNotifications = [CodexNotification]()
     }
 
@@ -172,6 +179,8 @@ public final class ChatClient: @unchecked Sendable {
 
     public var onDelta: (@Sendable (String, String) -> Void)?
     public var onMessage: (@Sendable (String, String) -> Void)?
+    public var onHistoryRecovered: (@Sendable ([ChatMessage]) -> Void)?
+    public var onCodexReplyResumed: (@Sendable (String, [ChatMessage]) -> Void)?
     public var onDone: (@Sendable () -> Void)?
     public var onSearching: (@Sendable () -> Void)?
     public var onModel: (@Sendable (String) -> Void)?
@@ -225,8 +234,9 @@ public final class ChatClient: @unchecked Sendable {
             if let attached = conversation.attachedThreadId {
                 conversation.thread = .detached(attached)
             }
-            let interruptedTurn = codexTurn != nil
+            let interruptedTurn = codexTurn?.awaitingDeliveryCheck == false
             if interruptedTurn { finishCodexTurn() }
+            else { codexTurn = nil }
             codexAvailable = false
             openAiModels = []
             rebuildModelCatalog()
@@ -282,6 +292,25 @@ public final class ChatClient: @unchecked Sendable {
         try? conversation.save(model: model, to: options.stateURL, env: options.env)
     }
 
+    private func saveCodexState() throws {
+        do {
+            try conversation.save(model: model, to: options.stateURL, env: options.env)
+        } catch {
+            throw NSError(domain: "SpeedChat.Persistence", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "SpeedChat couldn’t save the conversation to local storage.",
+            ])
+        }
+    }
+
+    private func codexStateSaveFailure() -> Error? {
+        do {
+            try saveCodexState()
+            return nil
+        } catch {
+            return error
+        }
+    }
+
     public func connect() async throws -> ReadyState {
         let dir = try RuntimeDiscovery.createRuntimeDirectory()
         let loadedOR = OpenRouterClient.loadConfig(from: options.openRouterConfigURL, env: options.env)
@@ -307,12 +336,19 @@ public final class ChatClient: @unchecked Sendable {
             return models
         }
 
+        let state = StateStore.load(from: options.stateURL, env: options.env)
         if currentModels.isEmpty {
-            if let codexError { throw codexError }
-            throw NSError(domain: "SpeedChat.Client", code: 2, userInfo: [NSLocalizedDescriptionKey: "No available models support low reasoning effort."])
+            let error = codexError ?? NSError(domain: "SpeedChat.Client", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "No available models support low reasoning effort.",
+            ])
+            guard let state else { throw error }
+            return sync {
+                model = state.model
+                conversation = ConversationContinuity(restoring: state)
+                return readyStateLocked(offlineReason: StateStore.friendlyError(error))
+            }
         }
 
-        let state = StateStore.load(from: options.stateURL, env: options.env)
         let resumeRequest = sync { () -> (threadId: String, model: String)? in
             if let state, models.contains(where: { $0.model == state.model }) {
                 model = state.model
@@ -326,6 +362,7 @@ public final class ChatClient: @unchecked Sendable {
         }
 
         guard let state else { return try await newChat() }
+        var saveFailure: Error?
         if let (threadId, resumeModel) = resumeRequest {
             do {
                 let resumed = try await resumeCodexThread(id: threadId, model: resumeModel, cwdPath: dir.path)
@@ -339,7 +376,9 @@ public final class ChatClient: @unchecked Sendable {
                     if !isOpenRouterModel(model), let resumedModel = resumed.model, !resumedModel.isEmpty {
                         model = resumedModel
                     }
-                    if recoveredHistory || state.model != model {
+                    if recoveredHistory {
+                        saveFailure = codexStateSaveFailure()
+                    } else if state.model != model {
                         saveCurrentState()
                     }
                 }
@@ -349,7 +388,10 @@ public final class ChatClient: @unchecked Sendable {
                 // Keep the saved conversation ready while thread availability is unknown.
             }
         }
-        return sync { readyStateLocked() }
+        return sync {
+            let offlineReason = models.isEmpty ? "The Codex app-server stopped unexpectedly." : nil
+            return readyStateLocked(offlineReason: offlineReason, stateSaveError: saveFailure?.localizedDescription)
+        }
     }
 
     private func resumeCodexThread(
@@ -423,23 +465,39 @@ public final class ChatClient: @unchecked Sendable {
         return id
     }
 
-    private func codexThreadForSend(currentThread: ConversationContinuity.Thread, model: String) async throws -> String {
+    private enum CodexSendThread {
+        case existing(String)
+        case started(String)
+
+        var id: String {
+            switch self {
+            case .existing(let id), .started(let id): return id
+            }
+        }
+    }
+
+    private func codexThreadForSend(
+        currentThread: ConversationContinuity.Thread, model: String
+    ) async throws -> CodexSendThread {
         let cwdPath = sync { runtimeDir?.path ?? "" }
         switch currentThread {
         case .attached(let id):
-            return id
+            return .existing(id)
         case .detached(let id):
             do {
                 let resumed = try await resumeCodexThread(id: id, model: model, cwdPath: cwdPath)
-                return sync {
+                return try sync {
+                    guard codexAvailable, conversation.thread?.id == id else { throw CodexRequestNotSent() }
+                    let previousMessages = conversation.messages
                     if conversation.didResume(
                         threadId: id,
                         name: resumed.name,
                         history: CodexHistory(turns: resumed.turns)
                     ) {
-                        saveCurrentState()
+                        if conversation.messages != previousMessages { onHistoryRecovered?(conversation.messages) }
+                        if let error = codexStateSaveFailure() { onError?(error) }
                     }
-                    return id
+                    return .existing(id)
                 }
             } catch let error as CodexRPCError where error.confirmsMissingRollout(for: id) {
                 sync { conversation.didConfirmThreadLoss(id) }
@@ -448,7 +506,7 @@ public final class ChatClient: @unchecked Sendable {
             break
         }
 
-        return try await startCodexThread(model: model, cwdPath: cwdPath)
+        return .started(try await startCodexThread(model: model, cwdPath: cwdPath))
     }
 
     public func newChat() async throws -> ReadyState {
@@ -474,6 +532,7 @@ public final class ChatClient: @unchecked Sendable {
             conversation = ConversationContinuity(thread: thread, titleNeeded: isCodexUp)
             checkedCodexSendId = nil
             undispatchedCodexMessage = nil
+            codexTurn = nil
             turnId = nil
             saveCurrentState()
             return readyStateLocked(resumed: false)
@@ -514,7 +573,9 @@ public final class ChatClient: @unchecked Sendable {
         }
     }
 
-    private func readyStateLocked(resumed: Bool = true) -> ReadyState {
+    private func readyStateLocked(
+        resumed: Bool = true, offlineReason: String? = nil, stateSaveError: String? = nil
+    ) -> ReadyState {
         ReadyState(
             threadId: conversation.thread?.id ?? "",
             messages: conversation.messages,
@@ -522,6 +583,8 @@ public final class ChatClient: @unchecked Sendable {
             model: model,
             models: models,
             openRouterConfigured: !openRouterConfig.key.isEmpty,
+            offlineReason: offlineReason,
+            stateSaveError: stateSaveError,
             codexRetry: codexRetryLocked()
         )
     }
@@ -554,27 +617,71 @@ public final class ChatClient: @unchecked Sendable {
                 return readyStateLocked()
             }
         }
+        enum DeliveryCheck {
+            case checked(ReadyState)
+            case streaming(interrupt: Bool)
+            case resend(ConversationContinuity.Thread)
+        }
+
         let history = await readCodexHistory(threadId: attempt.threadId)
-        let (checked, currentThread) = sync { () -> (ReadyState?, ConversationContinuity.Thread) in
+        let result = sync { () -> DeliveryCheck in
+            checkedCodexSendId = attempt.clientId
+            // A by-ID read does not subscribe. Only this still-attached attempt
+            // can resume its original stream or consume buffered notifications.
+            let canResume = codexAvailable && conversation.attachedThreadId == attempt.threadId &&
+                codexTurn?.awaitingDeliveryCheck == true && codexTurn?.attempt.clientId == attempt.clientId
+            if canResume, let deferred = codexTurn?.deferredNotifications {
+                let completedTurns = deferred.compactMap { notification -> [String: Any]? in
+                    guard notification.method == "turn/completed" else { return nil }
+                    return notification.params["turn"] as? [String: Any]
+                }
+                if let id = applyCodexTurnItems(
+                    CodexHistory(turns: completedTurns), threadId: attempt.threadId, resumingReply: true
+                ) {
+                    return .streaming(interrupt: bindCodexTurn(id))
+                }
+            }
             if let history {
                 if case .missing(let id) = conversation.thread, id == attempt.threadId {
                     conversation.thread = .detached(id)
                 }
-                if conversation.reconcileCodexSend(threadId: attempt.threadId, history: history) {
-                    saveCurrentState()
+                if let recorded = conversation.reconcileCodexSend(threadId: attempt.threadId, history: history) {
+                    let saveFailure = codexStateSaveFailure()
+                    if canResume, let id = recorded.id {
+                        let isInProgress = history.isThreadActive && recorded.status == "inProgress"
+                        let hasBufferedCompletion = codexTurn?.deferredNotifications.contains { notification in
+                            guard notification.method == "turn/completed",
+                                  let turn = notification.params["turn"] as? [String: Any] else { return false }
+                            return turn["id"] as? String == id
+                        } == true
+                        if isInProgress || hasBufferedCompletion {
+                            codexTurn?.awaitingDeliveryCheck = false
+                            codexTurn?.receiptConfirmed = true
+                            onCodexReplyResumed?(user.id, conversation.messages)
+                            if let saveFailure { onError?(saveFailure) }
+                            return .streaming(interrupt: bindCodexTurn(id))
+                        }
+                    }
+                    finishCodexTurn()
+                    return .checked(readyStateLocked(stateSaveError: saveFailure?.localizedDescription))
                 }
             }
-            checkedCodexSendId = attempt.clientId
-            let currentThread = conversation.thread ?? thread
             if resend, conversation.lastCodexSend?.delivery == .unconfirmed {
-                return (nil, currentThread)
+                return .resend(conversation.thread ?? thread)
             }
-            finishCodexTurn()
-            return (readyStateLocked(), currentThread)
+            endCodexOperation()
+            return .checked(readyStateLocked())
         }
-        if let checked { return checked }
-        onModel?(selectedModel)
-        return try await sendCodex(user, on: currentThread, model: selectedModel, replacing: attempt)
+        switch result {
+        case .checked(let ready):
+            return ready
+        case .streaming(let shouldInterrupt):
+            if shouldInterrupt { await interrupt() }
+            return nil
+        case .resend(let currentThread):
+            onModel?(selectedModel)
+            return try await sendCodex(user, on: currentThread, model: selectedModel, replacing: attempt)
+        }
     }
 
     private func readCodexHistory(threadId: String) async -> CodexHistory? {
@@ -587,7 +694,8 @@ public final class ChatClient: @unchecked Sendable {
             )
             guard let thread = result["thread"] as? [String: Any], thread["id"] as? String == threadId,
                   let turns = thread["turns"] as? [[String: Any]] else { return nil }
-            return CodexHistory(turns: turns)
+            let status = thread["status"] as? [String: Any]
+            return CodexHistory(turns: turns, isThreadActive: status?["type"] as? String == "active")
         } catch {
             return nil
         }
@@ -666,10 +774,12 @@ public final class ChatClient: @unchecked Sendable {
     ) async throws -> ReadyState? {
         var dispatchedAttempt: CodexSendAttempt?
         var beforeResend: ConversationContinuity?
+        var journalSaveFailed = false
         do {
             try await ensureCodexRunning()
             let currentThread = sync { conversation.thread ?? thread }
-            let codexThread = try await codexThreadForSend(currentThread: currentThread, model: currentModel)
+            let target = try await codexThreadForSend(currentThread: currentThread, model: currentModel)
+            let codexThread = target.id
             let prepared = try sync { () -> (CodexSendAttempt, String)? in
                 if let previous, conversation.lastCodexSend?.clientId == previous.clientId {
                     if conversation.lastCodexSend?.delivery == .confirmed {
@@ -679,7 +789,11 @@ public final class ChatClient: @unchecked Sendable {
                     beforeResend = conversation
                 }
                 let beforeSend = conversation
-                if conversation.attachedThreadId != codexThread {
+                guard codexAvailable else { throw CodexRequestNotSent() }
+                switch target {
+                case .existing:
+                    guard conversation.attachedThreadId == codexThread else { throw CodexRequestNotSent() }
+                case .started:
                     conversation.didStartCodexThread(codexThread)
                 }
                 let index: Int
@@ -702,8 +816,9 @@ public final class ChatClient: @unchecked Sendable {
                 )
                 conversation.lastCodexSend = attempt
                 do {
-                    try conversation.save(model: model, to: options.stateURL, env: options.env)
+                    try saveCodexState()
                 } catch {
+                    journalSaveFailed = true
                     conversation = beforeSend
                     throw error
                 }
@@ -738,6 +853,14 @@ public final class ChatClient: @unchecked Sendable {
                       active.attempt.turnId == nil || active.attempt.turnId == id else {
                     throw NSError(domain: "SpeedChat.Client", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid Codex turn acknowledgement."])
                 }
+                let provedReceipt = applyCodexTurnItems(CodexHistory(turns: [turn]), threadId: codexThread)
+                if provedReceipt != nil, let status = turn["status"] as? String,
+                   ["completed", "interrupted", "failed"].contains(status) {
+                    handleNotification(CodexNotification(method: "turn/completed", params: [
+                        "threadId": codexThread, "turn": turn,
+                    ]))
+                    return false
+                }
                 guard active.attempt.turnId == nil else { return false }
                 return bindCodexTurn(id)
             }
@@ -747,44 +870,98 @@ public final class ChatClient: @unchecked Sendable {
             }
             await nameFromContent(user.text, threadId: codexThread)
             return nil
-        } catch {
-            let shouldReport = sync {
+        } catch let sendError {
+            let report = sync { () -> Error? in
                 guard let dispatchedAttempt else {
-                    if conversation.lastCodexSend?.userMessageId != user.id {
+                    defer { endCodexOperation() }
+                    // A retry that never reached turn/start cannot replace old
+                    // evidence about this same prompt.
+                    guard conversation.lastCodexSend?.userMessageId != user.id else { return sendError }
+                    if journalSaveFailed {
                         undispatchedCodexMessage = user
+                        return sendError
                     }
-                    finishCodexTurn()
-                    return true
+                    let beforeRejection = conversation
+                    conversation.recordUndispatchedCodexPrompt(user)
+                    do {
+                        try saveCodexState()
+                        undispatchedCodexMessage = nil
+                        return sendError
+                    } catch {
+                        conversation = beforeRejection
+                        undispatchedCodexMessage = user
+                        return error
+                    }
                 }
-                guard let active = codexTurn, active.attempt.clientId == dispatchedAttempt.clientId else { return false }
-                let rpcError = error as? CodexRPCError
+                guard let active = codexTurn, active.attempt.clientId == dispatchedAttempt.clientId,
+                      !active.receiptConfirmed else { return nil }
+                let rpcError = sendError as? CodexRPCError
                 let unloaded = rpcError?.confirmsUnloadedThread(for: dispatchedAttempt.threadId) == true
-                if !active.receiptConfirmed, unloaded || rpcError?.confirmsInputRejection == true || error is CodexRequestNotSent {
+                let rejected = unloaded || rpcError?.confirmsInputRejection == true || sendError is CodexRequestNotSent
+                var report = sendError
+                if rejected {
                     if let beforeResend {
                         conversation = beforeResend
                     } else {
                         conversation.lastCodexSend?.delivery = .rejected
                     }
-                    saveCurrentState()
+                    do {
+                        try saveCodexState()
+                    } catch {
+                        report = error
+                    }
                 }
                 if unloaded, conversation.attachedThreadId == dispatchedAttempt.threadId {
                     conversation.thread = .detached(dispatchedAttempt.threadId)
                 }
-                finishCodexTurn()
-                return true
+                if !rejected, codexAvailable, conversation.attachedThreadId == dispatchedAttempt.threadId {
+                    codexTurn?.awaitingDeliveryCheck = true
+                    endCodexOperation()
+                } else {
+                    finishCodexTurn()
+                }
+                return report
             }
-            if shouldReport { throw error }
+            if let report { throw report }
             return nil
         }
+    }
+
+    private func applyCodexTurnItems(
+        _ history: CodexHistory, threadId: String, resumingReply: Bool = false
+    ) -> String? {
+        guard let active = codexTurn,
+              let (turn, itemId) = history.matchingReceipt(for: active.attempt, threadId: threadId),
+              let turnId = turn.id,
+              active.receiptConfirmed || conversation.recordCodexReceipt(active.attempt, turnId: turnId) else { return nil }
+        codexTurn?.receiptConfirmed = true
+        if resumingReply {
+            codexTurn?.awaitingDeliveryCheck = false
+            onCodexReplyResumed?(active.attempt.userMessageId, conversation.messages)
+        }
+        let existingIds = Set(conversation.messages.map(\.id))
+        let recovered = conversation.recoverReplies(
+            in: turn, threadId: threadId, after: itemId, for: active.attempt.userMessageId
+        )
+        if !active.receiptConfirmed || recovered, let error = codexStateSaveFailure() { onError?(error) }
+        if recovered {
+            onHistoryRecovered?(conversation.messages)
+            for reply in conversation.messages where !existingIds.contains(reply.id) {
+                onMessage?(reply.id, reply.text)
+            }
+        }
+        return turnId
     }
 
     // Both the acknowledged turn and an exact prompt receipt can bind an attempt.
     // Other notifications wait for that binding so a late turn cannot claim a new send.
     private func bindCodexTurn(_ id: String) -> Bool {
-        let deferred = codexTurn?.deferredNotifications ?? []
+        guard let active = codexTurn else { return false }
+        let deferred = active.deferredNotifications
         codexTurn?.deferredNotifications.removeAll()
         codexTurn?.attempt.turnId = id
-        if conversation.lastCodexSend?.clientId == codexTurn?.attempt.clientId {
+        if conversation.lastCodexSend?.clientId == active.attempt.clientId,
+           conversation.lastCodexSend?.turnId != id {
             conversation.lastCodexSend?.turnId = id
             saveCurrentState()
         }
@@ -795,6 +972,10 @@ public final class ChatClient: @unchecked Sendable {
 
     private func finishCodexTurn() {
         codexTurn = nil
+        endCodexOperation()
+    }
+
+    private func endCodexOperation() {
         turnId = nil
         turnStarting = false
         turnBlocked = false
@@ -995,14 +1176,20 @@ public final class ChatClient: @unchecked Sendable {
             return
         }
 
+        if active.awaitingDeliveryCheck {
+            codexTurn?.deferredNotifications.append(notification)
+            lock.unlock()
+            return
+        }
+
         if (method == "item/started" || method == "item/completed"),
            let item = params["item"] as? [String: Any], item["type"] as? String == "userMessage" {
             var shouldInterrupt = false
-            if !active.receiptConfirmed,
-               active.attempt.matchesReceipt(threadId: attachedThreadId, turnId: notificationTurnId, item: item),
+            if !active.receiptConfirmed, let input = CodexHistory.UserInput(item: item),
+               active.attempt.matchesReceipt(threadId: attachedThreadId, turnId: notificationTurnId, input: input),
                conversation.recordCodexReceipt(active.attempt, turnId: notificationTurnId) {
                 codexTurn?.receiptConfirmed = true
-                saveCurrentState()
+                if let error = codexStateSaveFailure() { onError?(error) }
                 if active.attempt.turnId == nil {
                     shouldInterrupt = bindCodexTurn(notificationTurnId)
                 }
@@ -1012,6 +1199,16 @@ public final class ChatClient: @unchecked Sendable {
             return
         }
 
+        if method == "turn/completed", let turn,
+           applyCodexTurnItems(CodexHistory(turns: [turn]), threadId: attachedThreadId) != nil,
+           active.attempt.turnId == nil {
+            _ = bindCodexTurn(notificationTurnId)
+        }
+
+        guard let active = codexTurn else {
+            lock.unlock()
+            return
+        }
         guard let activeTurnId = active.attempt.turnId else {
             codexTurn?.deferredNotifications.append(notification)
             lock.unlock()
@@ -1025,6 +1222,10 @@ public final class ChatClient: @unchecked Sendable {
         if method == "item/agentMessage/delta" {
             let rawDelta = (params["delta"] as? String) ?? ""
             let itemId = (params["itemId"] as? String) ?? ""
+            guard !conversation.messages.contains(where: { $0.id == itemId && $0.role == "assistant" }) else {
+                lock.unlock()
+                return
+            }
             let citationDelta = citationStream.push(rawDelta, sources: orderedCitations())
             let delta = linkStream.push(citationDelta)
             lock.unlock()
@@ -1060,13 +1261,13 @@ public final class ChatClient: @unchecked Sendable {
                     citationStream.reset()
                     linkStream.reset()
                     let normalized = RenderNormalizer.normalizeAssistantText(text, sources: orderedCitations())
-                    conversation.placeCodexReply(
+                    let changed = conversation.placeCodexReply(
                         ChatMessage(id: itemId, role: "assistant", text: normalized),
                         after: active.attempt.userMessageId, followsConfirmedPrompt: active.receiptConfirmed
                     )
-                    saveCurrentState()
+                    if changed { saveCurrentState() }
                     lock.unlock()
-                    onMessage?(itemId, normalized)
+                    if changed { onMessage?(itemId, normalized) }
                     return
                 }
             }

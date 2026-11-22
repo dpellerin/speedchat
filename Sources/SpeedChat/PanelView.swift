@@ -245,6 +245,11 @@ struct PanelView:View {
    if store.session.busy || store.session.phase == .connecting {ProgressView().controlSize(.small)}
    Circle().fill(store.session.failed ? Color.red : (store.session.canInteract ? Color.green : Color.secondary)).frame(width:6,height:6)
    Text(store.session.notice).font(.caption).foregroundStyle(store.session.failed ? Color.red : Color.secondary).lineLimit(2).textSelection(.enabled)
+    .accessibilityLabel(Text(store.session.notice))
+    .accessibilityIdentifier("speedchat-status")
+    .onChange(of:store.session.notice,initial:true) {_,notice in
+     if store.fixtureMode {store.fixtureStatusNotice=notice}
+    }
    Spacer(minLength:0)
    if store.session.failed {
     Button("Details") {showingErrorDetails=true}.controlSize(.small).accessibilityLabel("Show error details")

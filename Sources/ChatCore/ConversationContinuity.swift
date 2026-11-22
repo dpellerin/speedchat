@@ -44,6 +44,17 @@ struct ConversationContinuity {
         needsLegacyHistory = saved.messages == nil
     }
 
+    mutating func recordUndispatchedCodexPrompt(_ user: ChatMessage) {
+        guard let thread else { return }
+        if userIndex(messageId: user.id) == nil {
+            messages.append(user)
+        }
+        lastCodexSend = CodexSendAttempt(
+            threadId: thread.id, clientId: user.id, userMessageId: user.id,
+            wireText: user.text, delivery: .rejected
+        )
+    }
+
     mutating func recordCodexReceipt(_ attempt: CodexSendAttempt, turnId: String) -> Bool {
         guard thread?.id == attempt.threadId, lastCodexSend?.clientId == attempt.clientId,
               let anchor = userIndex(messageId: attempt.userMessageId) else { return false }
@@ -53,24 +64,17 @@ struct ConversationContinuity {
         return true
     }
 
-    @discardableResult
-    mutating func reconcileCodexSend(threadId: String, history: CodexHistory) -> Bool {
+    mutating func reconcileCodexSend(threadId: String, history: CodexHistory) -> CodexHistory.Turn? {
         guard let attempt = lastCodexSend, attempt.threadId == threadId,
-              attempt.delivery != .rejected else { return false }
+              attempt.delivery != .rejected else { return nil }
 
-        let matches = history.turns.flatMap { turn -> [(CodexHistory.Turn, String)] in
-            guard turn.isFull, let turnId = turn.id else { return [] }
-            return turn.items.compactMap { item in
-                guard let input = item.user, let itemId = input.id, !itemId.isEmpty,
-                      attempt.matchesReceipt(threadId: threadId, turnId: turnId,
-                                             clientId: input.clientId, wireText: input.wireText) else { return nil }
-                return (turn, itemId)
-            }
+        guard let (turn, itemId) = history.matchingReceipt(for: attempt, threadId: threadId),
+              let turnId = turn.id,
+              recordCodexReceipt(attempt, turnId: turnId) else { return nil }
+        if turn.status != "inProgress" {
+            _ = recoverReplies(in: turn, threadId: threadId, after: itemId, for: attempt.userMessageId)
         }
-        guard matches.count == 1, let (turn, itemId) = matches.first, let turnId = turn.id,
-              recordCodexReceipt(attempt, turnId: turnId) else { return false }
-        _ = recoverReplies(in: turn, threadId: threadId, after: itemId, for: attempt.userMessageId)
-        return true
+        return turn
     }
 
     mutating func didResume(threadId: String, name: String?, history: CodexHistory) -> Bool {
@@ -90,7 +94,7 @@ struct ConversationContinuity {
         let inputsByClientId = Dictionary(grouping: inputs, by: \.clientId)
         let exchanges = history.turns.flatMap(\.exchanges)
         let repliesById = Dictionary(grouping: exchanges.flatMap(\.replies), by: \.id)
-        var recovered = reconcileCodexSend(threadId: threadId, history: history)
+        var recovered = reconcileCodexSend(threadId: threadId, history: history) != nil
         for exchange in exchanges {
             guard !exchange.replies.isEmpty,
                   exchange.replies.allSatisfy({ repliesById[$0.id]?.count == 1 }) else { continue }
@@ -127,11 +131,12 @@ struct ConversationContinuity {
         return index
     }
 
-    mutating func placeCodexReply(_ reply: ChatMessage, after userMessageId: String, followsConfirmedPrompt: Bool) {
+    @discardableResult
+    mutating func placeCodexReply(_ reply: ChatMessage, after userMessageId: String, followsConfirmedPrompt: Bool) -> Bool {
         if let index = messages.firstIndex(where: { $0.id == reply.id }) {
-            guard messages[index].role == "assistant" else { return }
+            guard messages[index].role == "assistant", messages[index] != reply else { return false }
             messages[index] = reply
-            return
+            return true
         }
         let nextUser = userIndex(messageId: userMessageId).flatMap { anchor in
             messages[(anchor + 1)...].firstIndex { $0.role == "user" }
@@ -141,18 +146,27 @@ struct ConversationContinuity {
         if index < codexSyncedCount || (followsConfirmedPrompt && index == codexSyncedCount) {
             codexSyncedCount += 1
         }
+        return true
     }
 
     private mutating func recoverReplies(_ replies: [ChatMessage], after userAnchor: Int?) -> Bool {
         guard !replies.isEmpty, Set(replies.map(\.id)).count == replies.count else { return false }
         var previousIndex = userAnchor ?? -1
         var firstSavedReply: Int?
+        var segmentEnd = userAnchor.flatMap { anchor in
+            messages[(anchor + 1)...].firstIndex { $0.role == "user" }
+        } ?? messages.count
         for reply in replies {
             let matches = messages.indices.filter { messages[$0].id == reply.id }
             guard !matches.isEmpty else { continue }
             guard matches.count == 1, let index = matches.first, index > previousIndex,
-                  messages[index].role == "assistant" else { return false }
-            if firstSavedReply == nil { firstSavedReply = index }
+                  index < segmentEnd, messages[index].role == "assistant" else { return false }
+            if firstSavedReply == nil {
+                firstSavedReply = index
+                if userAnchor == nil {
+                    segmentEnd = messages[(index + 1)...].firstIndex { $0.role == "user" } ?? messages.count
+                }
+            }
             previousIndex = index
         }
 

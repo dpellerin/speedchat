@@ -20,6 +20,7 @@ import ChatCore
  var codexOverride=""
  var fixtureMode=false
  var fixtureCommands=[[String:String]]()
+ var fixtureStatusNotice=""
  var changed:(()->Void)?
  func show() {
   hiddenAt=nil;idleTimer?.invalidate();idleTimer=nil

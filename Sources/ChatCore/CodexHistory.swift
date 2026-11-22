@@ -5,7 +5,8 @@ struct CodexHistory: Sendable {
         let wireText: String?
         let visibleText: String
 
-        init(item: [String: Any]) {
+        init?(item: [String: Any]) {
+            guard item["type"] as? String == "userMessage" else { return nil }
             id = item["id"] as? String
             clientId = item["clientId"] as? String
             let parts = item["content"] as? [[String: Any]] ?? []
@@ -53,10 +54,12 @@ struct CodexHistory: Sendable {
     struct Turn: Sendable {
         let id: String?
         let items: [Item]
+        let status: String?
         let isFull: Bool
 
         init(_ turn: [String: Any]) {
             id = turn["id"] as? String
+            status = turn["status"] as? String
             let rawItems = turn["items"] as? [[String: Any]]
             isFull = rawItems != nil && (turn["itemsView"] == nil || turn["itemsView"] as? String == "full")
             let sources = (rawItems ?? []).flatMap { item -> [CitationSource] in
@@ -66,7 +69,7 @@ struct CodexHistory: Sendable {
             items = (rawItems ?? []).compactMap { item in
                 switch item["type"] as? String {
                 case "userMessage":
-                    return .user(UserInput(item: item))
+                    return UserInput(item: item).map(Item.user)
                 case "agentMessage":
                     guard let id = item["id"] as? String, !id.isEmpty,
                           item["phase"] as? String != "commentary",
@@ -94,9 +97,23 @@ struct CodexHistory: Sendable {
     }
 
     let turns: [Turn]
+    let isThreadActive: Bool
 
-    init(turns: [[String: Any]]) {
+    init(turns: [[String: Any]], isThreadActive: Bool = false) {
         self.turns = turns.map(Turn.init)
+        self.isThreadActive = isThreadActive
+    }
+
+    func matchingReceipt(for attempt: CodexSendAttempt, threadId: String) -> (turn: Turn, itemId: String)? {
+        let matches = turns.flatMap { turn -> [(turn: Turn, itemId: String)] in
+            guard turn.isFull, let turnId = turn.id else { return [] }
+            return turn.items.compactMap { item in
+                guard let input = item.user, let itemId = input.id,
+                      attempt.matchesReceipt(threadId: threadId, turnId: turnId, input: input) else { return nil }
+                return (turn, itemId)
+            }
+        }
+        return matches.count == 1 ? matches.first : nil
     }
 
     var legacyMessages: [ChatMessage] {

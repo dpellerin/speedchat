@@ -29,6 +29,7 @@ public struct BridgeEvent: Codable, Sendable {
     public var name: String?
     public var durationMs: Double?
     public var busy: Bool?
+    public var stateSaveError: String?
     public var codexRetry: CodexRetry?
     public init(
         type: String,
@@ -43,6 +44,7 @@ public struct BridgeEvent: Codable, Sendable {
         name: String? = nil,
         durationMs: Double? = nil,
         busy: Bool? = nil,
+        stateSaveError: String? = nil,
         codexRetry: CodexRetry? = nil
     ) {
         self.type = type
@@ -57,6 +59,7 @@ public struct BridgeEvent: Codable, Sendable {
         self.name = name
         self.durationMs = durationMs
         self.busy = busy
+        self.stateSaveError = stateSaveError
         self.codexRetry = codexRetry
     }
 }
@@ -117,15 +120,27 @@ public struct ChatSession: Sendable {
  public func shouldStopIdle(hidden:Bool,elapsed:TimeInterval) -> Bool {hidden && !busy && elapsed >= 300}
  public mutating func receive(_ event:BridgeEvent) {
   switch event.type {
-  case "ready":
+  case "ready","offlineConversation":
    transcriptID=UUID();messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel
-   phase = .ready;notice=event.notice ?? "Ready";failed=false;failureDetails=nil
+   let isOffline=event.type == "offlineConversation"
+   phase = isOffline ? .offline : .ready
+   notice=(isOffline ? event.notice : (event.stateSaveError ?? event.notice)) ?? "Ready"
+   failed=isOffline || event.stateSaveError != nil;failureDetails=event.stateSaveError ?? (isOffline ? notice : nil)
    lastRequest="";lastRequestWasOpenRouter=false;activeCodexPromptId=nil
    updateCodexRetry(event.codexRetry)
+  case "historyRecovered":
+   guard streaming,let promptId=activeCodexPromptId,var recovered=event.messages else {return}
+   if !recovered.contains(where:{$0.id == promptId}),
+      let optimistic=messages.first(where:{$0.id == promptId && $0.role == "user"}) {recovered.append(optimistic)}
+   messages=recovered
+  case "codexReplyResumed":
+   guard (streaming || phase == .checkingDelivery),let promptId=activeCodexPromptId,promptId == event.itemId else {return}
+   messages=event.messages ?? messages;phase = .sending;notice="Thinking…";codexRetry=nil
   case "conversationUpdated":
    guard streaming || phase == .checkingDelivery else {return}
    messages=event.messages ?? messages
-   phase = .ready;notice=event.notice ?? "Ready";failed=false;failureDetails=nil;activeCodexPromptId=nil
+   phase = .ready;notice=event.stateSaveError ?? event.notice ?? "Ready";activeCodexPromptId=nil
+   failed=event.stateSaveError != nil;failureDetails=event.stateSaveError
    updateCodexRetry(event.codexRetry)
   case "modelsUpdated":
    models=event.models ?? models

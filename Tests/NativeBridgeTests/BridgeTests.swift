@@ -236,3 +236,118 @@ private func visibleDate(_ value:String)->String {
  #expect(store.fixtureCommands.suffix(2).allSatisfy { $0["type"] == "send" && $0["text"] == "A router prompt" })
  #expect(store.session.messages.map(\.text) == ["A router prompt","A router prompt"])
 }
+
+@Test func lazyCodexResumePublishesRecoveredHistoryDuringNormalSend() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let codex = root.appendingPathComponent("fake-codex")
+    let script = """
+        #!/usr/bin/env python3
+        import json, sys
+        resumes = 0
+        def emit(value):
+            print(json.dumps(value), flush=True)
+        for raw in sys.stdin:
+            request = json.loads(raw)
+            method = request.get("method")
+            mid = request.get("id")
+            if method == "initialize" or method == "thread/name/set":
+                emit({"id": mid, "result": {}})
+            elif method == "model/list":
+                emit({"id": mid, "result": {"data": [{"model": "gpt-6-luna", "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}})
+            elif method == "thread/resume":
+                resumes += 1
+                if resumes == 1:
+                    emit({"id": mid, "error": {"code": -32603, "message": "Temporarily unavailable"}})
+                else:
+                    emit({"id": mid, "result": {"thread": {"id": "trail", "name": "Trail info", "turns": [
+                        {"id": "previous", "items": [
+                            {"id": "recorded", "type": "userMessage", "clientId": "saved",
+                             "content": [{"type": "text", "text": "Where should I hike?"}]},
+                            {"id": "recovered", "type": "agentMessage", "text": "Try Eagle Trail."}
+                        ]}
+                    ]}}})
+            elif method == "turn/start":
+                emit({"id": mid, "result": {"turn": {"id": "next"}}})
+                params = request["params"]
+                emit({"method": "item/started", "params": {"threadId": "trail", "turnId": "next",
+                    "item": {"id": "receipt", "type": "userMessage", "clientId": params["clientUserMessageId"],
+                             "content": params["input"]}}})
+                emit({"method": "item/completed", "params": {"threadId": "trail", "turnId": "next",
+                    "item": {"id": "final", "type": "agentMessage", "text": "At noon."}}})
+                emit({"method": "turn/completed", "params": {"threadId": "trail",
+                    "turn": {"id": "next", "status": "completed"}}})
+        """
+    try script.write(to: codex, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: codex.path)
+    let stateURL = root.appendingPathComponent("state.json")
+    let saved = ChatMessage(id: "saved", role: "user", text: "Where should I hike?")
+    try StateStore.save(threadId: "trail", model: "gpt-6-luna", to: stateURL, messages: [saved])
+
+    let bridge = BridgeProcess()
+    let (events, eventSink) = AsyncStream<BridgeEvent>.makeStream()
+    let timeout = Task {
+        try? await Task.sleep(for: .seconds(5))
+        eventSink.finish()
+    }
+    defer { timeout.cancel() }
+    bridge.start(codexOverride: codex.path, options: ChatClientOptions(
+        openRouterConfigURL: root.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]
+    )) { event in eventSink.yield(event) }
+
+    var session = ChatSession()
+    var optimistic: ChatMessage?
+    for await event in events {
+        session.receive(event)
+        if event.type == "ready" {
+            #expect(session.messages == [saved])
+            let draft = session.beginSend("When does it open?")
+            let text = try #require(draft)
+            let prompt = try #require(session.messages.last)
+            optimistic = prompt
+            bridge.send(["type": "send", "text": text, "itemId": prompt.id])
+        }
+        if event.type == "historyRecovered" {
+            #expect(session.streaming)
+            #expect(session.messages.last == optimistic)
+        }
+        if event.type == "done" || event.type == "fatal" { break }
+    }
+    await withCheckedContinuation { continuation in
+        bridge.close { continuation.resume() }
+    }
+    #expect(session.messages.map(\.text) == ["Where should I hike?", "Try Eagle Trail.", "When does it open?", "At noon."])
+    #expect(session.canSend)
+}
+
+@Test func savedConversationReachesPanelWhenCodexExitsDuringStartup() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let codex = root.appendingPathComponent("fake-codex")
+    try "#!/bin/sh\nexit 17\n".write(to: codex, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: codex.path)
+    let stateURL = root.appendingPathComponent("state.json")
+    let saved = ChatMessage(id: "saved", role: "assistant", text: "Try Eagle Trail.")
+    try StateStore.save(threadId: "trail", model: "gpt-6-luna", to: stateURL, messages: [saved])
+
+    let bridge = BridgeProcess()
+    let (events, sink) = AsyncStream<BridgeEvent>.makeStream()
+    let timeout = Task {
+        try? await Task.sleep(for: .seconds(5))
+        sink.finish()
+    }
+    defer { timeout.cancel() }
+    bridge.start(codexOverride: codex.path, options: ChatClientOptions(
+        openRouterConfigURL: root.appendingPathComponent("openrouter.json"), stateURL: stateURL, env: [:]
+    )) { event in sink.yield(event) }
+    var stream = events.makeAsyncIterator()
+    let initial = await stream.next()
+    await withCheckedContinuation { continuation in
+        bridge.close { continuation.resume() }
+    }
+    #expect(initial?.type == "offlineConversation")
+    #expect(initial?.messages == [saved])
+    #expect(initial?.models == [])
+}
