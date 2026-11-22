@@ -31,6 +31,7 @@ public struct BridgeEvent: Codable, Sendable {
     public var busy: Bool?
     public var stateSaveError: String?
     public var codexRetry: CodexRetry?
+    public var executionID: UUID?
     public init(
         type: String,
         messages: [ChatMessage]? = nil,
@@ -45,7 +46,8 @@ public struct BridgeEvent: Codable, Sendable {
         durationMs: Double? = nil,
         busy: Bool? = nil,
         stateSaveError: String? = nil,
-        codexRetry: CodexRetry? = nil
+        codexRetry: CodexRetry? = nil,
+        executionID: UUID? = nil
     ) {
         self.type = type
         self.messages = messages
@@ -61,6 +63,7 @@ public struct BridgeEvent: Codable, Sendable {
         self.busy = busy
         self.stateSaveError = stateSaveError
         self.codexRetry = codexRetry
+        self.executionID = executionID
     }
 }
 public struct ChatSession: Sendable {
@@ -75,6 +78,7 @@ public struct ChatSession: Sendable {
  public private(set) var lastRequest=""
  private var lastRequestWasOpenRouter=false
  private var activeCodexPromptId:String?
+ public private(set) var executionID: UUID?
  private var codexRetry:CodexRetry?
  private var failureDetails:String?
  public private(set) var failed=false
@@ -92,12 +96,13 @@ public struct ChatSession: Sendable {
  public var busy: Bool { [.sending,.selecting,.resetting,.checkingDelivery].contains(phase) }
  public var streaming: Bool { phase == .sending }
  public init() {}
- public mutating func connecting() {phase = .connecting;notice="Connecting…";failed=false}
- public mutating func offline(_ reason:String) {phase = .offline;notice=reason}
+ public mutating func connecting() {phase = .connecting;notice="Connecting…";failed=false;executionID=nil}
+ public mutating func offline(_ reason:String) {phase = .offline;notice=reason;executionID=nil}
  public mutating func beginSend(_ source:String) -> String? {
   let text=source.trimmingCharacters(in:.whitespacesAndNewlines)
   guard canSend, !text.isEmpty else {return nil}
   let id=UUID().uuidString.lowercased()
+  executionID=UUID()
   phase = .sending;notice="Thinking…";lastRequest=text;failed=false;failureDetails=nil;activeModel=selectedModel
   lastRequestWasOpenRouter=selectedOpenRouter
   activeCodexPromptId=selectedOpenRouter ? nil : id
@@ -109,6 +114,7 @@ public struct ChatSession: Sendable {
   notice = retry.action == .retry ? "Thinking…" : "Checking Codex delivery…"
   failed=false;failureDetails=nil;activeModel=selectedModel
   activeCodexPromptId=retry.userMessageId
+  executionID=nil
   return retry.userMessageId
  }
  public mutating func beginNewChat() -> Bool {guard canInteract else {return false};phase = .resetting;notice="Starting a new chat…";return true}
@@ -119,6 +125,7 @@ public struct ChatSession: Sendable {
  public mutating func stopping() {if streaming {notice="Stopping…"}}
  public func shouldStopIdle(hidden:Bool,elapsed:TimeInterval) -> Bool {hidden && !busy && elapsed >= 300}
  public mutating func receive(_ event:BridgeEvent) {
+  guard event.executionID == nil || event.executionID == executionID else {return}
   switch event.type {
   case "ready","offlineConversation":
    transcriptID=UUID();messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel
@@ -126,7 +133,7 @@ public struct ChatSession: Sendable {
    phase = isOffline ? .offline : .ready
    notice=(isOffline ? event.notice : (event.stateSaveError ?? event.notice)) ?? "Ready"
    failed=isOffline || event.stateSaveError != nil;failureDetails=event.stateSaveError ?? (isOffline ? notice : nil)
-   lastRequest="";lastRequestWasOpenRouter=false;activeCodexPromptId=nil
+   lastRequest="";lastRequestWasOpenRouter=false;activeCodexPromptId=nil;executionID=nil
    updateCodexRetry(event.codexRetry)
   case "historyRecovered":
    guard streaming,let promptId=activeCodexPromptId,var recovered=event.messages else {return}
@@ -139,7 +146,7 @@ public struct ChatSession: Sendable {
   case "conversationUpdated":
    guard streaming || phase == .checkingDelivery else {return}
    messages=event.messages ?? messages
-   phase = .ready;notice=event.stateSaveError ?? event.notice ?? "Ready";activeCodexPromptId=nil
+   phase = .ready;notice=event.stateSaveError ?? event.notice ?? "Ready";activeCodexPromptId=nil;executionID=nil
    failed=event.stateSaveError != nil;failureDetails=event.stateSaveError
    updateCodexRetry(event.codexRetry)
   case "modelsUpdated":
@@ -159,6 +166,10 @@ public struct ChatSession: Sendable {
   case "delta","message":
    guard streaming else {return}
    let id=event.itemId ?? "assistant"
+   if event.type == "message", event.executionID != nil, event.text == "" {
+    messages.removeAll {$0.id == id && $0.role == "assistant"}
+    return
+   }
    if let i=messages.firstIndex(where:{$0.id==id}) {if event.type == "delta" {messages[i].text += event.delta ?? ""} else {messages[i].text=event.text ?? ""}}
    else {
     let reply=ChatMessage(id:id,role:"assistant",text:event.type == "delta" ? event.delta ?? "" : event.text ?? "")
@@ -169,12 +180,13 @@ public struct ChatSession: Sendable {
   case "searching": if streaming {notice="Searching the web…"}
   case "done":
    guard streaming else {return}
-   phase = .ready;activeCodexPromptId=nil;if !failed {notice="Ready"}
+   phase = .ready;activeCodexPromptId=nil;executionID=nil;if !failed {notice=event.stateSaveError ?? "Ready"}
    updateCodexRetry(event.codexRetry)
   case "error":
    guard phase != .offline else {return}
    failed=true;notice=event.message ?? "Something went wrong.";failureDetails=notice
    phase = phase == .connecting ? .offline : (event.busy == true ? .sending : .ready)
+   if !streaming {executionID=nil}
    updateCodexRetry(event.codexRetry)
   case "fatal": failed=true;offline(event.message ?? "The backend disconnected.")
   case "metric": if let name=event.name,let ms=event.durationMs {metrics[name]=ms}

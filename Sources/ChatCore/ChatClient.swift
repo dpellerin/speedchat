@@ -126,12 +126,33 @@ public final class ChatClient: @unchecked Sendable {
 
     private var conversation = ConversationContinuity()
     private var turnId: String?
-    private var turnStarting = false
     private var turnBlocked = false
     private var interruptPending = false
     private var mutationPending = false
     private var checkedCodexSendId: String?
     private var undispatchedCodexMessage: ChatMessage?
+
+    private struct PendingSend {
+        let user: ChatMessage
+        let thread: ConversationContinuity.Thread
+        let model: String
+        let openRouterKey: String?
+    }
+
+    private struct ActiveExecution {
+        let id: UUID
+        var pendingSend: PendingSend?
+        var openRouter: OpenRouterReply?
+    }
+
+    private struct OpenRouterReply {
+        let itemId = "or-msg-\(UUID().uuidString.lowercased())"
+        var task: Task<Void, Never>?
+        var streamedText = ""
+        var reasoning: String?
+    }
+
+    private var activeExecution: ActiveExecution?
 
     private struct ActiveCodexTurn {
         var attempt: CodexSendAttempt
@@ -143,7 +164,7 @@ public final class ChatClient: @unchecked Sendable {
     private var codexTurn: ActiveCodexTurn?
 
     public var busy: Bool {
-        sync { turnStarting || turnId != nil || mutationPending }
+        sync { activeExecution != nil || mutationPending }
     }
 
     public var codexRetry: CodexRetry? {
@@ -174,9 +195,7 @@ public final class ChatClient: @unchecked Sendable {
     private var codexAvailable = false
     private var models = [ChatModel]()
     private var model = ""
-    private var openRouterTask: Task<Void, Never>?
-    private var openRouterTurnToken: UUID?
-
+    public var onTurnEvent: (@Sendable (BridgeEvent) -> Void)?
     public var onDelta: (@Sendable (String, String) -> Void)?
     public var onMessage: (@Sendable (String, String) -> Void)?
     public var onHistoryRecovered: (@Sendable ([ChatMessage]) -> Void)?
@@ -511,7 +530,7 @@ public final class ChatClient: @unchecked Sendable {
 
     public func newChat() async throws -> ReadyState {
         let (isCodexUp, codexModel, cwdPath) = try sync { () -> (Bool, String, String) in
-            if turnStarting || turnId != nil || mutationPending {
+            if activeExecution != nil || mutationPending {
                 throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [NSLocalizedDescriptionKey: "Wait for the current response or change to finish."])
             }
             mutationPending = true
@@ -545,7 +564,7 @@ public final class ChatClient: @unchecked Sendable {
 
     public func selectModel(_ candidate: String) async throws -> ReadyState {
         let (currentThread, shouldUpdateCodex) = try sync { () -> (String, Bool) in
-            if turnStarting || turnId != nil || mutationPending {
+            if activeExecution != nil || mutationPending {
                 throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [NSLocalizedDescriptionKey: "Wait for the current response or change to finish."])
             }
             guard models.contains(where: { $0.model == candidate }) else {
@@ -711,8 +730,8 @@ public final class ChatClient: @unchecked Sendable {
         return thread
     }
 
-    private func beginTurn() {
-        turnStarting = true
+    private func beginTurn(_ execution: ActiveExecution = ActiveExecution(id: UUID())) {
+        activeExecution = execution
         turnBlocked = false
         interruptPending = false
         citationSources.removeAll()
@@ -721,8 +740,9 @@ public final class ChatClient: @unchecked Sendable {
         linkStream.reset()
     }
 
-    public func send(_ text: String, userMessageId: String = UUID().uuidString.lowercased()) async throws {
-        let (currentThread, currentModel, useOpenRouter, orKey) = try sync {
+    /// Register a Send before scheduling provider work, so Stop can settle it immediately.
+    public func acceptSend(_ text: String, userMessageId: String, executionID: UUID) throws {
+        try sync {
             let thread = try threadForNewTurn()
             let useOpenRouter = isOpenRouterModel(model)
             if !useOpenRouter, let action = codexRetryLocked(), action.action != .retry {
@@ -730,42 +750,51 @@ public final class ChatClient: @unchecked Sendable {
                     NSLocalizedDescriptionKey: action.notice ?? "Check the previous Codex send first.",
                 ])
             }
-            beginTurn()
-            return (thread, model, useOpenRouter, openRouterConfig.key)
-        }
-
-        let userMessage = ChatMessage(id: userMessageId, role: "user", text: text)
-        onModel?(currentModel)
-
-        if useOpenRouter {
-            if orKey.isEmpty {
-                sync { turnStarting = false }
+            let key = openRouterConfig.key
+            if useOpenRouter && key.isEmpty {
                 throw NSError(domain: "SpeedChat.Client", code: 7, userInfo: [NSLocalizedDescriptionKey: "OpenRouter API key is required. Add your key in SpeedChat Settings."])
             }
-            let itemId = "or-msg-\(UUID().uuidString.lowercased())"
-            let token = UUID()
-            let (snapshotMessages, pendingStop) = sync { () -> ([ChatMessage], Bool) in
-                conversation.messages.append(userMessage)
-                turnId = "or-turn-\(token.uuidString.lowercased())"
-                openRouterTurnToken = token
-                turnStarting = false
-                return (conversation.messages, interruptPending)
-            }
-
-            if pendingStop {
-                await interrupt()
-                return
-            }
-
-            let task: Task<Void, Never> = Task { [weak self] in
-                await self?.runOpenRouterTurn(itemId: itemId, token: token, model: currentModel, key: orKey, messages: snapshotMessages)
-            }
-            sync { openRouterTask = task }
-            await nameFromContent(text)
-            return
+            let user = ChatMessage(id: userMessageId, role: "user", text: text)
+            beginTurn(ActiveExecution(
+                id: executionID,
+                pendingSend: PendingSend(user: user, thread: thread, model: model, openRouterKey: useOpenRouter ? key : nil),
+                openRouter: useOpenRouter ? OpenRouterReply() : nil
+            ))
+            if useOpenRouter { conversation.messages.append(user) }
         }
+    }
 
-        _ = try await sendCodex(userMessage, on: currentThread, model: currentModel)
+    public func send(_ text: String, userMessageId: String = UUID().uuidString.lowercased()) async throws {
+        let executionID = UUID()
+        try acceptSend(text, userMessageId: userMessageId, executionID: executionID)
+        try await startSend(executionID: executionID)
+    }
+
+    public func startSend(executionID: UUID) async throws {
+        let pending = sync { () -> PendingSend? in
+            guard activeExecution?.id == executionID, let pending = activeExecution?.pendingSend else { return nil }
+            activeExecution?.pendingSend = nil
+            if pending.openRouterKey != nil {
+                onTurnEvent?(BridgeEvent(type: "activeModel", model: pending.model, executionID: executionID))
+            }
+            return pending
+        }
+        guard let pending else { return }
+
+        if pending.openRouterKey == nil || onTurnEvent == nil { onModel?(pending.model) }
+        if let key = pending.openRouterKey {
+            let namingThread = sync { () -> String? in
+                guard activeExecution?.id == executionID else { return nil }
+                let snapshot = conversation.messages
+                activeExecution?.openRouter?.task = Task { [weak self] in
+                    await self?.runOpenRouterTurn(executionID: executionID, model: pending.model, key: key, messages: snapshot)
+                }
+                return conversation.attachedThreadId
+            }
+            if let namingThread { await nameFromContent(pending.user.text, threadId: namingThread) }
+        } else {
+            _ = try await sendCodex(pending.user, on: pending.thread, model: pending.model)
+        }
     }
 
     private func sendCodex(
@@ -977,157 +1006,168 @@ public final class ChatClient: @unchecked Sendable {
 
     private func endCodexOperation() {
         turnId = nil
-        turnStarting = false
+        activeExecution = nil
         turnBlocked = false
         interruptPending = false
     }
 
+    private func emitTurnEvent(_ event: BridgeEvent, executionID: UUID, fallback: () -> Void) {
+        if let onTurnEvent {
+            var scopedEvent = event
+            scopedEvent.executionID = executionID
+            onTurnEvent(scopedEvent)
+        } else {
+            fallback()
+        }
+    }
+
     private func runOpenRouterTurn(
-        itemId: String,
-        token: UUID,
+        executionID: UUID,
         model: String,
         key: String,
         messages snapshot: [ChatMessage]
     ) async {
-        final class StreamBox: @unchecked Sendable {
-            var streamedText = ""
-            var reasoning: String?
-        }
-        let box = StreamBox()
-
+        guard sync({ activeExecution?.id == executionID }) else { return }
         do {
-            let fullText = try await OpenRouterClient.streamTurn(
-                OpenRouterStreamOptions(
-                    key: key,
-                    model: model,
-                    instructions: ChatPrompt.instructions,
-                    messages: snapshot,
-                    onDelta: { [weak self] rawDelta in
-                        guard let self else { return }
-                        let delta: String = self.sync {
-                            guard self.openRouterTurnToken == token else { return "" }
-                            box.streamedText += rawDelta
-                            let citationDelta = self.citationStream.push(rawDelta, sources: self.orderedCitations())
-                            return self.linkStream.push(citationDelta)
-                        }
-                        if !delta.isEmpty {
+            var streamOptions = OpenRouterStreamOptions(
+                key: key,
+                model: model,
+                instructions: ChatPrompt.instructions,
+                messages: snapshot,
+                onDelta: { [weak self] rawDelta in
+                    guard let self else { return }
+                    self.sync {
+                        guard self.activeExecution?.id == executionID,
+                              let itemId = self.activeExecution?.openRouter?.itemId else { return }
+                        self.activeExecution?.openRouter?.streamedText += rawDelta
+                        let citationDelta = self.citationStream.push(rawDelta, sources: self.orderedCitations())
+                        let delta = self.linkStream.push(citationDelta)
+                        guard !delta.isEmpty else { return }
+                        self.emitTurnEvent(BridgeEvent(type: "delta", itemId: itemId, delta: delta), executionID: executionID) {
                             self.onDelta?(delta, itemId)
                         }
-                    },
-                    onSearching: { [weak self] in
-                        guard let self else { return }
-                        let isActive = self.sync { self.openRouterTurnToken == token }
-                        if isActive {
+                    }
+                },
+                onSearching: { [weak self] in
+                    guard let self else { return }
+                    self.sync {
+                        guard self.activeExecution?.id == executionID else { return }
+                        self.emitTurnEvent(BridgeEvent(type: "searching"), executionID: executionID) {
                             self.onSearching?()
                         }
-                    },
-                    onCitation: { [weak self] source in
-                        guard let self else { return }
-                        self.sync { self.recordCitation(source) }
-                    },
-                    onReasoning: { [weak self] reasoning in
-                        guard let self else { return }
-                        self.sync {
-                            guard self.openRouterTurnToken == token else { return }
-                            box.reasoning = reasoning.isEmpty ? nil : reasoning
-                        }
-                    },
-                    fetch: options.openRouterFetch
-                )
-            )
-
-            let normalizedOpt: String? = sync {
-                guard openRouterTurnToken == token else { return nil }
-                citationStream.reset()
-                linkStream.reset()
-                let rawText = fullText.isEmpty ? box.streamedText : fullText
-                let normalized = RenderNormalizer.normalizeAssistantText(rawText, sources: orderedCitations())
-                if !normalized.isEmpty {
-                    conversation.messages.append(ChatMessage(id: itemId, role: "assistant", text: normalized, reasoning: box.reasoning))
-                    saveCurrentState()
-                }
-                openRouterTask = nil
-                openRouterTurnToken = nil
-                turnId = nil
-                turnStarting = false
-                return normalized
-            }
-
-            guard let normalized = normalizedOpt else { return }
-            if !normalized.isEmpty {
-                onMessage?(itemId, normalized)
-            }
-            onDone?()
-        } catch {
-            let isCancelled = Task.isCancelled || (error is CancellationError)
-            let isCurrent = sync { () -> Bool in
-                let active = openRouterTurnToken == token
-                if isCancelled {
-                    let partial = box.streamedText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !partial.isEmpty {
-                        let normalized = RenderNormalizer.normalizeAssistantText(box.streamedText, sources: orderedCitations())
-                        conversation.messages.append(ChatMessage(id: itemId, role: "assistant", text: normalized))
-                        saveCurrentState()
                     }
+                },
+                onCitation: { [weak self] source in
+                    guard let self else { return }
+                    self.sync {
+                        guard self.activeExecution?.id == executionID else { return }
+                        self.recordCitation(source)
+                    }
+                },
+                onReasoning: { [weak self] reasoning in
+                    guard let self else { return }
+                    self.sync {
+                        guard self.activeExecution?.id == executionID else { return }
+                        self.activeExecution?.openRouter?.reasoning = reasoning.isEmpty ? nil : reasoning
+                    }
+                },
+                fetch: options.openRouterFetch
+            )
+            streamOptions.checkDispatch = { [weak self] in
+                guard let self, self.sync({ self.activeExecution?.id == executionID }) else {
+                    throw CancellationError()
                 }
-                if active {
-                    openRouterTask = nil
-                    openRouterTurnToken = nil
-                    turnId = nil
-                    turnStarting = false
-                }
-                return active
             }
-            if isCurrent {
-                if isCancelled {
-                    onDone?()
-                } else {
-                    onError?(error)
-                }
+            let fullText = try await OpenRouterClient.streamTurn(streamOptions)
+            sync { finishOpenRouterTurn(executionID: executionID, outcome: .completed(fullText)) }
+        } catch is CancellationError {
+            sync { finishOpenRouterTurn(executionID: executionID, outcome: .stopped) }
+        } catch {
+            sync { finishOpenRouterTurn(executionID: executionID, outcome: .failed(error)) }
+        }
+    }
+
+    private enum OpenRouterOutcome {
+        case completed(String)
+        case stopped
+        case failed(Error)
+    }
+
+    // The caller holds the lock. Only the first terminal action can take the active reply.
+    private func finishOpenRouterTurn(executionID: UUID, outcome: OpenRouterOutcome) {
+        guard activeExecution?.id == executionID, let reply = activeExecution?.openRouter else { return }
+        activeExecution = nil
+
+        let rawText: String
+        let reasoning: String?
+        switch outcome {
+        case .completed(let fullText):
+            rawText = fullText.isEmpty ? reply.streamedText : fullText
+            reasoning = reply.reasoning
+        case .stopped:
+            reply.task?.cancel()
+            rawText = reply.streamedText
+            reasoning = nil
+        case .failed(let error):
+            emitTurnEvent(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: false, codexRetry: codexRetryLocked()), executionID: executionID) {
+                onError?(error)
+            }
+            return
+        }
+
+        let text = RenderNormalizer.normalizeAssistantText(rawText, sources: orderedCitations())
+        if !text.isEmpty {
+            conversation.messages.append(ChatMessage(id: reply.itemId, role: "assistant", text: text, reasoning: reasoning))
+        }
+        let saveWarning: String?
+        do {
+            try conversation.save(model: model, to: options.stateURL, env: options.env)
+            saveWarning = nil
+        } catch {
+            saveWarning = "Couldn’t save this turn locally. It may be missing after reopening."
+        }
+        if !text.isEmpty || !reply.streamedText.isEmpty {
+            emitTurnEvent(BridgeEvent(type: "message", itemId: reply.itemId, text: text), executionID: executionID) {
+                if !text.isEmpty { onMessage?(reply.itemId, text) }
+            }
+        }
+        emitTurnEvent(BridgeEvent(type: "done", stateSaveError: saveWarning, codexRetry: codexRetryLocked()), executionID: executionID) {
+            onDone?()
+        }
+    }
+
+    /// Record Stop synchronously. Only a bound Codex interrupt needs an asynchronous RPC.
+    @discardableResult
+    public func requestStop(executionID: UUID? = nil) -> Task<Void, Never>? {
+        sync {
+            guard let execution = activeExecution, executionID == nil || execution.id == executionID else { return nil }
+            if execution.openRouter != nil {
+                finishOpenRouterTurn(executionID: execution.id, outcome: .stopped)
+                return nil
+            }
+            guard let currentTurn = turnId else {
+                interruptPending = true
+                return nil
+            }
+            guard let currentThread = conversation.attachedThreadId else { return nil }
+            interruptPending = false
+            return Task { [rpc] in
+                _ = try? await rpc.request(method: "turn/interrupt", params: ["threadId": currentThread, "turnId": currentTurn], timeoutMs: 30_000)
             }
         }
     }
 
     public func interrupt() async {
-        enum Action {
-            case cancelTask(Task<Void, Never>)
-            case rpcInterrupt(threadId: String, turnId: String)
-            case none
-        }
-        let action: Action = sync {
-            if let activeOR = openRouterTask {
-                interruptPending = false
-                return .cancelTask(activeOR)
-            }
-            if turnStarting && turnId == nil {
-                interruptPending = true
-                return .none
-            }
-            guard let currentThread = conversation.attachedThreadId, let currentTurn = turnId else {
-                return .none
-            }
-            interruptPending = false
-            return .rpcInterrupt(threadId: currentThread, turnId: currentTurn)
-        }
-
-        switch action {
-        case .cancelTask(let task):
-            task.cancel()
-        case .rpcInterrupt(let currentThread, let currentTurn):
-            _ = try? await rpc.request(method: "turn/interrupt", params: ["threadId": currentThread, "turnId": currentTurn], timeoutMs: 30_000)
-        case .none:
-            break
-        }
+        await requestStop()?.value
     }
 
     public func close() async {
-        let (task, dir) = sync { () -> (Task<Void, Never>?, URL?) in
-            let t = openRouterTask
-            openRouterTask = nil
-            openRouterTurnToken = nil
-            let d = runtimeDir
+        let (task, dir) = sync {
+            let task = activeExecution?.openRouter?.task
+            if activeExecution?.openRouter != nil { activeExecution = nil }
+            let dir = runtimeDir
             runtimeDir = nil
-            return (t, d)
+            return (task, dir)
         }
 
         task?.cancel()
@@ -1156,8 +1196,11 @@ public final class ChatClient: @unchecked Sendable {
         let params = notification.params
 
         if method == "speedchat/blockedRequest" {
-            Task { await self.interrupt() }
-            onError?(NSError(domain: "SpeedChat.Client", code: 8, userInfo: [NSLocalizedDescriptionKey: "Blocked an unexpected client tool or local action request."]))
+            sync {
+                guard activeExecution?.openRouter == nil else { return }
+                requestStop()
+                onError?(NSError(domain: "SpeedChat.Client", code: 8, userInfo: [NSLocalizedDescriptionKey: "Blocked an unexpected client tool or local action request."]))
+            }
             return
         }
 

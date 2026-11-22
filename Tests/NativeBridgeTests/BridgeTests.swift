@@ -208,7 +208,8 @@ private func visibleDate(_ value:String)->String {
  store.draft="When does it open?"
  store.send()
  let prompt=try #require(store.session.messages.first)
- #expect(store.fixtureCommands.last == ["type":"send","text":prompt.text,"itemId":prompt.id])
+ let executionID=try #require(store.session.executionID)
+ #expect(store.fixtureCommands.last == ["type":"send","text":prompt.text,"itemId":prompt.id,"executionID":executionID.uuidString])
 
  store.session.receive(BridgeEvent(type:"error",message:"turn/start timed out.",
                                   codexRetry:CodexRetry(userMessageId:prompt.id,action:.checkDelivery)))

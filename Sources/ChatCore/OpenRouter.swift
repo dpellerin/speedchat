@@ -34,6 +34,7 @@ public struct OpenRouterStreamOptions: Sendable {
     public var onCitation: (@Sendable (CitationSource) -> Void)?
     public var onReasoning: (@Sendable (String) -> Void)?
     public var fetch: OpenRouterFetch?
+    var checkDispatch: (@Sendable () throws -> Void)?
 
     public init(
         key: String,
@@ -356,6 +357,8 @@ public enum OpenRouterClient {
         request.setValue("SpeedChat", forHTTPHeaderField: "X-Title")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
+        try Task.checkCancellation()
+        try options.checkDispatch?()
         let response = try await fetchFn(request)
         if !(200..<300).contains(response.statusCode) {
             throw extractError(status: response.statusCode, bodyText: response.errorBody)
