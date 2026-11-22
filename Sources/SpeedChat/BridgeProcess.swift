@@ -14,8 +14,8 @@ final class BridgeProcess: @unchecked Sendable {
     private var onEvent: (@Sendable (BridgeEvent) -> Void)?
     private var turnStartedAt: Date?
     private var firstTokenSeen = false
-    private var pendingDelta = ""
-    private var pendingItemId = ""
+    private var activeExecutionID: UUID?
+    private var pendingDelta: BridgeEvent?
     private var deltaTimer: DispatchWorkItem?
 
     func start(
@@ -31,29 +31,14 @@ final class BridgeProcess: @unchecked Sendable {
             let chatClient = ChatClient(rpc: rpc, options: options)
             self.client = chatClient
 
+            chatClient.onTurnEvent = { [weak self] event in
+                self?.enqueueReplyEvent(event)
+            }
             chatClient.onDelta = { [weak self] delta, itemId in
-                self?.queue.async { [weak self] in
-                    guard let self, !self.closing else { return }
-                    if !self.pendingItemId.isEmpty && self.pendingItemId != itemId {
-                        self.flushDelta()
-                    }
-                    self.pendingItemId = itemId
-                    self.pendingDelta += delta
-                    if self.deltaTimer == nil {
-                        let work = DispatchWorkItem { [weak self] in
-                            self?.flushDelta()
-                        }
-                        self.deltaTimer = work
-                        self.queue.asyncAfter(deadline: .now() + .milliseconds(16), execute: work)
-                    }
-                }
+                self?.enqueueReplyEvent(BridgeEvent(type: "delta", itemId: itemId, delta: delta))
             }
             chatClient.onMessage = { [weak self] itemId, text in
-                self?.queue.async { [weak self] in
-                    guard let self, !self.closing else { return }
-                    self.flushDelta()
-                    self.onEvent?(BridgeEvent(type: "message", itemId: itemId, text: text))
-                }
+                self?.enqueueReplyEvent(BridgeEvent(type: "message", itemId: itemId, text: text))
             }
             chatClient.onHistoryRecovered = { [weak self] messages in
                 self?.queue.async { [weak self] in
@@ -69,39 +54,21 @@ final class BridgeProcess: @unchecked Sendable {
                 }
             }
             chatClient.onDone = { [weak self, weak chatClient] in
-                let retry = chatClient?.codexRetry
-                self?.queue.async { [weak self] in
-                    guard let self, !self.closing else { return }
-                    self.flushDelta()
-                    self.emitMetric("response")
-                    self.onEvent?(BridgeEvent(type: "done", codexRetry: retry))
-                }
+                self?.enqueueReplyEvent(BridgeEvent(type: "done", codexRetry: chatClient?.codexRetry))
             }
             chatClient.onSearching = { [weak self] in
-                self?.queue.async { [weak self] in
-                    guard let self, !self.closing else { return }
-                    self.onEvent?(BridgeEvent(type: "searching"))
-                }
+                self?.enqueueReplyEvent(BridgeEvent(type: "searching"))
             }
             chatClient.onModel = { [weak self] activeModel in
-                self?.queue.async { [weak self] in
-                    guard let self, !self.closing else { return }
-                    self.onEvent?(BridgeEvent(type: "activeModel", model: activeModel))
-                }
+                self?.enqueueReplyEvent(BridgeEvent(type: "activeModel", model: activeModel))
             }
             chatClient.onError = { [weak self, weak chatClient] error in
-                let busy = chatClient?.busy
-                let retry = chatClient?.codexRetry
-                self?.queue.async { [weak self] in
-                    guard let self, !self.closing else { return }
-                    self.flushDelta()
-                    self.onEvent?(BridgeEvent(
-                        type: "error",
-                        message: StateStore.friendlyError(error),
-                        busy: busy,
-                        codexRetry: retry
-                    ))
-                }
+                self?.enqueueReplyEvent(BridgeEvent(
+                    type: "error",
+                    message: StateStore.friendlyError(error),
+                    busy: chatClient?.busy,
+                    codexRetry: chatClient?.codexRetry
+                ))
             }
             chatClient.onFatal = { [weak self] error in
                 self?.queue.async { [weak self] in
@@ -154,23 +121,60 @@ final class BridgeProcess: @unchecked Sendable {
         }
     }
 
-    private func emitMetric(_ name: String) {
+    private func enqueueReplyEvent(_ event: BridgeEvent) {
+        queue.async { [weak self] in
+            self?.receiveReplyEvent(event)
+        }
+    }
+
+    private func receiveReplyEvent(_ event: BridgeEvent) {
+        guard !closing, event.executionID == nil || event.executionID == activeExecutionID else { return }
+        if event.type == "delta" {
+            if let pending = pendingDelta,
+               pending.itemId != event.itemId || pending.executionID != event.executionID {
+                flushDelta()
+            }
+            if let pending = pendingDelta {
+                pendingDelta?.delta = (pending.delta ?? "") + (event.delta ?? "")
+            } else {
+                pendingDelta = event
+            }
+            if deltaTimer == nil {
+                let work = DispatchWorkItem { [weak self] in self?.flushDelta() }
+                deltaTimer = work
+                queue.asyncAfter(deadline: .now() + .milliseconds(16), execute: work)
+            }
+            return
+        }
+
+        if event.type == "message" || event.type == "error" || event.type == "done" {
+            flushDelta()
+        }
+        if event.type == "done" {
+            emitMetric("response", executionID: event.executionID)
+        }
+        if event.type == "done" || (event.type == "error" && event.busy != true) {
+            activeExecutionID = nil
+        }
+        onEvent?(event)
+    }
+
+    private func emitMetric(_ name: String, executionID: UUID? = nil) {
         guard let started = turnStartedAt else { return }
         let ms = max(0, round(Date().timeIntervalSince(started) * 1000))
-        onEvent?(BridgeEvent(type: "metric", name: name, durationMs: ms))
+        onEvent?(BridgeEvent(type: "metric", name: name, durationMs: ms, executionID: executionID))
     }
 
     private func flushDelta() {
         deltaTimer?.cancel()
         deltaTimer = nil
-        guard !pendingDelta.isEmpty else { return }
+        guard let pending = pendingDelta else { return }
+        pendingDelta = nil
         if !firstTokenSeen {
             firstTokenSeen = true
-            emitMetric("first-token")
+            emitMetric("first-token", executionID: pending.executionID)
         }
-        onEvent?(BridgeEvent(type: "delta", itemId: pendingItemId, delta: pendingDelta))
-        pendingDelta = ""
-        pendingItemId = ""
+        onEvent?(pending)
     }
 
     func send(_ command: [String: String]) {
@@ -182,21 +186,42 @@ final class BridgeProcess: @unchecked Sendable {
                 return
             }
             let type = command["type"] ?? ""
-            if type == "send" || type == "retryCodex" || type == "resendCodex" {
+            let requestedExecutionID = command["executionID"].flatMap(UUID.init(uuidString:))
+            if type == "send" {
                 let text = (command["text"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                guard type != "send" || !text.isEmpty else { return }
+                guard !text.isEmpty else { return }
+                let executionID = requestedExecutionID ?? UUID()
+                let userMessageId = command["itemId"] ?? UUID().uuidString.lowercased()
+                do {
+                    try chatClient.acceptSend(text, userMessageId: userMessageId, executionID: executionID)
+                } catch {
+                    onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error),
+                                         busy: chatClient.busy, codexRetry: chatClient.codexRetry,
+                                         executionID: requestedExecutionID))
+                    return
+                }
+                activeExecutionID = executionID
                 turnStartedAt = Date()
                 firstTokenSeen = false
                 Task { [weak self] in
                     do {
-                        if type == "send" {
-                            if let id = command["itemId"] {
-                                try await chatClient.send(text, userMessageId: id)
-                            } else {
-                                try await chatClient.send(text)
-                            }
-                        } else if let id = command["itemId"],
-                                  let checked = try await chatClient.retryCodexSend(userMessageId: id, resend: type == "resendCodex") {
+                        try await chatClient.startSend(executionID: executionID)
+                    } catch {
+                        self?.enqueueReplyEvent(BridgeEvent(
+                            type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy,
+                            codexRetry: chatClient.codexRetry, executionID: requestedExecutionID
+                        ))
+                    }
+                }
+                return
+            }
+            if type == "retryCodex" || type == "resendCodex" {
+                turnStartedAt = Date()
+                firstTokenSeen = false
+                Task { [weak self] in
+                    do {
+                        if let id = command["itemId"],
+                           let checked = try await chatClient.retryCodexSend(userMessageId: id, resend: type == "resendCodex") {
                             self?.queue.async { [weak self] in
                                 guard let self, !self.closing else { return }
                                 self.onEvent?(BridgeEvent(
@@ -209,10 +234,10 @@ final class BridgeProcess: @unchecked Sendable {
                             }
                         }
                     } catch {
-                        self?.queue.async { [weak self] in
-                            guard let self, !self.closing else { return }
-                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy, codexRetry: chatClient.codexRetry))
-                        }
+                        self?.enqueueReplyEvent(BridgeEvent(
+                            type: "error", message: StateStore.friendlyError(error),
+                            busy: chatClient.busy, codexRetry: chatClient.codexRetry
+                        ))
                     }
                 }
                 return
@@ -269,9 +294,7 @@ final class BridgeProcess: @unchecked Sendable {
                 return
             }
             if type == "interrupt" {
-                Task {
-                    await chatClient.interrupt()
-                }
+                chatClient.requestStop(executionID: requestedExecutionID ?? activeExecutionID)
                 return
             }
             if type == "close" {

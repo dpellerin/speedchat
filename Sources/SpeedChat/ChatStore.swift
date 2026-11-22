@@ -60,8 +60,9 @@ import ChatCore
  }
  func command(_ value:[String:String]) {if fixtureMode {fixtureCommands.append(value)} else {bridge?.send(value)}}
  func send() {
-  guard let text=session.beginSend(draft),let id=session.messages.last?.id else {return}
-  draft="";followBottom=true;command(["type":"send","text":text,"itemId":id])
+  guard let text=session.beginSend(draft),let id=session.messages.last?.id,
+        let executionID=session.executionID else {return}
+  draft="";followBottom=true;command(["type":"send","text":text,"itemId":id,"executionID":executionID.uuidString])
  }
  func newChat() {guard session.beginNewChat() else {return};followBottom=true;command(["type":"newChat"])}
  func selectModel(_ model:String) {guard session.beginModelChange(model) else {return};command(["type":"selectModel","model":model])}
@@ -69,7 +70,13 @@ import ChatCore
   if bridge != nil && session.phase != .offline {command(["type":"reloadConfig"])}
   else if !fixtureMode {connect()}
  }
- func interrupt() {guard session.streaming else {return};session.stopping();command(["type":"interrupt"])}
+ func interrupt() {
+  guard session.streaming else {return}
+  session.stopping()
+  var stop=["type":"interrupt"]
+  stop["executionID"]=session.executionID?.uuidString
+  command(stop)
+ }
  func retry() {
   if let id=session.beginCodexRetry(resend:false) {
    command(["type":"retryCodex","itemId":id])
