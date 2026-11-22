@@ -280,21 +280,27 @@ public final class ChatClient: @unchecked Sendable {
         }
 
         guard let state else { return try await newChat() }
-        if let (threadId, resumeModel) = resumeRequest,
-           let resumed = try? await resumeCodexThread(id: threadId, model: resumeModel, cwdPath: dir.path) {
-            sync {
-                guard codexAvailable else { return }
-                let importedLegacyHistory = conversation.didResume(
-                    threadId: threadId,
-                    name: resumed.name,
-                    codexMessages: StateStore.messagesFromTurns(resumed.turns)
-                )
-                if !isOpenRouterModel(model), let resumedModel = resumed.model, !resumedModel.isEmpty {
-                    model = resumedModel
+        if let (threadId, resumeModel) = resumeRequest {
+            do {
+                let resumed = try await resumeCodexThread(id: threadId, model: resumeModel, cwdPath: dir.path)
+                sync {
+                    guard codexAvailable else { return }
+                    let importedLegacyHistory = conversation.didResume(
+                        threadId: threadId,
+                        name: resumed.name,
+                        codexMessages: StateStore.messagesFromTurns(resumed.turns)
+                    )
+                    if !isOpenRouterModel(model), let resumedModel = resumed.model, !resumedModel.isEmpty {
+                        model = resumedModel
+                    }
+                    if importedLegacyHistory || state.model != model {
+                        saveCurrentState()
+                    }
                 }
-                if importedLegacyHistory || state.model != model {
-                    saveCurrentState()
-                }
+            } catch let error as CodexRPCError where error.confirmsMissingRollout(for: threadId) {
+                sync { conversation.didConfirmThreadLoss(threadId) }
+            } catch {
+                // Keep the saved conversation ready while thread availability is unknown.
             }
         }
         return sync { readyStateLocked() }
@@ -372,22 +378,35 @@ public final class ChatClient: @unchecked Sendable {
     }
 
     private func codexThreadForSend(currentThread: ConversationContinuity.Thread, model: String) async throws -> String {
+        let cwdPath = sync { runtimeDir?.path ?? "" }
         switch currentThread {
         case .attached(let id):
             return id
-        case .detached:
-            throw NSError(domain: "SpeedChat.Client", code: 3, userInfo: [NSLocalizedDescriptionKey: "The saved Codex thread is unavailable."])
-        case .standalone:
-            let cwdPath = sync { runtimeDir?.path ?? "" }
-            let startedId = try await startCodexThread(model: model, cwdPath: cwdPath)
-            return sync {
-                conversation.thread = .attached(startedId)
-                // This is a fresh Codex thread; all visible history must be sent.
-                conversation.codexSyncedCount = 0
-                conversation.titleNeeded = true
-                saveCurrentState()
-                return startedId
+        case .detached(let id):
+            do {
+                let resumed = try await resumeCodexThread(id: id, model: model, cwdPath: cwdPath)
+                return sync {
+                    if conversation.didResume(
+                        threadId: id,
+                        name: resumed.name,
+                        codexMessages: StateStore.messagesFromTurns(resumed.turns)
+                    ) {
+                        saveCurrentState()
+                    }
+                    return id
+                }
+            } catch let error as CodexRPCError where error.confirmsMissingRollout(for: id) {
+                sync { conversation.didConfirmThreadLoss(id) }
             }
+        case .standalone, .missing:
+            break
+        }
+
+        let startedId = try await startCodexThread(model: model, cwdPath: cwdPath)
+        return sync {
+            conversation.didStartCodexThread(startedId)
+            saveCurrentState()
+            return startedId
         }
     }
 

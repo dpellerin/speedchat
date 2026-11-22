@@ -18,6 +18,25 @@ public struct CodexNotification: @unchecked Sendable {
     }
 }
 
+public struct CodexRPCError: LocalizedError, @unchecked Sendable {
+    public let code: Int
+    public let message: String
+    public let data: Any?
+
+    public init(code: Int, message: String, data: Any? = nil) {
+        self.code = code
+        self.message = message
+        self.data = data
+    }
+
+    public var errorDescription: String? { "\(message) (\(code))" }
+
+    // Match the by-ID thread/resume response for a missing stored rollout.
+    func confirmsMissingRollout(for threadId: String) -> Bool {
+        code == -32600 && message == "no rollout found for thread id \(threadId)"
+    }
+}
+
 public protocol CodexTransport: AnyObject, Sendable {
     var onNotification: (@Sendable (CodexNotification) -> Void)? { get set }
     var onExit: (@Sendable () -> Void)? { get set }
@@ -304,10 +323,15 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         }
         if let id = message["id"] as? Int, let entry = pending.removeValue(forKey: id) {
             entry.timer.cancel()
-            if let errorDict = message["error"] as? [String: Any] {
-                let errMsg = (errorDict["message"] as? String) ?? "RPC error"
-                let code = (errorDict["code"] as? Int) ?? -1
-                entry.reject(NSError(domain: "SpeedChat.Codex", code: code, userInfo: [NSLocalizedDescriptionKey: "\(errMsg) (\(code))"]))
+            if let error = message["error"] {
+                guard message["result"] == nil,
+                      let error = error as? [String: Any],
+                      let code = error["code"] as? Int,
+                      let rawMessage = error["message"] as? String else {
+                    entry.reject(NSError(domain: "SpeedChat.Codex", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid Codex RPC error response."]))
+                    return
+                }
+                entry.reject(CodexRPCError(code: code, message: rawMessage, data: error["data"]))
             } else {
                 let result = (message["result"] as? [String: Any]) ?? [:]
                 entry.resolve(CodexPayload(result))

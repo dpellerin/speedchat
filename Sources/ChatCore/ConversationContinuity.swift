@@ -5,11 +5,12 @@ struct ConversationContinuity {
     enum Thread {
         case standalone(String)
         case detached(String)
+        case missing(String)
         case attached(String)
 
         var id: String {
             switch self {
-            case .standalone(let id), .detached(let id), .attached(let id):
+            case .standalone(let id), .detached(let id), .missing(let id), .attached(let id):
                 return id
             }
         }
@@ -47,6 +48,19 @@ struct ConversationContinuity {
         messages = codexMessages
         codexSyncedCount = codexMessages.count
         return true
+    }
+
+    mutating func didConfirmThreadLoss(_ id: String) {
+        if case .detached(id) = thread {
+            thread = .missing(id)
+        }
+    }
+
+    mutating func didStartCodexThread(_ id: String) {
+        thread = .attached(id)
+        codexSyncedCount = 0
+        titleNeeded = true
+        needsLegacyHistory = false
     }
 
     func save(model: String, to url: URL?, env: [String: String]) throws {
