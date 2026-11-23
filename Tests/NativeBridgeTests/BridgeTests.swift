@@ -208,25 +208,38 @@ private func visibleDate(_ value:String)->String {
  store.draft="When does it open?"
  store.send()
  let prompt=try #require(store.session.messages.first)
- #expect(store.fixtureCommands.last == ["type":"send","text":prompt.text,"itemId":prompt.id])
+ let executionID=try #require(store.session.executionID)
+ #expect(store.fixtureCommands.last == ["type":"send","text":prompt.text,"itemId":prompt.id,"executionID":executionID.uuidString])
 
  store.session.receive(BridgeEvent(type:"error",message:"turn/start timed out.",
                                   codexRetry:CodexRetry(userMessageId:prompt.id,action:.checkDelivery)))
  #expect(store.session.notice.contains("may already have received"))
  store.retry()
- #expect(store.fixtureCommands.last == ["type":"retryCodex","itemId":prompt.id])
+ let retryID=try #require(store.session.executionID)
+ #expect(retryID != executionID)
+ #expect(store.fixtureCommands.last == ["type":"retryCodex","itemId":prompt.id,"executionID":retryID.uuidString])
  #expect(store.session.messages == [prompt])
 
  store.session.receive(BridgeEvent(type:"conversationUpdated",messages:[prompt],
-                                  codexRetry:CodexRetry(userMessageId:prompt.id,action:.resend)))
+                                  codexRetry:CodexRetry(userMessageId:prompt.id,action:.resend),
+                                  executionID:retryID))
  #expect(store.session.notice.contains("could duplicate"))
  store.resend()
- #expect(store.fixtureCommands.last == ["type":"resendCodex","itemId":prompt.id])
+ let resendID=try #require(store.session.executionID)
+ #expect(resendID != executionID && resendID != retryID)
+ #expect(store.fixtureCommands.last == ["type":"resendCodex","itemId":prompt.id,"executionID":resendID.uuidString])
+ store.session.receive(BridgeEvent(type:"delta",itemId:"late-reply",delta:"Late reply",executionID:executionID))
+ store.session.receive(BridgeEvent(type:"conversationUpdated",messages:[],executionID:retryID))
+ store.session.receive(BridgeEvent(type:"done",executionID:executionID))
  #expect(store.session.messages == [prompt])
+ #expect(store.session.streaming)
+ store.interrupt()
+ #expect(store.fixtureCommands.last == ["type":"interrupt","executionID":resendID.uuidString])
 
- store.session.receive(BridgeEvent(type:"error",message:"Codex reply failed after receipt."))
+ store.session.receive(BridgeEvent(type:"error",message:"Codex reply failed after receipt.",executionID:resendID))
+ let commands=store.fixtureCommands
  store.retry()
- #expect(store.fixtureCommands.last?["type"] == "resendCodex")
+ #expect(store.fixtureCommands == commands)
 
  store.session.receive(BridgeEvent(type:"ready",model:"example/router"))
  store.draft="A router prompt"
@@ -306,7 +319,8 @@ private func visibleDate(_ value:String)->String {
             let text = try #require(draft)
             let prompt = try #require(session.messages.last)
             optimistic = prompt
-            bridge.send(["type": "send", "text": text, "itemId": prompt.id])
+            let executionID = try #require(session.executionID)
+            bridge.send(["type": "send", "text": text, "itemId": prompt.id, "executionID": executionID.uuidString])
         }
         if event.type == "historyRecovered" {
             #expect(session.streaming)
@@ -350,4 +364,44 @@ private func visibleDate(_ value:String)->String {
     #expect(initial?.type == "offlineConversation")
     #expect(initial?.messages == [saved])
     #expect(initial?.models == [])
+}
+
+func writeBridgeCodexFixture(in root: URL) throws -> String {
+    let executable = root.appendingPathComponent("fake-codex")
+    let script = """
+    #!/usr/bin/env python3
+    import json, sys
+    for raw in sys.stdin:
+        message = json.loads(raw)
+        if "id" not in message:
+            continue
+        method, result = message["method"], {}
+        if method == "model/list":
+            result = {"data": [{"model": "gpt-6-luna", "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}
+        elif method == "thread/resume":
+            result = {"thread": {"id": message["params"]["threadId"], "name": "Conversation", "turns": []}}
+        print(json.dumps({"id": message["id"], "result": result}), flush=True)
+    """
+    try script.write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+    return executable.path
+}
+
+@Test func retiringCodexWhileItChecksOwnershipRejectsTheUnsentRequest() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("rpc-retire-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let rpc = JsonRpcProcess(codexOverride: try writeBridgeCodexFixture(in: root), env: [:])
+    try await rpc.start(cwd: root)
+
+    do {
+        _ = try await rpc.request(method: "turn/start", params: [:], timeoutMs: 200, whileCurrent: {
+            rpc.retire()
+            return true
+        })
+        Issue.record("Retirement should reject the request without sending it.")
+    } catch {
+        #expect(error.localizedDescription == "Codex app-server is not running.")
+    }
+    await rpc.stop()
 }

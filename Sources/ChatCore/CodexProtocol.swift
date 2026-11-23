@@ -54,7 +54,23 @@ public protocol CodexTransport: AnyObject, Sendable {
     var onExit: (@Sendable () -> Void)? { get set }
     func start(cwd: URL?) async throws
     func request(method: String, params: [String: Any], timeoutMs: Int) async throws -> [String: Any]
+    func request(
+        method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
+    ) async throws -> [String: Any]
     func stop() async
+    /// Reject new dispatch from the outgoing backend before asynchronous cleanup.
+    func retire()
+}
+
+public extension CodexTransport {
+    func retire() {}
+
+    func request(
+        method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
+    ) async throws -> [String: Any] {
+        guard whileCurrent() else { throw CodexRequestNotSent() }
+        return try await request(method: method, params: params, timeoutMs: timeoutMs)
+    }
 }
 
 public enum CodexProtocol {
@@ -109,6 +125,8 @@ public enum CodexProtocol {
 
 public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
     private let queue = DispatchQueue(label: "SpeedChat.codex-rpc", qos: .userInitiated)
+    private let retirementLock = NSLock()
+    private var retired = false
     private var child: Process?
     private var input: FileHandle?
     private var framer = JSONLFramer()
@@ -132,9 +150,17 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         self.envOverride = env
     }
 
+    public func retire() {
+        retirementLock.withLock { retired = true }
+    }
+
     public func start(cwd: URL? = nil) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in
+                guard !retirementLock.withLock({ retired }) else {
+                    continuation.resume(throwing: CodexRequestNotSent())
+                    return
+                }
                 if self.child != nil {
                     continuation.resume()
                     return
@@ -220,7 +246,10 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
                         }
                     }
 
-                    try proc.run()
+                    try retirementLock.withLock {
+                        guard !retired else { throw CodexRequestNotSent() }
+                        try proc.run()
+                    }
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
@@ -240,15 +269,30 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
     }
 
     public func request(method: String, params: [String: Any], timeoutMs: Int = 30_000) async throws -> [String: Any] {
+        try await request(method: method, params: params, timeoutMs: timeoutMs, whileCurrent: { true })
+    }
+
+    public func request(
+        method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
+    ) async throws -> [String: Any] {
         let boxed = CodexPayload(params)
         let response: CodexPayload = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CodexPayload, Error>) in
             queue.async { [self] in
-                guard self.child != nil, self.input != nil else {
+                // Ownership may take the ChatClient lock. Evaluate it before
+                // entering the retirement gate to preserve the lock order.
+                guard self.child != nil, self.input != nil, whileCurrent() else {
                     continuation.resume(throwing: CodexRequestNotSent())
                     return
                 }
                 let id = self.nextId
                 self.nextId += 1
+                do {
+                    try self.write(["id": id, "method": method, "params": boxed.value])
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                // Replies are handled on this same queue, after registration.
                 let timer = DispatchWorkItem { [weak self] in
                     guard let self, let pending = self.pending.removeValue(forKey: id) else { return }
                     pending.reject(NSError(domain: "SpeedChat.Codex", code: -2, userInfo: [NSLocalizedDescriptionKey: "\(method) timed out."]))
@@ -259,7 +303,6 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
                     timer: timer
                 )
                 self.queue.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timer)
-                self.write(["id": id, "method": method, "params": boxed.value])
             }
         }
         return response.value
@@ -268,7 +311,7 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
     public func notify(method: String, params: [String: Any]) {
         let boxed = CodexPayload(params)
         queue.async { [self] in
-            self.write(["method": method, "params": boxed.value])
+            try? self.write(["method": method, "params": boxed.value])
         }
     }
 
@@ -299,11 +342,16 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
         }
     }
 
-    private func write(_ object: [String: Any]) {
-        guard let input,
-              var data = try? JSONSerialization.data(withJSONObject: object) else { return }
+    private func write(_ object: [String: Any]) throws {
+        guard let input, JSONSerialization.isValidJSONObject(object),
+              var data = try? JSONSerialization.data(withJSONObject: object) else {
+            throw CodexRequestNotSent()
+        }
         data.append(10)
-        try? input.write(contentsOf: data)
+        try retirementLock.withLock {
+            guard !retired else { throw CodexRequestNotSent() }
+            try input.write(contentsOf: data)
+        }
     }
 
     private func handleStdout(_ data: Data, handle: FileHandle) {
@@ -323,14 +371,18 @@ public final class JsonRpcProcess: CodexTransport, @unchecked Sendable {
             return
         }
         if let method = message["method"] as? String, let reqId = message["id"] {
-            write([
+            try? write([
                 "id": reqId,
                 "error": [
                     "code": -32601,
                     "message": "SpeedChat does not permit client tools or local actions.",
                 ],
             ])
-            onNotification?(CodexNotification(method: "speedchat/blockedRequest", params: ["method": method]))
+            let requestParams = message["params"] as? [String: Any]
+            var blocked = ["method": method]
+            blocked["threadId"] = requestParams?["threadId"] as? String
+            blocked["turnId"] = requestParams?["turnId"] as? String
+            onNotification?(CodexNotification(method: "speedchat/blockedRequest", params: blocked))
             return
         }
         if let id = message["id"] as? Int, let entry = pending.removeValue(forKey: id) {

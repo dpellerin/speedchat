@@ -6,7 +6,8 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
     private let lock = NSLock()
     var onNotification: (@Sendable (CodexNotification) -> Void)?
     var onExit: (@Sendable () -> Void)?
-    var calls = [(method: String, params: [String: Any])]()
+    private var recordedCalls = [(method: String, params: [String: Any])]()
+    var calls: [(method: String, params: [String: Any])] { sync { recordedCalls } }
     var failStart = false
     var failThreadStart = false
     var missingThreadId = false
@@ -15,6 +16,9 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
     var beforeThreadRead: (() -> Void)?
     var readResult: Result<CodexPayload, Error> = .success(CodexPayload())
     var turnStartError: Error?
+    var beforeTurnStartDispatch: (() -> Void)?
+    var turnInterruptError: Error?
+    var beforeTurnInterrupt: (() -> Void)?
     var holdTurnStart = false
     var holdSettings = false
     var holdFirstRename = false
@@ -73,9 +77,17 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
         cont?.resume(returning: CodexPayload([:]))
     }
 
+    func request(
+        method: String, params: [String: Any], timeoutMs: Int, whileCurrent: @escaping @Sendable () -> Bool
+    ) async throws -> [String: Any] {
+        if method == "turn/start" { beforeTurnStartDispatch?() }
+        guard whileCurrent() else { throw CodexRequestNotSent() }
+        return try await request(method: method, params: params, timeoutMs: timeoutMs)
+    }
+
     func request(method: String, params: [String: Any], timeoutMs: Int) async throws -> [String: Any] {
         let (shouldHoldTurn, shouldHoldSettings, shouldHoldRename) = sync { () -> (Bool, Bool, Bool) in
-            calls.append((method: method, params: params))
+            recordedCalls.append((method: method, params: params))
             let holdT = (method == "turn/start" && holdTurnStart)
             let holdS = (method == "thread/settings/update" && holdSettings)
             let nameParam = (params["name"] as? String) ?? ""
@@ -133,6 +145,10 @@ final class FakeCodexTransport: CodexTransport, @unchecked Sendable {
             }
             let id = count == 0 ? "dedicated" : "thread-\(count)"
             return ["thread": ["id": id], "model": threadStartModel]
+        }
+        if method == "turn/interrupt" {
+            beforeTurnInterrupt?()
+            if let turnInterruptError { throw turnInterruptError }
         }
         if method == "turn/start" {
             if let turnStartError { throw turnStartError }

@@ -73,8 +73,10 @@ struct CodexHistory: Sendable {
                 case "agentMessage":
                     guard let id = item["id"] as? String, !id.isEmpty,
                           item["phase"] as? String != "commentary",
-                          let text = item["text"] as? String, !text.isEmpty else { return nil }
-                    return .assistant(ChatMessage(id: id, role: "assistant", text: RenderNormalizer.normalizeAssistantText(text, sources: sources)))
+                          let text = item["text"] as? String else { return nil }
+                    let normalized = RenderNormalizer.normalizeAssistantText(text, sources: sources)
+                    guard !normalized.isEmpty else { return nil }
+                    return .assistant(ChatMessage(id: id, role: "assistant", text: normalized))
                 default:
                     return nil
                 }

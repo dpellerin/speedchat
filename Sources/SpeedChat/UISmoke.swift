@@ -151,11 +151,15 @@ extension AppDelegate {
     self.store.session.receive(BridgeEvent(type:"ready",messages:[pending],models:ready.models,model:"gpt-6-luna",
                                           codexRetry:CodexRetry(userMessageId:pending.id,action:.checkDelivery)))
     self.store.retry()
+    let retryExecutionID=self.store.session.executionID
+    let retryCommand=self.store.fixtureCommands.last
     check("Retry checks delivery of the original prompt",
-          self.store.fixtureCommands.last == ["type":"retryCodex","itemId":pending.id] &&
+          retryExecutionID != nil && retryCommand?["type"] == "retryCodex" &&
+          retryCommand?["itemId"] == pending.id && retryCommand?["executionID"] == retryExecutionID?.uuidString &&
           self.store.session.messages == [pending])
     self.store.session.receive(BridgeEvent(type:"conversationUpdated",messages:[pending],
-                                          codexRetry:CodexRetry(userMessageId:pending.id,action:.resend)))
+                                          codexRetry:CodexRetry(userMessageId:pending.id,action:.resend),
+                                          executionID:retryExecutionID))
     let warning="Codex may already have received this message. Sending it again could duplicate it."
     for _ in 0..<30 {
      if self.store.fixtureStatusNotice == warning {break}
@@ -165,10 +169,14 @@ extension AppDelegate {
     check("Panel displays the uncertainty warning before resend",
           self.panel.isVisible && self.store.fixtureStatusNotice == warning)
     self.store.resend()
+    let resendExecutionID=self.store.session.executionID
+    let resendCommand=self.store.fixtureCommands.last
     check("Explicit resend dispatches the original prompt and preserves one row",
-          self.store.fixtureCommands.last == ["type":"resendCodex","itemId":pending.id] &&
+          resendExecutionID != nil && resendExecutionID != retryExecutionID &&
+          resendCommand?["type"] == "resendCodex" && resendCommand?["itemId"] == pending.id &&
+          resendCommand?["executionID"] == resendExecutionID?.uuidString &&
           self.store.session.messages == [pending])
-    self.store.session.receive(BridgeEvent(type:"done"))
+    self.store.session.receive(BridgeEvent(type:"done",executionID:resendExecutionID))
 
     let later=ChatMessage(id:"later-prompt",role:"user",text:"Are the trails open?")
     self.store.session.receive(BridgeEvent(type:"ready",messages:[pending,later],models:ready.models,model:"gpt-6-luna",
