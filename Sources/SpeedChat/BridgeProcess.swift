@@ -258,12 +258,14 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                 return
             }
             if type == "listHistory" {
-                let entries = chatClient.listHistory()
-                onEvent?(BridgeEvent(type: "history", history: entries))
+                let query = command["query"] ?? ""
+                let entries = chatClient.listHistory(query: query)
+                onEvent?(BridgeEvent(type: "history", history: entries, query: query))
                 return
             }
             if type == "openConversation" {
                 guard let id = command["conversationId"], !id.isEmpty else { return }
+                let scrollToMessageId = command["scrollToMessageId"].flatMap { $0.isEmpty ? nil : $0 }
                 do {
                     let ready = try chatClient.openConversation(id: id)
                     let offlineReason = ready.offlineReason
@@ -275,7 +277,8 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                         model: ready.model,
                         notice: offlineReason.map { "Offline · \($0)" } ?? "Ready",
                         stateSaveError: ready.stateSaveError,
-                        codexRetry: ready.codexRetry
+                        codexRetry: ready.codexRetry,
+                        scrollToMessageId: scrollToMessageId
                     ))
                 } catch {
                     onEvent?(BridgeEvent(

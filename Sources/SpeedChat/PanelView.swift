@@ -183,6 +183,8 @@ struct PanelView:View {
    header
    Divider()
    if store.showingHistory {
+    historySearchBar
+    Divider()
     historyList
     Divider()
     historyFooter
@@ -245,15 +247,55 @@ struct PanelView:View {
    }
   }.padding(.horizontal,18).padding(.vertical,8)
  }
+ private var historySearchBar:some View {
+  HStack(spacing:8) {
+   Image(systemName:"magnifyingglass")
+    .font(.system(size:13))
+    .foregroundStyle(.secondary)
+   HistorySearchField(
+    text:Binding(
+     get:{store.historyQuery},
+     set:{store.updateHistoryQuery($0)}
+    ),
+    focusToken:store.historyFocusToken,
+    onClear:{store.clearHistoryQuery()},
+    onEscape:{store.closeHistory()},
+    onMoveUp:{store.moveHistorySelection(-1)},
+    onMoveDown:{store.moveHistorySelection(1)},
+    onSubmit:{store.openSelectedHistoryConversation()}
+   )
+   .frame(height:22)
+  }
+  .padding(.horizontal,12)
+  .padding(.vertical,8)
+  .background {
+   RoundedRectangle(cornerRadius:10)
+    .fill(Color(nsColor:.textBackgroundColor).opacity(0.75))
+  }
+  .overlay {
+   RoundedRectangle(cornerRadius:10)
+    .stroke(Color.secondary.opacity(0.2),lineWidth:1)
+  }
+  .padding(.horizontal,14)
+  .padding(.vertical,10)
+ }
  private var historyList:some View {
   Group {
    if store.historyEntries.isEmpty {
     VStack(spacing:12) {
-     Image(systemName:"clock.arrow.circlepath").font(.system(size:30)).foregroundStyle(.secondary)
-     Text("No saved conversations yet").font(.title3.weight(.medium))
-      .accessibilityLabel("No saved conversations yet")
-      .accessibilityIdentifier("speedchat-history-empty")
-     Text("Conversations with at least one message appear here.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+     if store.hasActiveHistoryQuery {
+      Image(systemName:"magnifyingglass").font(.system(size:30)).foregroundStyle(.secondary)
+      Text("No matching conversations").font(.title3.weight(.medium)).textSelection(.enabled)
+       .accessibilityLabel("No matching conversations")
+       .accessibilityIdentifier("speedchat-history-no-matches")
+      Text("Try different words or clear the search.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+     } else {
+      Image(systemName:"clock.arrow.circlepath").font(.system(size:30)).foregroundStyle(.secondary)
+      Text("No saved conversations yet").font(.title3.weight(.medium))
+       .accessibilityLabel("No saved conversations yet")
+       .accessibilityIdentifier("speedchat-history-empty")
+      Text("Conversations with at least one message appear here.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+     }
     }.frame(maxWidth:.infinity,maxHeight:.infinity).padding(24)
    } else {
     ScrollViewReader {proxy in
@@ -264,7 +306,12 @@ struct PanelView:View {
          entry:entry,
          isCurrent:entry.id == store.session.conversationId,
          isSelected:index == store.selectedHistoryIndex,
-         open:{store.openHistoryConversation(id:entry.id)}
+         open:{
+          store.openHistoryConversation(
+           id:entry.id,
+           scrollToMessageId:store.hasActiveHistoryQuery ? entry.firstMatchingMessageId : nil
+          )
+         }
         ).id(entry.id)
        }
       }.padding(14)
@@ -292,8 +339,8 @@ struct PanelView:View {
      LazyVStack(alignment:.leading,spacing:18) {
       if store.session.messages.isEmpty {emptyState}
       ForEach(store.session.messages) {message in MessageView(message:message).id(message.id)}
-      Color.clear.frame(height:1).id("bottom").background(ScrollProbe(controller:scroll))
-     }.padding(20)
+      Color.clear.frame(height:1).id("bottom")
+     }.padding(20).background(ScrollProbe(controller:scroll))
     }.onChange(of:store.session.messages) {old,messages in
      guard let last=messages.last else {return}
      if old.last?.id != last.id {
@@ -304,14 +351,29 @@ struct PanelView:View {
      proxy.scrollTo(last.id,anchor:.top)
     }
     .task(id:store.session.transcriptID) {
-     scroll.userScrolled=false
-     store.followBottom=true
-     guard !store.session.messages.isEmpty else {return}
-     proxy.scrollTo("bottom",anchor:.bottom)
-     await Task.yield()
-     proxy.scrollTo("bottom",anchor:.bottom)
+     guard !store.session.messages.isEmpty else {
+      scroll.userScrolled=false
+      store.followBottom=true
+      return
+     }
+     if let targetId=store.session.scrollTargetMessageId,
+        store.session.messages.contains(where:{$0.id == targetId}) {
+      scroll.userScrolled=true
+      proxy.scrollTo(targetId,anchor:.center)
+      await Task.yield()
+      proxy.scrollTo(targetId,anchor:.center)
+      try? await Task.sleep(for:.milliseconds(30))
+      proxy.scrollTo(targetId,anchor:.center)
+      scroll.syncFollowBottom()
+     } else {
+      scroll.userScrolled=false
+      store.followBottom=true
+      proxy.scrollTo("bottom",anchor:.bottom)
+      await Task.yield()
+      proxy.scrollTo("bottom",anchor:.bottom)
+     }
     }
-    if !store.followBottom {Button {scroll.userScrolled=false;store.followBottom=true;proxy.scrollTo("bottom",anchor:.bottom)} label:{Label("Latest",systemImage:"arrow.down")}.buttonStyle(.borderedProminent).padding(14)}
+    if !store.followBottom {Button {scroll.userScrolled=false;store.followBottom=true;proxy.scrollTo("bottom",anchor:.bottom)} label:{Label("Latest",systemImage:"arrow.down")}.buttonStyle(.borderedProminent).padding(14).accessibilityIdentifier("speedchat-latest-button")}
    }
   }.id(store.session.transcriptID)
  }
@@ -404,7 +466,10 @@ private struct HistoryRowView:View {
   Button(action:open) {
    VStack(alignment:.leading,spacing:4) {
     HStack(spacing:8) {
-     Text(entry.title).font(.system(size:14,weight:.semibold)).foregroundStyle(.primary).lineLimit(1)
+     Text(Self.highlighted(entry.title,ranges:entry.titleMatchRanges,fontSize:14,highlightWeight:.bold))
+      .font(.system(size:14,weight:.semibold))
+      .foregroundStyle(.primary)
+      .lineLimit(1)
      if isCurrent {
       Text("Current")
        .font(.caption2.weight(.medium))
@@ -420,7 +485,7 @@ private struct HistoryRowView:View {
       .lineLimit(1)
     }
     if !entry.preview.isEmpty {
-     Text(entry.preview)
+     Text(Self.highlighted(entry.preview,ranges:entry.previewMatchRanges,fontSize:13,highlightWeight:.semibold))
       .font(.system(size:13))
       .foregroundStyle(.secondary)
       .lineLimit(2)
@@ -443,5 +508,27 @@ private struct HistoryRowView:View {
   .buttonStyle(.plain)
   .onHover {hovered=$0}
   .accessibilityIdentifier("history-row-\(entry.id)")
+ }
+
+ private static func highlighted(
+  _ text:String,
+  ranges:[HistoryMatchRange],
+  fontSize:CGFloat,
+  highlightWeight:Font.Weight
+ ) -> AttributedString {
+  var attributed=AttributedString(text)
+  guard !ranges.isEmpty else {return attributed}
+  let totalCount=text.count
+  for range in ranges {
+   guard range.start >= 0,range.end > range.start,range.end <= totalCount else {continue}
+   let lower=text.index(text.startIndex,offsetBy:range.start)
+   let upper=text.index(text.startIndex,offsetBy:range.end)
+   guard let attrLower=AttributedString.Index(lower,within:attributed),
+         let attrUpper=AttributedString.Index(upper,within:attributed) else {continue}
+   attributed[attrLower..<attrUpper].foregroundColor = .primary
+   attributed[attrLower..<attrUpper].backgroundColor = Color.accentColor.opacity(0.22)
+   attributed[attrLower..<attrUpper].font = .system(size:fontSize,weight:highlightWeight)
+  }
+  return attributed
  }
 }

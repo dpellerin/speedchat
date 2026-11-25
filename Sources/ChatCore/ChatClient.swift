@@ -197,8 +197,8 @@ public final class ChatClient: @unchecked Sendable {
         sync { StateStore.loadConversations(stateURL: options.stateURL, env: options.env) }
     }
 
-    public func listHistory() -> [HistoryEntry] {
-        ConversationHistory.entries(from: savedConversations())
+    public func listHistory(query: String = "") -> [HistoryEntry] {
+        ConversationHistory.search(savedConversations(), query: query)
     }
 
     public func openConversation(id: String) throws -> ReadyState {

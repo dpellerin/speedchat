@@ -34,6 +34,8 @@ public struct BridgeEvent: Codable, Sendable {
     public var codexRetry: CodexRetry?
     public var executionID: UUID?
     public var history: [HistoryEntry]?
+    public var query: String?
+    public var scrollToMessageId: String?
     public init(
         type: String,
         conversationId: String? = nil,
@@ -51,7 +53,9 @@ public struct BridgeEvent: Codable, Sendable {
         stateSaveError: String? = nil,
         codexRetry: CodexRetry? = nil,
         executionID: UUID? = nil,
-        history: [HistoryEntry]? = nil
+        history: [HistoryEntry]? = nil,
+        query: String? = nil,
+        scrollToMessageId: String? = nil
     ) {
         self.type = type
         self.conversationId = conversationId
@@ -70,6 +74,8 @@ public struct BridgeEvent: Codable, Sendable {
         self.codexRetry = codexRetry
         self.executionID = executionID
         self.history = history
+        self.query = query
+        self.scrollToMessageId = scrollToMessageId
     }
 }
 public struct ChatSession: Sendable {
@@ -78,6 +84,7 @@ public struct ChatSession: Sendable {
  public private(set) var conversationId: String?
  public private(set) var messages=[ChatMessage]()
  public private(set) var transcriptID=UUID()
+ public private(set) var scrollTargetMessageId: String?
  public private(set) var models=[ChatModel]()
  public private(set) var selectedModel=""
  public private(set) var activeModel=""
@@ -111,6 +118,7 @@ public struct ChatSession: Sendable {
   guard canSend, !text.isEmpty else {return nil}
   let id=UUID().uuidString.lowercased()
   executionID=UUID()
+  scrollTargetMessageId=nil
   phase = .sending;notice="Thinking…";lastRequest=text;failed=false;failureDetails=nil;activeModel=selectedModel
   lastRequestWasOpenRouter=selectedOpenRouter
   activeCodexPromptId=selectedOpenRouter ? nil : id
@@ -130,7 +138,7 @@ public struct ChatSession: Sendable {
   executionID=UUID()
   return retry.userMessageId
  }
- public mutating func beginNewChat() -> Bool {guard canInteract else {return false};phase = .resetting;notice="Starting a new chat…";return true}
+ public mutating func beginNewChat() -> Bool {guard canInteract else {return false};scrollTargetMessageId=nil;phase = .resetting;notice="Starting a new chat…";return true}
  public mutating func beginModelChange(_ model:String) -> Bool {
   guard canInteract, models.contains(where:{$0.model == model}) else {return false}
   phase = .selecting;notice="Changing model…";return true
@@ -141,7 +149,7 @@ public struct ChatSession: Sendable {
   guard event.executionID == nil || event.executionID == executionID else {return}
   switch event.type {
   case "ready","offlineConversation":
-   transcriptID=UUID();conversationId=event.conversationId;messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel
+   transcriptID=UUID();scrollTargetMessageId=event.scrollToMessageId;conversationId=event.conversationId;messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel
    let isOffline=event.type == "offlineConversation"
    phase = isOffline ? .offline : .ready
    notice=(isOffline ? event.notice : (event.stateSaveError ?? event.notice)) ?? "Ready"
