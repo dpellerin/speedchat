@@ -221,8 +221,6 @@ struct PanelView:View {
   let openRouterModels=store.session.models.filter{$0.isOpenRouter}
   return HStack(spacing:12) {
    if store.showingHistory {
-    // Clear the macOS window traffic lights in fullSizeContentView titlebars.
-    Spacer().frame(width:60)
     Button {store.closeHistory()} label:{Label("Back",systemImage:"chevron.left").font(.callout)}
      .buttonStyle(.borderless)
      .help("Return to current conversation (Esc)")
@@ -234,13 +232,13 @@ struct PanelView:View {
      .help("Start a new conversation (⌘N)")
      .accessibilityIdentifier("speedchat-history-new-chat")
    } else {
-    DragHeader().frame(height:24).frame(minWidth:50,maxWidth:.infinity)
     Button {store.openHistory()} label:{Label("History",systemImage:"clock.arrow.circlepath").font(.callout)}
      .buttonStyle(.borderless)
      .disabled(!store.session.canOpenHistory)
      .help("Conversation History (⌘K)")
      .accessibilityLabel("Conversation History")
      .accessibilityIdentifier("speedchat-history-button")
+    DragHeader().frame(height:24).frame(minWidth:50,maxWidth:.infinity)
     Menu {
      if !openAiModels.isEmpty {
       Section("OpenAI") {
