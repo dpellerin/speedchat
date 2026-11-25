@@ -21,7 +21,7 @@ Zero external dependencies, zero external Swift packages, and no Electron/WebVie
   - Hosted live web search on OpenAI models and on-demand OpenRouter web search (`plugins: [{ id: "web" }]`) triggered only when current information is needed, with inline Markdown source citations.
 - **Native macOS Experience**
   - Compact, draggable, resizable `NSPanel` with semantic light/dark appearance (clean white chat surface in light mode, native contrast in dark mode).
-  - Stays on one macOS Space at a time, pulls onto the current Space (including over fullscreen apps) when summoned, participates in Mission Control, and stays open when it loses focus. Press the global shortcut again when focused—or use Escape / Command-W—to hide it while keeping your draft, conversation, and warm backend ready.
+  - Stays on one macOS Space at a time, pulls onto the current Space and active display (including over fullscreen apps) when summoned, restores focus when you return to its Space if it was active before you left, participates in Mission Control, and stays open when it loses focus. Press the global shortcut again when focused—or use Escape / Command-W—to hide it while keeping your draft, conversation, and warm backend ready.
   - Native selectable prose, code blocks with one-click copy, and readable Unicode math normalization.
   - The menu-bar bubble includes **About SpeedChat**, which shows the version, build number, the time the app bundle was built in the local time zone, and the copyright notice from the bundle.
 

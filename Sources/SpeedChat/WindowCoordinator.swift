@@ -9,12 +9,59 @@ struct DisplayBounds: Equatable, Sendable {
     let id: String
     let frame: CGRect
     let visibleFrame: CGRect
+
+    static func displayContaining(_ frame: CGRect, in displays: [DisplayBounds]) -> DisplayBounds? {
+        var bestDisplay: DisplayBounds?
+        var bestArea: CGFloat = 0
+        for display in displays {
+            let intersection = frame.intersection(display.frame)
+            guard !intersection.isNull, !intersection.isEmpty else { continue }
+            let area = intersection.width * intersection.height
+            if area > bestArea {
+                bestArea = area
+                bestDisplay = display
+            }
+        }
+        return bestDisplay
+    }
+
+    static func relocatedFrame(
+        for currentFrame: CGRect,
+        from sourceDisplay: DisplayBounds?,
+        to targetDisplay: DisplayBounds
+    ) -> CGRect {
+        let targetVisible = targetDisplay.visibleFrame
+        let width = min(currentFrame.width, targetVisible.width)
+        let height = min(currentFrame.height, targetVisible.height)
+
+        let targetSlackX = max(0, targetVisible.width - width)
+        let targetSlackY = max(0, targetVisible.height - height)
+
+        let rawX: CGFloat
+        let rawY: CGFloat
+        if let sourceVisible = sourceDisplay?.visibleFrame {
+            let sourceSlackX = sourceVisible.width - currentFrame.width
+            let sourceSlackY = sourceVisible.height - currentFrame.height
+            let ratioX = sourceSlackX > 0 ? (currentFrame.minX - sourceVisible.minX) / sourceSlackX : 0.5
+            let ratioY = sourceSlackY > 0 ? (currentFrame.minY - sourceVisible.minY) / sourceSlackY : 0.5
+            rawX = targetVisible.minX + ratioX * targetSlackX
+            rawY = targetVisible.minY + ratioY * targetSlackY
+        } else {
+            rawX = targetVisible.minX + targetSlackX / 2
+            rawY = targetVisible.minY + targetSlackY / 2
+        }
+
+        let clampedX = min(max(rawX.rounded(), targetVisible.minX), targetVisible.maxX - width)
+        let clampedY = min(max(rawY.rounded(), targetVisible.minY), targetVisible.maxY - height)
+        return CGRect(x: clampedX, y: clampedY, width: width, height: height)
+    }
 }
 
 enum WindowWorkspaceEvent: Equatable, Sendable {
     case panelDidBecomeKey
     case panelDidResignKey
     case otherAppWindowDidBecomeKey
+    case otherAppDidActivate
     case appDidResignActive
     case activeSpaceDidChange
 }
@@ -23,7 +70,6 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
     var isPanelVisible: Bool { get }
     var isPanelOnActiveSpace: Bool { get }
     var isPanelKey: Bool { get }
-    var isAppActive: Bool { get }
     var panelFrame: CGRect { get }
     var displays: [DisplayBounds] { get }
     var activeDisplay: DisplayBounds? { get }
@@ -48,18 +94,24 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
         .managed,
         .fullScreenAuxiliary
     ]
-    static let spaceSwitchResignGraceInterval: TimeInterval = 0.5
+    static let spaceSwitchAppActivationRaceInterval: TimeInterval = 0.15
 
     static let secondaryWindowCollectionBehavior: NSWindow.CollectionBehavior = [
         .moveToActiveSpace
     ]
 
+    private enum PanelSpaceOwnership {
+        case none
+        case activeOnSpace
+        case resignedWithoutOtherApp
+    }
+
     private let workspace: any WindowWorkspace
     private let onShow: () -> Void
     private let onHide: () -> Void
     private let onNewChat: () -> Void
-    private var panelIsActiveOnItsSpace = false
-    private var recentResignAt: TimeInterval?
+    private var panelOwnership: PanelSpaceOwnership = .none
+    private var otherAppActivatedAt: TimeInterval?
     private var shouldRestoreOnSpaceReturn = false
 
     init(
@@ -83,7 +135,7 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
     }
 
     func togglePanelFromHotKey() {
-        if workspace.isPanelVisible && workspace.isPanelOnActiveSpace && workspace.isPanelKey && workspace.isAppActive {
+        if workspace.isPanelVisible && workspace.isPanelOnActiveSpace && workspace.isPanelKey {
             hidePanel()
             return
         }
@@ -91,25 +143,23 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
     }
 
     func showPanel() {
-        if workspace.isPanelVisible && !workspace.isPanelOnActiveSpace {
-            // Detach from the non-active Space without treating relocation as a hide
-            // so AppKit enters the active Space cleanly without bouncing Spaces.
+        let crossDisplayTargetFrame = targetFrameForCrossDisplayRelocation()
+        if workspace.isPanelVisible && (!workspace.isPanelOnActiveSpace || crossDisplayTargetFrame != nil) {
+            // Detach from the non-active Space or other display's active Space
+            // without treating relocation as a hide so AppKit enters the active
+            // Space cleanly (including another display's fullscreen Space).
             workspace.orderOutPanel()
         }
-        relocatePanelToActiveDisplayIfNeeded()
-        shouldRestoreOnSpaceReturn = false
-        recentResignAt = nil
+        if let crossDisplayTargetFrame {
+            workspace.setPanelFrame(crossDisplayTargetFrame)
+        }
+        clearRestorationState()
         onShow()
-        workspace.orderFrontAndMakePanelKey()
-        workspace.activateApp()
-        workspace.focusComposer()
-        panelIsActiveOnItsSpace = workspace.isPanelVisible && workspace.isPanelOnActiveSpace
+        focusPanelOnActiveSpace()
     }
 
     func hidePanel() {
-        shouldRestoreOnSpaceReturn = false
-        panelIsActiveOnItsSpace = false
-        recentResignAt = nil
+        clearRestorationState()
         workspace.orderOutPanel()
         onHide()
     }
@@ -141,77 +191,42 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
         workspace.activateApp()
     }
 
-    private func relocatePanelToActiveDisplayIfNeeded() {
-        guard let targetDisplay = workspace.activeDisplay, !targetDisplay.visibleFrame.isEmpty else { return }
+    private func targetFrameForCrossDisplayRelocation() -> CGRect? {
+        guard let targetDisplay = workspace.activeDisplay, !targetDisplay.visibleFrame.isEmpty else { return nil }
         let currentFrame = workspace.panelFrame
-        guard !currentFrame.isEmpty else { return }
-        let sourceDisplay = displayContaining(currentFrame, in: workspace.displays)
+        guard !currentFrame.isEmpty else { return nil }
+        let sourceDisplay = DisplayBounds.displayContaining(currentFrame, in: workspace.displays)
         if sourceDisplay?.id == targetDisplay.id {
-            return
+            return nil
         }
-        let targetFrame = relocatedFrame(for: currentFrame, from: sourceDisplay, to: targetDisplay)
-        workspace.setPanelFrame(targetFrame)
-    }
-
-    private func displayContaining(_ frame: CGRect, in displays: [DisplayBounds]) -> DisplayBounds? {
-        var bestDisplay: DisplayBounds?
-        var bestArea: CGFloat = 0
-        for display in displays {
-            let intersection = frame.intersection(display.frame)
-            guard !intersection.isNull, !intersection.isEmpty else { continue }
-            let area = intersection.width * intersection.height
-            if area > bestArea {
-                bestArea = area
-                bestDisplay = display
-            }
-        }
-        return bestDisplay
-    }
-
-    private func relocatedFrame(
-        for currentFrame: CGRect,
-        from sourceDisplay: DisplayBounds?,
-        to targetDisplay: DisplayBounds
-    ) -> CGRect {
-        let targetVisible = targetDisplay.visibleFrame
-        let width = min(currentFrame.width, targetVisible.width)
-        let height = min(currentFrame.height, targetVisible.height)
-
-        let targetSlackX = max(0, targetVisible.width - width)
-        let targetSlackY = max(0, targetVisible.height - height)
-
-        let rawX: CGFloat
-        let rawY: CGFloat
-        if let sourceVisible = sourceDisplay?.visibleFrame {
-            let sourceSlackX = sourceVisible.width - currentFrame.width
-            let sourceSlackY = sourceVisible.height - currentFrame.height
-            let ratioX = sourceSlackX > 0 ? (currentFrame.minX - sourceVisible.minX) / sourceSlackX : 0.5
-            let ratioY = sourceSlackY > 0 ? (currentFrame.minY - sourceVisible.minY) / sourceSlackY : 0.5
-            rawX = targetVisible.minX + ratioX * targetSlackX
-            rawY = targetVisible.minY + ratioY * targetSlackY
-        } else {
-            rawX = targetVisible.minX + targetSlackX / 2
-            rawY = targetVisible.minY + targetSlackY / 2
-        }
-
-        let clampedX = min(max(rawX.rounded(), targetVisible.minX), targetVisible.maxX - width)
-        let clampedY = min(max(rawY.rounded(), targetVisible.minY), targetVisible.maxY - height)
-        return CGRect(x: clampedX, y: clampedY, width: width, height: height)
+        return DisplayBounds.relocatedFrame(for: currentFrame, from: sourceDisplay, to: targetDisplay)
     }
 
     private func handle(_ event: WindowWorkspaceEvent) {
         switch event {
         case .panelDidBecomeKey:
             guard workspace.isPanelVisible, workspace.isPanelOnActiveSpace else { return }
-            panelIsActiveOnItsSpace = true
-            recentResignAt = nil
+            panelOwnership = .activeOnSpace
+            otherAppActivatedAt = nil
             shouldRestoreOnSpaceReturn = false
 
         case .otherAppWindowDidBecomeKey:
             if workspace.isPanelOnActiveSpace {
-                panelIsActiveOnItsSpace = false
-                recentResignAt = nil
-                shouldRestoreOnSpaceReturn = false
+                clearRestorationState()
+            }
+
+        case .otherAppDidActivate:
+            guard workspace.isPanelVisible else {
+                clearRestorationState()
+                return
+            }
+            if !workspace.isPanelOnActiveSpace {
+                recordPanelLeftActiveSpace()
+                return
+            }
+            if panelOwnership != .none {
+                panelOwnership = .none
+                otherAppActivatedAt = workspace.now
             }
 
         case .panelDidResignKey, .appDidResignActive:
@@ -220,16 +235,11 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
                 return
             }
             if !workspace.isPanelOnActiveSpace {
-                if panelIsActiveOnItsSpace || isWithinResignGraceWindow() {
-                    shouldRestoreOnSpaceReturn = true
-                }
-                panelIsActiveOnItsSpace = false
-                recentResignAt = nil
+                recordPanelLeftActiveSpace()
                 return
             }
-            if panelIsActiveOnItsSpace {
-                panelIsActiveOnItsSpace = false
-                recentResignAt = workspace.now
+            if panelOwnership == .activeOnSpace {
+                panelOwnership = .resignedWithoutOtherApp
             }
 
         case .activeSpaceDidChange:
@@ -238,34 +248,46 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
                 return
             }
             if !workspace.isPanelOnActiveSpace {
-                if panelIsActiveOnItsSpace || isWithinResignGraceWindow() {
-                    shouldRestoreOnSpaceReturn = true
-                }
-                panelIsActiveOnItsSpace = false
-                recentResignAt = nil
+                recordPanelLeftActiveSpace()
                 return
             }
             if shouldRestoreOnSpaceReturn {
-                shouldRestoreOnSpaceReturn = false
-                recentResignAt = nil
-                workspace.orderFrontAndMakePanelKey()
-                workspace.activateApp()
-                workspace.focusComposer()
-                panelIsActiveOnItsSpace = workspace.isPanelVisible && workspace.isPanelOnActiveSpace
+                focusPanelOnActiveSpace()
             }
         }
     }
 
-    private func isWithinResignGraceWindow() -> Bool {
-        guard let recentResignAt else { return false }
-        let elapsed = workspace.now - recentResignAt
-        return elapsed >= 0 && elapsed <= Self.spaceSwitchResignGraceInterval
+    private var panelOwnedActiveSpace: Bool {
+        panelOwnership != .none || isWithinOtherAppActivationRaceWindow()
+    }
+
+    private func isWithinOtherAppActivationRaceWindow() -> Bool {
+        guard let otherAppActivatedAt else { return false }
+        let elapsed = workspace.now - otherAppActivatedAt
+        return elapsed >= 0 && elapsed <= Self.spaceSwitchAppActivationRaceInterval
+    }
+
+    private func recordPanelLeftActiveSpace() {
+        if panelOwnedActiveSpace {
+            shouldRestoreOnSpaceReturn = true
+        }
+        panelOwnership = .none
+        otherAppActivatedAt = nil
+    }
+
+    private func focusPanelOnActiveSpace() {
+        shouldRestoreOnSpaceReturn = false
+        otherAppActivatedAt = nil
+        workspace.orderFrontAndMakePanelKey()
+        workspace.activateApp()
+        workspace.focusComposer()
+        panelOwnership = (workspace.isPanelVisible && workspace.isPanelOnActiveSpace) ? .activeOnSpace : .none
     }
 
     private func clearRestorationState() {
         shouldRestoreOnSpaceReturn = false
-        panelIsActiveOnItsSpace = false
-        recentResignAt = nil
+        panelOwnership = .none
+        otherAppActivatedAt = nil
     }
 }
 
@@ -298,7 +320,6 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
     var isPanelVisible: Bool { panel?.isVisible ?? false }
     var isPanelOnActiveSpace: Bool { panel?.isOnActiveSpace ?? false }
     var isPanelKey: Bool { panel?.isKeyWindow ?? false }
-    var isAppActive: Bool { NSApp.isActive }
     var panelFrame: CGRect { panel?.frame ?? .zero }
     var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
@@ -410,6 +431,15 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
             defaultCenter.addObserver(forName: NSApplication.didResignActiveNotification, object: NSApp, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.onEvent?(.appDidResignActive)
+                }
+            }
+        )
+        workspaceCenterObservers.append(
+            workspaceCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] notification in
+                let activatedPID = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+                MainActor.assumeIsolated {
+                    guard let activatedPID, activatedPID != NSRunningApplication.current.processIdentifier else { return }
+                    self?.onEvent?(.otherAppDidActivate)
                 }
             }
         )

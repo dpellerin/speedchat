@@ -29,7 +29,8 @@ import Testing
 }
 
 @MainActor
-@Test func globalShortcutHidesPanelWhenAlreadyFrontmostAndFocusedOnCurrentSpace() {
+@Test(arguments: FocusedPanelHideScenario.allCases)
+func globalShortcutHidesPanelWhenAlreadyFrontmostAndFocusedOnCurrentSpace(scenario: FocusedPanelHideScenario) {
     let workspace = FakeWindowWorkspace(activeSpace: .desktopA)
     var showCount = 0
     var hideCount = 0
@@ -40,6 +41,13 @@ import Testing
     )
 
     coordinator.showPanel()
+    if scenario == .clickedNonActivatingPanel {
+        workspace.otherAppTakesFocus()
+        workspace.userClicksPanel()
+        #expect(workspace.isPanelKey)
+        #expect(!workspace.isAppActive)
+    }
+
     coordinator.togglePanelFromHotKey()
 
     #expect(!workspace.isPanelVisible)
@@ -59,8 +67,8 @@ import Testing
 }
 
 @MainActor
-@Test(arguments: ["anotherApp", "anotherAppWithStalePanelKey", "secondaryWindow"])
-func globalShortcutRaisesAndFocusesUnfocusedPanelOnCurrentSpace(scenario: String) {
+@Test(arguments: UnfocusedPanelScenario.allCases)
+func globalShortcutRaisesAndFocusesUnfocusedPanelOnCurrentSpace(scenario: UnfocusedPanelScenario) {
     let workspace = FakeWindowWorkspace(activeSpace: .desktopA)
     var showCount = 0
     var hideCount = 0
@@ -72,13 +80,12 @@ func globalShortcutRaisesAndFocusesUnfocusedPanelOnCurrentSpace(scenario: String
 
     coordinator.showPanel()
     switch scenario {
-    case "anotherApp":
+    case .anotherApp:
         workspace.otherAppTakesFocus()
-    case "anotherAppWithStalePanelKey":
-        workspace.otherAppTakesFocus(retainStalePanelKey: true)
-    default:
+    case .secondaryWindow:
         workspace.secondaryWindowTakesFocus()
     }
+    #expect(!workspace.isPanelKey)
 
     coordinator.togglePanelFromHotKey()
 
@@ -258,11 +265,7 @@ func globalShortcutPullsOpenPanelFromAnotherSpaceWithoutHidingOrBouncingSpaces(d
 }
 
 @MainActor
-@Test(arguments: [
-    SpaceLeaveOrdering.spaceChangeFirst,
-    .resignAfterSpaceFlip,
-    .resignBeforeSpaceFlip
-])
+@Test(arguments: SpaceLeaveOrdering.allCases)
 func returningToPanelSpaceRestoresPanelFrontmostWithComposerFocused(ordering: SpaceLeaveOrdering) {
     let workspace = FakeWindowWorkspace(activeSpace: .desktopA)
     var showCount = 0
@@ -300,20 +303,56 @@ func returningToPanelSpaceRestoresPanelFrontmostWithComposerFocused(ordering: Sp
 }
 
 @MainActor
-@Test(arguments: ["anotherApp", "anotherAppWithStalePanelKey", "secondaryWindow"])
-func returningToPanelSpaceLeavesOtherActiveAppOrWindowFrontmost(scenario: String) {
+@Test func slowMissionControlOrSwipeWithoutOtherAppActivationRestoresPanelOnReturn() {
+    let workspace = FakeWindowWorkspace(activeSpace: .desktopA)
+    let coordinator = WindowCoordinator(workspace: workspace)
+
+    coordinator.showPanel()
+    // Mission Control or a slow trackpad swipe resigns panel key without activating
+    // another app, and more than 1.0s elapses before activeSpaceDidChange arrives.
+    workspace.resignPanelWithoutOtherApp()
+    workspace.advanceTime(by: 1.5)
+    workspace.switchSpace(to: .desktopB, ordering: .spaceChangeFirst)
+
+    #expect(workspace.activeSpace == .desktopB)
+    #expect(!workspace.isPanelOnActiveSpace)
+
+    workspace.advanceTime(by: 3.0)
+    workspace.switchSpace(to: .desktopA)
+
+    #expect(workspace.activeSpace == .desktopA)
+    #expect(workspace.isPanelVisible)
+    #expect(workspace.panelSpace == .desktopA)
+    #expect(workspace.isPanelFrontmost)
+    #expect(workspace.isPanelKey)
+    #expect(workspace.isAppActive)
+    #expect(workspace.isComposerFocused)
+}
+
+@MainActor
+@Test(arguments: SpaceFocusStealScenario.allCases)
+func returningToPanelSpaceLeavesOtherActiveAppOrWindowFrontmost(scenario: SpaceFocusStealScenario) {
     let workspace = FakeWindowWorkspace(activeSpace: .desktopA)
     let coordinator = WindowCoordinator(workspace: workspace)
 
     coordinator.showPanel()
     switch scenario {
-    case "anotherApp":
+    case .anotherApp:
+        // Quick click on another app on Space A followed by a Space switch 0.3s later
+        // (past the short WindowServer commit-race window) must NOT steal focus on return.
         workspace.otherAppTakesFocus()
-        workspace.advanceTime(by: WindowCoordinator.spaceSwitchResignGraceInterval + 0.5)
-    case "anotherAppWithStalePanelKey":
+        workspace.advanceTime(by: 0.3)
+    case .anotherAppWithStalePanelKey:
         workspace.otherAppTakesFocus(retainStalePanelKey: true)
-        workspace.advanceTime(by: WindowCoordinator.spaceSwitchResignGraceInterval + 0.5)
-    default:
+        workspace.advanceTime(by: 0.3)
+    case .anotherAppFollowedBySecondAppSwitch:
+        // Clicking a second app on Space A right before switching Spaces must not reopen
+        // the commit-race window for the Panel.
+        workspace.otherAppTakesFocus()
+        workspace.advanceTime(by: 0.3)
+        workspace.otherAppTakesFocus()
+        workspace.advanceTime(by: 0.05)
+    case .secondaryWindow:
         // Focusing another SpeedChat window on Space A clears Panel ownership immediately,
         // even if the user switches Spaces right away.
         workspace.secondaryWindowTakesFocus()
@@ -388,8 +427,8 @@ func returningToPanelSpaceLeavesOtherActiveAppOrWindowFrontmost(scenario: String
 }
 
 @MainActor
-@Test(arguments: ["hotkey", "menuShow", "menuNewChat"])
-func pullingPanelOntoAnotherSpaceClearsPriorSpaceRestoration(trigger: String) {
+@Test(arguments: PanelSummonTrigger.allCases)
+func pullingPanelOntoAnotherSpaceClearsPriorSpaceRestoration(trigger: PanelSummonTrigger) {
     let workspace = FakeWindowWorkspace(activeSpace: .desktopA)
     let coordinator = WindowCoordinator(workspace: workspace)
 
@@ -397,11 +436,11 @@ func pullingPanelOntoAnotherSpaceClearsPriorSpaceRestoration(trigger: String) {
     workspace.switchSpace(to: .desktopB)
 
     switch trigger {
-    case "hotkey":
+    case .hotkey:
         coordinator.togglePanelFromHotKey()
-    case "menuShow":
+    case .menuShow:
         coordinator.showPanel()
-    default:
+    case .menuNewChat:
         coordinator.newChatFromMenu()
     }
 
@@ -435,20 +474,20 @@ func pullingPanelOntoAnotherSpaceClearsPriorSpaceRestoration(trigger: String) {
 }
 
 @MainActor
-@Test(arguments: ["hideOnSpaceA", "smartToggleHideOnSpaceA", "hideWhileOffSpace"])
-func hidingPanelClearsPendingSpaceReturnRestoration(scenario: String) {
+@Test(arguments: PanelHideScenario.allCases)
+func hidingPanelClearsPendingSpaceReturnRestoration(scenario: PanelHideScenario) {
     let workspace = FakeWindowWorkspace(activeSpace: .desktopA)
     let coordinator = WindowCoordinator(workspace: workspace)
 
     coordinator.showPanel()
     switch scenario {
-    case "hideOnSpaceA":
+    case .hideOnSpaceA:
         coordinator.hidePanel()
         workspace.switchSpace(to: .desktopB)
-    case "smartToggleHideOnSpaceA":
+    case .smartToggleHideOnSpaceA:
         coordinator.togglePanelFromHotKey()
         workspace.switchSpace(to: .desktopB)
-    default:
+    case .hideWhileOffSpace:
         workspace.switchSpace(to: .desktopB)
         coordinator.hidePanel()
     }
@@ -500,7 +539,7 @@ func activeTurnCompletingOnAnotherSpaceDoesNotStealFocusOrSwitchSpaces(panelWasA
 
     if !panelWasActiveBeforeLeaving {
         workspace.otherAppTakesFocus()
-        workspace.advanceTime(by: WindowCoordinator.spaceSwitchResignGraceInterval + 0.5)
+        workspace.advanceTime(by: 0.3)
     }
 
     workspace.switchSpace(to: .desktopB)
@@ -711,6 +750,70 @@ func summoningPanelOnSpaceBWithSecondaryWindowOnSpaceANeverSwitchesSpaces(window
 }
 
 @MainActor
+@Test(arguments: [FakeSpace.desktopB, .fullscreenApp])
+func pullingVisiblePanelAcrossDisplaysDetachesBeforeMovingOntoTargetDisplaySpace(targetDisplaySpace: FakeSpace) {
+    let display1 = DisplayBounds(
+        id: "display-1",
+        frame: CGRect(x: 0, y: 0, width: 1512, height: 982),
+        visibleFrame: CGRect(x: 0, y: 70, width: 1512, height: 874)
+    )
+    let display2 = DisplayBounds(
+        id: "display-2",
+        frame: CGRect(x: 1512, y: 0, width: 2560, height: 1440),
+        visibleFrame: CGRect(x: 1512, y: 0, width: 2560, height: 1415)
+    )
+    let initialFrame = CGRect(x: 360, y: 120, width: 790, height: 740)
+    let workspace = FakeWindowWorkspace(
+        activeSpace: .desktopA,
+        displays: [display1, display2],
+        activeDisplay: display1,
+        panelFrame: initialFrame
+    )
+    var showCount = 0
+    var hideCount = 0
+    let coordinator = WindowCoordinator(
+        workspace: workspace,
+        onShow: { showCount += 1 },
+        onHide: { hideCount += 1 }
+    )
+
+    // Panel is visible on Display 1's active Space.
+    coordinator.showPanel()
+    #expect(workspace.isPanelVisible)
+    #expect(workspace.isPanelOnActiveSpace)
+    #expect(workspace.panelSpace == .desktopA)
+
+    // Under macOS "Displays have separate Spaces", switching focus to an app on Display 2
+    // (including a fullscreen Space on Display 2) leaves Display 1's Space active, so the
+    // visible Panel on Display 1 still reports isPanelOnActiveSpace == true.
+    workspace.otherAppTakesFocus()
+    workspace.focusDisplay(display2, activeSpace: targetDisplaySpace, keepOtherDisplaysActive: true)
+    #expect(workspace.isPanelVisible)
+    #expect(workspace.isPanelOnActiveSpace)
+    #expect(!workspace.isPanelKey)
+
+    workspace.clearRecordedPanelOperations()
+    coordinator.togglePanelFromHotKey()
+
+    let moved = workspace.panelFrame
+    #expect(moved.width == initialFrame.width)
+    #expect(moved.height == initialFrame.height)
+    #expect(moved.minX >= display2.visibleFrame.minX)
+    #expect(moved.maxX <= display2.visibleFrame.maxX)
+    #expect(moved.minY >= display2.visibleFrame.minY)
+    #expect(moved.maxY <= display2.visibleFrame.maxY)
+    #expect(workspace.panelSpace == targetDisplaySpace)
+    #expect(workspace.isPanelVisible)
+    #expect(workspace.isPanelFrontmost)
+    #expect(workspace.isPanelKey)
+    #expect(workspace.isAppActive)
+    #expect(workspace.isComposerFocused)
+    #expect(workspace.recordedPanelOperations == [.orderOut, .setFrame, .orderFrontAndMakeKey])
+    #expect(showCount == 2)
+    #expect(hideCount == 0)
+}
+
+@MainActor
 @Test func relocatingOversizedOrOffscreenPanelClampsWithinDestinationVisibleBounds() {
     let leftMonitor = DisplayBounds(
         id: "left",
@@ -859,6 +962,35 @@ private final class ControllableChatBackend: ChatBackend, @unchecked Sendable {
     }
 }
 
+enum FocusedPanelHideScenario: String, Sendable, Equatable, CaseIterable {
+    case activeApp
+    case clickedNonActivatingPanel
+}
+
+enum UnfocusedPanelScenario: String, Sendable, Equatable, CaseIterable {
+    case anotherApp
+    case secondaryWindow
+}
+
+enum SpaceFocusStealScenario: String, Sendable, Equatable, CaseIterable {
+    case anotherApp
+    case anotherAppWithStalePanelKey
+    case anotherAppFollowedBySecondAppSwitch
+    case secondaryWindow
+}
+
+enum PanelSummonTrigger: String, Sendable, Equatable, CaseIterable {
+    case hotkey
+    case menuShow
+    case menuNewChat
+}
+
+enum PanelHideScenario: String, Sendable, Equatable, CaseIterable {
+    case hideOnSpaceA
+    case smartToggleHideOnSpaceA
+    case hideWhileOffSpace
+}
+
 enum FakeSpace: String, Sendable, Equatable {
     case desktopA
     case desktopB
@@ -866,10 +998,18 @@ enum FakeSpace: String, Sendable, Equatable {
     case fullscreenApp
 }
 
-enum SpaceLeaveOrdering: String, Sendable, Equatable {
+enum SpaceLeaveOrdering: String, Sendable, Equatable, CaseIterable {
     case spaceChangeFirst
     case resignAfterSpaceFlip
     case resignBeforeSpaceFlip
+    case destinationAppActivatesBeforeSpaceFlip
+    case destinationAppActivatesAfterSpaceFlip
+}
+
+enum PanelOperation: Equatable, Sendable {
+    case orderOut
+    case setFrame
+    case orderFrontAndMakeKey
 }
 
 @MainActor
@@ -889,6 +1029,7 @@ private final class FakeWindowWorkspace: WindowWorkspace {
 
     private(set) var activeSpace: FakeSpace
     private(set) var panelSpace: FakeSpace?
+    private var visibleSpacesOnOtherDisplays: Set<FakeSpace> = []
     private(set) var isPanelVisible = false
     private(set) var isPanelFrontmost = false
     private(set) var isPanelKey = false
@@ -898,6 +1039,7 @@ private final class FakeWindowWorkspace: WindowWorkspace {
     private(set) var activeDisplay: DisplayBounds?
     private(set) var panelFrame: CGRect
     private(set) var frameUpdateCount = 0
+    private(set) var recordedPanelOperations: [PanelOperation] = []
     private var secondaryStates: [SecondaryWindow: SecondaryWindowState] = [:]
     private(set) var now: TimeInterval = 100.0
     var onEvent: ((WindowWorkspaceEvent) -> Void)?
@@ -919,13 +1061,30 @@ private final class FakeWindowWorkspace: WindowWorkspace {
         activeDisplay = display
     }
 
+    func focusDisplay(_ display: DisplayBounds, activeSpace targetSpace: FakeSpace, keepOtherDisplaysActive: Bool) {
+        if keepOtherDisplaysActive {
+            visibleSpacesOnOtherDisplays.insert(activeSpace)
+        } else {
+            visibleSpacesOnOtherDisplays.removeAll()
+        }
+        visibleSpacesOnOtherDisplays.remove(targetSpace)
+        activeDisplay = display
+        activeSpace = targetSpace
+    }
+
+    func clearRecordedPanelOperations() {
+        recordedPanelOperations.removeAll()
+    }
+
     func setPanelFrame(_ frame: CGRect) {
         panelFrame = frame
         frameUpdateCount += 1
+        recordedPanelOperations.append(.setFrame)
     }
 
     var isPanelOnActiveSpace: Bool {
-        isPanelVisible && panelSpace == activeSpace
+        guard isPanelVisible, let panelSpace else { return false }
+        return panelSpace == activeSpace || visibleSpacesOnOtherDisplays.contains(panelSpace)
     }
 
     func isSecondaryVisible(_ window: SecondaryWindow) -> Bool {
@@ -1004,6 +1163,41 @@ private final class FakeWindowWorkspace: WindowWorkspace {
                 isPanelFrontmost = false
             }
             onEvent?(.activeSpaceDidChange)
+
+        case .destinationAppActivatesBeforeSpaceFlip:
+            if wasPanelKey {
+                isPanelKey = false
+                isComposerFocused = false
+                onEvent?(.panelDidResignKey)
+            }
+            if wasAppActive {
+                isAppActive = false
+                onEvent?(.appDidResignActive)
+            }
+            onEvent?(.otherAppDidActivate)
+            advanceTime(by: 0.05)
+            activeSpace = destination
+            if panelSpace != activeSpace {
+                isPanelFrontmost = false
+            }
+            onEvent?(.activeSpaceDidChange)
+
+        case .destinationAppActivatesAfterSpaceFlip:
+            activeSpace = destination
+            if panelSpace != activeSpace {
+                isPanelFrontmost = false
+            }
+            if wasPanelKey {
+                isPanelKey = false
+                isComposerFocused = false
+                onEvent?(.panelDidResignKey)
+            }
+            if wasAppActive {
+                isAppActive = false
+                onEvent?(.appDidResignActive)
+            }
+            onEvent?(.otherAppDidActivate)
+            onEvent?(.activeSpaceDidChange)
         }
         for window in SecondaryWindow.allCases {
             guard var state = secondaryStates[window] else { continue }
@@ -1012,6 +1206,20 @@ private final class FakeWindowWorkspace: WindowWorkspace {
                 state.isFrontmost = false
             }
             secondaryStates[window] = state
+        }
+    }
+
+    func resignPanelWithoutOtherApp() {
+        let wasPanelKey = isPanelKey
+        let wasAppActive = isAppActive
+        isAppActive = false
+        isPanelKey = false
+        isComposerFocused = false
+        if wasPanelKey {
+            onEvent?(.panelDidResignKey)
+        }
+        if wasAppActive {
+            onEvent?(.appDidResignActive)
         }
     }
 
@@ -1034,6 +1242,7 @@ private final class FakeWindowWorkspace: WindowWorkspace {
         if wasAppActive {
             onEvent?(.appDidResignActive)
         }
+        onEvent?(.otherAppDidActivate)
     }
 
     func secondaryWindowTakesFocus() {
@@ -1056,6 +1265,7 @@ private final class FakeWindowWorkspace: WindowWorkspace {
     }
 
     func orderOutPanel() {
+        recordedPanelOperations.append(.orderOut)
         let wasPanelKey = isPanelKey
         isPanelVisible = false
         panelSpace = nil
@@ -1068,7 +1278,9 @@ private final class FakeWindowWorkspace: WindowWorkspace {
     }
 
     func orderFrontAndMakePanelKey() {
+        recordedPanelOperations.append(.orderFrontAndMakeKey)
         // Model macOS AppKit behavior: an already-visible panel on another Space
+        // (including another display's active Space under "Displays have separate Spaces")
         // stays stranded on its original Space unless detached via orderOut first.
         if isPanelVisible, let existingSpace = panelSpace, existingSpace != activeSpace {
             isPanelKey = false
