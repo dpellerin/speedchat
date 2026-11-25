@@ -30,7 +30,16 @@ import ChatCore
   panel.delegate=self
   panel.contentView=NSHostingView(rootView:PanelView(store:store,preferences:preferences,scroll:scroll,settings:{[weak self] in self?.showSettings()},dismiss:{[weak self] in self?.hide()}))
   windowCoordinator=WindowCoordinator(
-   workspace:AppKitWindowWorkspace(panel:panel) { [weak self] in self?.focusComposer() },
+   workspace:AppKitWindowWorkspace(
+    panel:panel,
+    secondaryWindow:{ [weak self] kind in
+     switch kind {
+     case .settings:self?.settingsWindow
+     case .about:self?.aboutWindow
+     }
+    },
+    focusComposer:{ [weak self] in self?.focusComposer() }
+   ),
    onShow:{ [weak self] in self?.store.show() },
    onHide:{ [weak self] in self?.store.hide() },
    onNewChat:{ [weak self] in self?.store.newChat() }
@@ -138,11 +147,11 @@ import ChatCore
    hosting.layoutSubtreeIfNeeded()
    let size=hosting.fittingSize
    let window=NSWindow(contentRect:NSRect(origin:.zero,size:size),styleMask:[.titled,.closable],backing:.buffered,defer:false)
-   window.title="SpeedChat Settings";window.isReleasedWhenClosed=false;window.contentView=hosting;window.setContentSize(size);window.center();settingsWindow=window
+   window.title="SpeedChat Settings";window.isReleasedWhenClosed=false;window.collectionBehavior=WindowCoordinator.secondaryWindowCollectionBehavior;window.contentView=hosting;window.setContentSize(size);window.center();settingsWindow=window
   } else if let hosting=settingsWindow?.contentView {
    hosting.layoutSubtreeIfNeeded();settingsWindow?.setContentSize(hosting.fittingSize)
   }
-  NSApp.activate(ignoringOtherApps:true);settingsWindow?.makeKeyAndOrderFront(nil)
+  windowCoordinator.showSecondaryWindow(.settings)
  }
  @objc func showAbout() {
   if aboutWindow == nil {
@@ -150,9 +159,9 @@ import ChatCore
    hosting.layoutSubtreeIfNeeded()
    let size=hosting.fittingSize
    let window=NSWindow(contentRect:NSRect(origin:.zero,size:size),styleMask:[.titled,.closable],backing:.buffered,defer:false)
-   window.title="About SpeedChat";window.isReleasedWhenClosed=false;window.isRestorable=false;window.contentView=hosting;window.setContentSize(size);window.center();aboutWindow=window
+   window.title="About SpeedChat";window.isReleasedWhenClosed=false;window.isRestorable=false;window.collectionBehavior=WindowCoordinator.secondaryWindowCollectionBehavior;window.contentView=hosting;window.setContentSize(size);window.center();aboutWindow=window
   }
-  NSApp.activate(ignoringOtherApps:true);aboutWindow?.makeKeyAndOrderFront(nil)
+  windowCoordinator.showSecondaryWindow(.about)
  }
  @objc func quit() {NSApp.terminate(nil)}
  func windowShouldClose(_ sender:NSWindow)->Bool {if sender === panel {hide();return false};return true}

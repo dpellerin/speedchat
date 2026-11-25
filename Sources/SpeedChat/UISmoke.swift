@@ -86,6 +86,7 @@ extension AppDelegate {
    check("Unsafe URL is never opened",!NativeActions.open(URL(fileURLWithPath:"/tmp/blocked")))
    showSettings()
    check("Panel stays visible when another window receives focus",panel.isVisible && settingsWindow?.isKeyWindow == true)
+   check("Settings window uses single-Space move-to-active-Space behavior",settingsWindow?.collectionBehavior.contains(.moveToActiveSpace) == true && settingsWindow?.collectionBehavior.contains(.canJoinAllSpaces) == false)
    func hasScrollView(_ view:NSView)->Bool {if view is NSScrollView {return true};return view.subviews.contains(where:hasScrollView)}
    if let settingsContent=settingsWindow?.contentView {
     settingsContent.layoutSubtreeIfNeeded()
@@ -98,6 +99,7 @@ extension AppDelegate {
    check("Smart-toggle raises and focuses unfocused panel on current Space",panel.isVisible && panel.isKeyWindow && raisedComposer != nil && panel.firstResponder === raisedComposer)
    settingsWindow?.orderOut(nil)
    showAbout()
+   check("About window uses single-Space move-to-active-Space behavior",aboutWindow?.collectionBehavior.contains(.moveToActiveSpace) == true && aboutWindow?.collectionBehavior.contains(.canJoinAllSpaces) == false)
    let about=AboutInfo.current()
    let bundleVersion=(Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String) ?? ""
    let bundleBuild=(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String) ?? ""
