@@ -1,6 +1,7 @@
 import Foundation
 
 public struct ReadyState: Equatable, Sendable {
+    public var conversationId: String?
     public var threadId: String
     public var messages: [ChatMessage]
     public var resumed: Bool
@@ -13,6 +14,7 @@ public struct ReadyState: Equatable, Sendable {
     public var codexRetry: CodexRetry?
 
     public init(
+        conversationId: String? = nil,
         threadId: String,
         messages: [ChatMessage],
         resumed: Bool,
@@ -24,6 +26,7 @@ public struct ReadyState: Equatable, Sendable {
         stateSaveError: String? = nil,
         codexRetry: CodexRetry? = nil
     ) {
+        self.conversationId = conversationId
         self.threadId = threadId
         self.messages = messages
         self.resumed = resumed
@@ -42,17 +45,20 @@ public struct ChatClientOptions: Sendable {
     public var openRouterConfigURL: URL?
     public var stateURL: URL?
     public var env: [String: String]
+    public var now: @Sendable () -> Date
 
     public init(
         openRouterFetch: OpenRouterFetch? = nil,
         openRouterConfigURL: URL? = nil,
         stateURL: URL? = nil,
-        env: [String: String] = ProcessInfo.processInfo.environment
+        env: [String: String] = ProcessInfo.processInfo.environment,
+        now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.openRouterFetch = openRouterFetch
         self.openRouterConfigURL = openRouterConfigURL
         self.stateURL = stateURL
         self.env = env
+        self.now = now
     }
 }
 
@@ -181,6 +187,14 @@ public final class ChatClient: @unchecked Sendable {
 
     public var busy: Bool {
         sync { activeExecution != nil || mutationPending }
+    }
+
+    public var conversationId: String? {
+        sync { conversation.conversationId }
+    }
+
+    public func savedConversations() -> [SavedConversation] {
+        sync { StateStore.loadConversations(stateURL: options.stateURL, env: options.env) }
     }
 
     public var codexRetry: CodexRetry? {
@@ -354,15 +368,15 @@ public final class ChatClient: @unchecked Sendable {
         if closeTask != nil { throw CancellationError() }
     }
 
-    private func saveCurrentState() {
+    private func saveCurrentState(touchActivity: Bool = true) {
         guard closeTask == nil else { return }
-        try? conversation.save(model: model, to: options.stateURL, env: options.env)
+        try? conversation.save(model: model, to: options.stateURL, env: options.env, now: options.now(), touchActivity: touchActivity)
     }
 
-    private func saveCodexState() throws {
+    private func saveCodexState(touchActivity: Bool = true) throws {
         try requireOpen()
         do {
-            try conversation.save(model: model, to: options.stateURL, env: options.env)
+            try conversation.save(model: model, to: options.stateURL, env: options.env, now: options.now(), touchActivity: touchActivity)
         } catch {
             throw NSError(domain: "SpeedChat.Persistence", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "SpeedChat couldn’t save the conversation to local storage.",
@@ -370,9 +384,9 @@ public final class ChatClient: @unchecked Sendable {
         }
     }
 
-    private func codexStateSaveFailure() -> Error? {
+    private func codexStateSaveFailure(touchActivity: Bool = true) -> Error? {
         do {
-            try saveCodexState()
+            try saveCodexState(touchActivity: touchActivity)
             return nil
         } catch {
             return error
@@ -432,7 +446,7 @@ public final class ChatClient: @unchecked Sendable {
             return (threadId, codexModelForSelection())
         }
 
-        guard let state else { return try await newChat() }
+        guard let state, !state.threadId.isEmpty else { return try await newChat() }
         var saveFailure: Error?
         if let (threadId, resumeModel) = resumeRequest {
             do {
@@ -448,9 +462,9 @@ public final class ChatClient: @unchecked Sendable {
                         model = resumedModel
                     }
                     if recoveredHistory {
-                        saveFailure = codexStateSaveFailure()
+                        saveFailure = codexStateSaveFailure(touchActivity: true)
                     } else if state.model != model {
-                        saveCurrentState()
+                        saveCurrentState(touchActivity: false)
                     }
                 }
             } catch let error as CodexRPCError where error.confirmsMissingRollout(for: threadId) {
@@ -502,7 +516,7 @@ public final class ChatClient: @unchecked Sendable {
             rebuildModelCatalog()
             if !models.contains(where: { $0.model == model }) {
                 model = Self.defaultModel(from: models)
-                saveCurrentState()
+                saveCurrentState(touchActivity: false)
             }
             return readyStateLocked()
         }
@@ -623,7 +637,7 @@ public final class ChatClient: @unchecked Sendable {
             checkedCodexSendId = nil
             undispatchedCodexMessage = nil
             uncheckedCodexReply = nil
-            saveCurrentState()
+            saveCurrentState(touchActivity: false)
             return readyStateLocked(resumed: false)
         }
         if case .attached(let id) = thread {
@@ -659,7 +673,7 @@ public final class ChatClient: @unchecked Sendable {
         return try sync {
             try requireOpen()
             model = candidate
-            saveCurrentState()
+            saveCurrentState(touchActivity: false)
             return readyStateLocked()
         }
     }
@@ -668,6 +682,7 @@ public final class ChatClient: @unchecked Sendable {
         resumed: Bool = true, offlineReason: String? = nil, stateSaveError: String? = nil
     ) -> ReadyState {
         ReadyState(
+            conversationId: conversation.conversationId,
             threadId: conversation.thread?.id ?? "",
             messages: conversation.messages,
             resumed: resumed,
@@ -1330,7 +1345,7 @@ public final class ChatClient: @unchecked Sendable {
         }
         let saveWarning: String?
         do {
-            try conversation.save(model: model, to: options.stateURL, env: options.env)
+            try conversation.save(model: model, to: options.stateURL, env: options.env, now: options.now(), touchActivity: true)
             saveWarning = nil
         } catch {
             saveWarning = "Couldn’t save this turn locally. It may be missing after reopening."
