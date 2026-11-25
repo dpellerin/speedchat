@@ -219,7 +219,7 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForCondition { store.session.phase == .ready }
+    try await waitForHistoryCondition { store.session.phase == .ready }
     #expect(store.session.conversationId == "conv-a")
 
     store.draft = "Unsent Lisbon follow-up"
@@ -230,7 +230,7 @@ import Testing
     store.openHistory()
     #expect(!store.showingHistory)
     backend.emit(BridgeEvent(type: "done", conversationId: "conv-a", executionID: store.session.executionID))
-    try await waitForCondition { store.session.phase == .ready }
+    try await waitForHistoryCondition { store.session.phase == .ready }
 
     // Draft cleared on send; write new unsent draft for Conversation A.
     #expect(store.draft.isEmpty)
@@ -241,7 +241,7 @@ import Testing
     #expect(store.showingHistory)
     #expect(backend.commands.last == ["type": "listHistory"])
     backend.emit(BridgeEvent(type: "history", history: [entryA, entryB]))
-    try await waitForCondition { store.historyEntries.count == 2 }
+    try await waitForHistoryCondition { store.historyEntries.count == 2 }
     #expect(store.selectedHistoryIndex == 0)
 
     // Keyboard navigation clamps within bounds.
@@ -263,7 +263,7 @@ import Testing
     // Reopen History, select Conversation B with ↓ + ↵ -> saves Draft for A, loads empty Draft for B.
     store.openHistory()
     backend.emit(BridgeEvent(type: "history", history: [entryA, entryB]))
-    try await waitForCondition { store.historyEntries.count == 2 }
+    try await waitForHistoryCondition { store.historyEntries.count == 2 }
     store.moveHistorySelection(1)
     store.openSelectedHistoryConversation()
     #expect(!store.showingHistory)
@@ -276,13 +276,13 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForCondition { store.session.conversationId == "conv-b" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-b" }
 
     // Write Draft for B, switch back to A -> restores Draft for A!
     store.draft = "Draft for B"
     store.openHistory()
     backend.emit(BridgeEvent(type: "history", history: [entryA, entryB]))
-    try await waitForCondition { store.historyEntries.count == 2 }
+    try await waitForHistoryCondition { store.historyEntries.count == 2 }
     store.openSelectedHistoryConversation()
     #expect(store.draft == "Draft for A")
     backend.emit(BridgeEvent(
@@ -292,7 +292,7 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForCondition { store.session.conversationId == "conv-a" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-a" }
 
     // Hiding the Panel while History is open abandons History and preserves active conversation & Draft.
     store.openHistory()
@@ -311,12 +311,12 @@ import Testing
     #expect(store.draft.isEmpty)
     #expect(backend.commands.last == ["type": "newChat"])
     backend.emit(BridgeEvent(type: "ready", conversationId: nil, messages: [], models: models, model: "gpt-6-luna"))
-    try await waitForCondition { store.session.conversationId == nil && store.session.phase == .ready }
+    try await waitForHistoryCondition { store.session.conversationId == nil && store.session.phase == .ready }
 
     // Switching back to Conversation B still has Draft for B intact.
     store.openHistory()
     backend.emit(BridgeEvent(type: "history", history: [entryA, entryB]))
-    try await waitForCondition { store.historyEntries.count == 2 }
+    try await waitForHistoryCondition { store.historyEntries.count == 2 }
     store.moveHistorySelection(1)
     store.openSelectedHistoryConversation()
     #expect(store.draft == "Draft for B")
@@ -327,15 +327,15 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForCondition { store.session.conversationId == "conv-b" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-b" }
 
     // History stays usable after a fatal offline disconnect (stream does not finish on fatal).
     backend.emit(BridgeEvent(type: "fatal", message: "Codex stopped."))
-    try await waitForCondition { store.session.phase == .offline }
+    try await waitForHistoryCondition { store.session.phase == .offline }
     store.openHistory()
     #expect(store.showingHistory)
     backend.emit(BridgeEvent(type: "history", history: [entryA]))
-    try await waitForCondition { store.historyEntries == [entryA] }
+    try await waitForHistoryCondition { store.historyEntries == [entryA] }
     store.openSelectedHistoryConversation()
     #expect(!store.showingHistory)
     #expect(store.draft == "Draft for A")
@@ -347,7 +347,7 @@ import Testing
         model: "gpt-6-luna",
         notice: "Offline · Codex stopped."
     ))
-    try await waitForCondition { store.session.conversationId == "conv-a" && store.session.phase == .offline }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-a" && store.session.phase == .offline }
 
     store.stop()
 }
@@ -539,7 +539,7 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForCondition { store.session.phase == .ready }
+    try await waitForHistoryCondition { store.session.phase == .ready }
     store.draft = "Unsent draft for active chat"
 
     // Opening History bumps historyFocusToken and clears any prior query.
@@ -569,7 +569,7 @@ import Testing
     )
     backend.emit(BridgeEvent(type: "history", history: [staleEntry], query: "alf"))
     backend.emit(BridgeEvent(type: "history", history: [matchedActive], query: "alfama"))
-    try await waitForCondition { store.historyEntries == [matchedActive] }
+    try await waitForHistoryCondition { store.historyEntries == [matchedActive] }
     #expect(store.historyEntries.map(\.id) == ["conv-a"])
 
     // Pressing Esc (closeHistory) while query text is present immediately closes History in one action,
@@ -596,7 +596,7 @@ import Testing
     // closes History, preserves its draft, sends scrollToMessageId, and updates session.scrollTargetMessageId!
     store.updateHistoryQuery("alfama")
     backend.emit(BridgeEvent(type: "history", history: [matchedActive], query: "alfama"))
-    try await waitForCondition { store.historyEntries == [matchedActive] }
+    try await waitForHistoryCondition { store.historyEntries == [matchedActive] }
     let transcriptBeforeReselect = store.session.transcriptID
     store.openSelectedHistoryConversation()
     #expect(!store.showingHistory)
@@ -611,14 +611,14 @@ import Testing
         model: "gpt-6-luna",
         scrollToMessageId: "a-m2"
     ))
-    try await waitForCondition { store.session.transcriptID != transcriptBeforeReselect }
+    try await waitForHistoryCondition { store.session.transcriptID != transcriptBeforeReselect }
     #expect(store.session.scrollTargetMessageId == "a-m2")
 
     // Opening a conversation when the search bar is empty omits scrollToMessageId and scrolls to bottom.
     let emptyQueryEntry = HistoryEntry(id: "conv-b", title: "Other chat", updatedAt: "2026-04-01T10:00:00.000Z", preview: "Latest", model: "gpt-6-luna", messageCount: 1)
     store.openHistory()
     backend.emit(BridgeEvent(type: "history", history: [emptyQueryEntry], query: ""))
-    try await waitForCondition { store.historyEntries == [emptyQueryEntry] }
+    try await waitForHistoryCondition { store.historyEntries == [emptyQueryEntry] }
     store.openSelectedHistoryConversation()
     #expect(backend.commands.last == ["type": "openConversation", "conversationId": "conv-b"])
     #expect(store.followBottom)
@@ -629,45 +629,87 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForCondition { store.session.conversationId == "conv-b" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-b" }
     #expect(store.session.scrollTargetMessageId == nil)
 
     store.stop()
 }
 
 @MainActor
-private func waitForCondition(timeout: Duration = .seconds(2), _ predicate: () -> Bool) async throws {
-    let deadline = ContinuousClock.now + timeout
-    while !predicate(), ContinuousClock.now < deadline {
-        try await Task.sleep(for: .milliseconds(5))
-    }
-    #expect(predicate())
-}
+@Test func chatStoreClearsScrollTargetWhenAbandoningHistory() async throws {
+    let backend = RecordingHistoryBackend()
+    let store = ChatStore { backend }
+    store.connect()
 
-private final class RecordingHistoryBackend: ChatBackend, @unchecked Sendable {
-    private let lock = NSLock()
-    private var sink: (@Sendable (BridgeEvent) -> Void)?
-    private var recorded = [[String: String]]()
+    let models = [ChatModel(model: "gpt-6-luna", displayName: "GPT-6 Luna", provider: "openai")]
+    let messages = [
+        ChatMessage(id: "m1", role: "user", text: "Plan Lisbon"),
+        ChatMessage(id: "m2", role: "assistant", text: "Ride Tram 28 through Alfama."),
+        ChatMessage(id: "m3", role: "assistant", text: "Enjoy coastal seafood."),
+    ]
+    backend.emit(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-a",
+        messages: messages,
+        models: models,
+        model: "gpt-6-luna",
+        scrollToMessageId: "m2"
+    ))
+    try await waitForHistoryCondition { store.session.scrollTargetMessageId == "m2" }
 
-    var commands: [[String: String]] { lock.withLock { recorded } }
+    // Opening and abandoning History must not leave a stale scrollTargetMessageId
+    // that would re-jump the remounted transcript back to the old search hit.
+    store.openHistory()
+    #expect(store.showingHistory)
+    #expect(store.session.scrollTargetMessageId == nil)
 
-    func start(codexOverride: String, options: ChatClientOptions, onEvent: @escaping @Sendable (BridgeEvent) -> Void) {
-        lock.withLock { sink = onEvent }
-    }
+    store.closeHistory()
+    #expect(!store.showingHistory)
+    #expect(store.session.scrollTargetMessageId == nil)
 
-    func send(_ command: [String: String]) {
-        lock.withLock { recorded.append(command) }
-    }
+    // Consuming a scroll target (as transcript .task does) returns it once and clears it.
+    backend.emit(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-a",
+        messages: messages,
+        models: models,
+        model: "gpt-6-luna",
+        scrollToMessageId: "m2"
+    ))
+    try await waitForHistoryCondition { store.session.scrollTargetMessageId == "m2" }
+    #expect(store.consumeScrollTarget() == "m2")
+    #expect(store.session.scrollTargetMessageId == nil)
+    #expect(store.consumeScrollTarget() == nil)
 
-    func close(completion: (@Sendable () -> Void)?) {
-        lock.withLock { sink = nil }
-        completion?()
-    }
+    // Clearing explicitly (as clicking Latest does) clears it without requiring a History round-trip.
+    backend.emit(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-a",
+        messages: messages,
+        models: models,
+        model: "gpt-6-luna",
+        scrollToMessageId: "m1"
+    ))
+    try await waitForHistoryCondition { store.session.scrollTargetMessageId == "m1" }
+    store.clearScrollTarget()
+    #expect(store.session.scrollTargetMessageId == nil)
 
-    func emit(_ event: BridgeEvent) {
-        let sink = lock.withLock { self.sink }
-        sink?(event)
-    }
+    // Abandoning History via panel hide() also keeps scrollTargetMessageId cleared.
+    backend.emit(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-a",
+        messages: messages,
+        models: models,
+        model: "gpt-6-luna",
+        scrollToMessageId: "m2"
+    ))
+    try await waitForHistoryCondition { store.session.scrollTargetMessageId == "m2" }
+    store.openHistory()
+    store.hide()
+    #expect(!store.showingHistory)
+    #expect(store.session.scrollTargetMessageId == nil)
+
+    store.stop()
 }
 
 @MainActor

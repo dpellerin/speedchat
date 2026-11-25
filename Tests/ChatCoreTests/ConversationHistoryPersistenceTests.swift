@@ -7,31 +7,6 @@ private func posixPermissions(at url: URL) throws -> Int {
     return ((attrs[.posixPermissions] as? NSNumber)?.intValue ?? 0) & 0o777
 }
 
-private func completeCodexTurn(
-    rpc: FakeCodexTransport,
-    threadId: String,
-    turnId: String = "turn-1",
-    userMessageId: String,
-    userText: String,
-    replyId: String,
-    replyText: String
-) {
-    rpc.onNotification?(CodexNotification(method: "item/started", params: [
-        "threadId": threadId, "turnId": turnId,
-        "item": [
-            "id": "codex-user-\(userMessageId)", "type": "userMessage", "clientId": userMessageId,
-            "content": [["type": "text", "text": userText]],
-        ],
-    ]))
-    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
-        "threadId": threadId, "turnId": turnId,
-        "item": ["id": replyId, "type": "agentMessage", "text": replyText],
-    ]))
-    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
-        "threadId": threadId, "turn": ["id": turnId, "status": "completed"],
-    ]))
-}
-
 @Test func newChatPreservesPriorConversationWithPrivatePermissionsAndSkipsBlankChats() async throws {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("history-persist-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: dir) }
@@ -57,7 +32,7 @@ private func completeCodexTurn(
 
     // First real conversation.
     try await client.send("Can you please help me plan a weekend trip to Lisbon?", userMessageId: "u1")
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: blank2.threadId,
         userMessageId: "u1", userText: "Can you please help me plan a weekend trip to Lisbon?",
         replyId: "a1", replyText: "Start in Alfama and ride Tram 28."
@@ -79,7 +54,7 @@ private func completeCodexTurn(
 
     // Second real conversation persists individually alongside the first.
     try await client.send("Explain Swift structured concurrency", userMessageId: "u2")
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: afterNewChat.threadId,
         userMessageId: "u2", userText: "Explain Swift structured concurrency",
         replyId: "a2", replyText: "Task groups bind child task lifetimes to a lexical scope."
@@ -274,7 +249,7 @@ private func completeCodexTurn(
     let handoffTurn = try #require(codexRPC.calls.last { $0.method == "turn/start" })
     let handoffThreadId = try #require(handoffTurn.params["threadId"] as? String)
     let handoffWireText = try #require((handoffTurn.params["input"] as? [[String: Any]])?.first?["text"] as? String)
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: codexRPC, threadId: handoffThreadId,
         userMessageId: "u2", userText: handoffWireText,
         replyId: "a2", replyText: "You asked me to remember the lighthouse."
@@ -308,7 +283,7 @@ private func completeCodexTurn(
     let replacementWireText = try #require((replacementTurn.params["input"] as? [[String: Any]])?.first?["text"] as? String)
     #expect(replacementWireText.contains("Remember the lighthouse."))
     #expect(!replacementWireText.contains("private beam note"))
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: codexRPC, threadId: replacementThreadId,
         userMessageId: "u3", userText: replacementWireText,
         replyId: "a3", replyText: "Lighthouse and harbor remembered."
@@ -342,7 +317,7 @@ private func completeCodexTurn(
     // Conversation 1: one completed exchange (codexSyncedCount = 2), then an unconfirmed send.
     let firstReady = try await client.connect()
     try await client.send("First conversation prompt", userMessageId: "c1-u1")
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: firstReady.threadId,
         userMessageId: "c1-u1", userText: "First conversation prompt",
         replyId: "c1-a1", replyText: "First reply"
@@ -362,7 +337,7 @@ private func completeCodexTurn(
     #expect(secondReady.conversationId == nil)
     #expect(secondReady.codexRetry == nil)
     try await client.send("Second conversation prompt", userMessageId: "c2-u1")
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: secondReady.threadId,
         userMessageId: "c2-u1", userText: "Second conversation prompt",
         replyId: "c2-a1", replyText: "Second reply"
@@ -389,23 +364,6 @@ private func completeCodexTurn(
     await client.close()
 }
 
-private final class TestClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var current: Date
-
-    init(_ start: Date) {
-        self.current = start
-    }
-
-    func now() -> Date {
-        lock.withLock { current }
-    }
-
-    func advance(by seconds: TimeInterval) {
-        lock.withLock { current = current.addingTimeInterval(seconds) }
-    }
-}
-
 @Test func updatedAtChangesOnlyOnMessageActivityAndNotOnReopenOrModelSelection() async throws {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("history-updated-at-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: dir) }
@@ -415,7 +373,7 @@ private final class TestClock: @unchecked Sendable {
     try OpenRouterClient.saveConfig(key: "test-or-key", to: configURL)
 
     let baseDate = Date(timeIntervalSince1970: 1_777_629_600) // 2026-05-01T10:00:00Z
-    let clock = TestClock(baseDate)
+    let clock = HistoryTestClock(baseDate)
     let (heldReply, heldSink) = AsyncThrowingStream<String, Error>.makeStream()
     defer { heldSink.finish() }
 
@@ -431,7 +389,7 @@ private final class TestClock: @unchecked Sendable {
     let client = ChatClient(rpc: rpc, options: options)
     let ready = try await client.connect()
     try await client.send("Initial question", userMessageId: "u1")
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: ready.threadId,
         userMessageId: "u1", userText: "Initial question",
         replyId: "a1", replyText: "Initial answer"
@@ -514,7 +472,7 @@ private final class TestClock: @unchecked Sendable {
     let routerModel = OpenRouterClient.defaultModels[0].model
     try OpenRouterClient.saveConfig(key: "test-or-key", to: configURL)
 
-    let clock = TestClock(Date(timeIntervalSince1970: 1_777_629_600))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_777_629_600))
     let options = ChatClientOptions(
         openRouterConfigURL: configURL,
         stateURL: stateURL,
@@ -526,7 +484,7 @@ private final class TestClock: @unchecked Sendable {
     let client = ChatClient(rpc: rpc, options: options)
     let firstReady = try await client.connect()
     try await client.send("First topic about sourdough", userMessageId: "c1-u1")
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: firstReady.threadId,
         userMessageId: "c1-u1", userText: "First topic about sourdough",
         replyId: "c1-a1", replyText: "Feed your starter twice daily."
@@ -536,7 +494,7 @@ private final class TestClock: @unchecked Sendable {
     clock.advance(by: 60)
     let secondReady = try await client.newChat()
     try await client.send("Second topic about hiking boots", userMessageId: "c2-u1")
-    completeCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: secondReady.threadId,
         userMessageId: "c2-u1", userText: "Second topic about hiking boots",
         replyId: "c2-a1", replyText: "Break them in on short trails first."

@@ -162,7 +162,7 @@ import Testing
 
 @MainActor
 @Test func chatStoreConfirmsCancelsDeletesPreservesSearchAndTransitionsDeletedActiveToBlankNewChat() async throws {
-    let backend = RecordingDeleteBackend()
+    let backend = RecordingHistoryBackend()
     let store = ChatStore { backend }
     store.shouldFocusComposer = { true }
     var historyChangedCount = 0
@@ -180,13 +180,13 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForDeleteCondition { store.session.conversationId == "conv-b" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-b" }
     store.draft = "Draft for B"
 
     // Switch to conv-a so conv-b has an in-memory draft saved.
     store.openHistory()
     backend.emit(BridgeEvent(type: "history", history: [entryA, entryB]))
-    try await waitForDeleteCondition { store.historyEntries.count == 2 }
+    try await waitForHistoryCondition { store.historyEntries.count == 2 }
     store.openSelectedHistoryConversation()
     backend.emit(BridgeEvent(
         type: "ready",
@@ -195,7 +195,7 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForDeleteCondition { store.session.conversationId == "conv-a" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-a" }
     store.draft = "Draft for A"
 
     // Requesting delete when History is closed does nothing.
@@ -206,7 +206,7 @@ import Testing
     store.openHistory()
     store.updateHistoryQuery("tram")
     backend.emit(BridgeEvent(type: "history", history: [entryA, entryB], query: "tram"))
-    try await waitForDeleteCondition { store.historyEntries.count == 2 }
+    try await waitForHistoryCondition { store.historyEntries.count == 2 }
     store.moveHistorySelection(1)
 
     let commandsBeforePrompt = backend.commands.count
@@ -236,7 +236,7 @@ import Testing
     #expect(backend.commands.last == ["type": "deleteConversation", "conversationId": "conv-b", "query": "tram"])
 
     backend.emit(BridgeEvent(type: "history", history: [entryA], clearedActiveConversation: false, query: "tram"))
-    try await waitForDeleteCondition { store.historyEntries == [entryA] }
+    try await waitForHistoryCondition { store.historyEntries == [entryA] }
     #expect(store.selectedHistoryIndex == 0)
     #expect(store.historyQuery == "tram")
     #expect(store.session.conversationId == "conv-a")
@@ -246,7 +246,7 @@ import Testing
     // Clear search, then delete the CURRENTLY ACTIVE conversation (conv-a, the last remaining saved conversation).
     store.clearHistoryQuery()
     backend.emit(BridgeEvent(type: "history", history: [entryA], query: ""))
-    try await waitForDeleteCondition { store.historyQuery.isEmpty && store.historyEntries == [entryA] }
+    try await waitForHistoryCondition { store.historyQuery.isEmpty && store.historyEntries == [entryA] }
 
     let changedBeforeDeleteA = historyChangedCount
     #expect(store.requestDeleteSelectedHistoryConversation())
@@ -265,7 +265,7 @@ import Testing
         clearedActiveConversation: true
     ))
     backend.emit(BridgeEvent(type: "history", history: [], clearedActiveConversation: true, query: ""))
-    try await waitForDeleteCondition { store.historyEntries.isEmpty && store.session.conversationId == nil }
+    try await waitForHistoryCondition { store.historyEntries.isEmpty && store.session.conversationId == nil }
     #expect(!store.hasActiveHistoryQuery)
     #expect(historyChangedCount > changedBeforeDeleteA)
     // Pressing ⌘⌫ when History is empty does nothing and returns false.
@@ -289,12 +289,12 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitForDeleteCondition { store.session.conversationId == "conv-c" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-c" }
     store.draft = "Unsent draft C"
     let entryC = HistoryEntry(id: "conv-c", title: "Active chat C", updatedAt: "2026-05-15T10:00:00.000Z", preview: "Active chat C", model: "gpt-6-luna", messageCount: 1)
     store.openHistory()
     backend.emit(BridgeEvent(type: "history", history: [entryC]))
-    try await waitForDeleteCondition { store.historyEntries == [entryC] }
+    try await waitForHistoryCondition { store.historyEntries == [entryC] }
     store.requestDeleteHistoryConversation(entryC)
     store.confirmDeleteHistoryConversation()
     // Immediately hide Panel before backend emits ready -> must transition cleanly to blank New Chat!
@@ -367,39 +367,4 @@ import Testing
     #expect(store.session.conversationId == nil)
     #expect(store.session.messages.isEmpty)
     #expect(store.draft.isEmpty)
-}
-
-@MainActor
-private func waitForDeleteCondition(timeout: Duration = .seconds(2), _ predicate: () -> Bool) async throws {
-    let deadline = ContinuousClock.now + timeout
-    while !predicate(), ContinuousClock.now < deadline {
-        try await Task.sleep(for: .milliseconds(5))
-    }
-    #expect(predicate())
-}
-
-private final class RecordingDeleteBackend: ChatBackend, @unchecked Sendable {
-    private let lock = NSLock()
-    private var sink: (@Sendable (BridgeEvent) -> Void)?
-    private var recorded = [[String: String]]()
-
-    var commands: [[String: String]] { lock.withLock { recorded } }
-
-    func start(codexOverride: String, options: ChatClientOptions, onEvent: @escaping @Sendable (BridgeEvent) -> Void) {
-        lock.withLock { sink = onEvent }
-    }
-
-    func send(_ command: [String: String]) {
-        lock.withLock { recorded.append(command) }
-    }
-
-    func close(completion: (@Sendable () -> Void)?) {
-        lock.withLock { sink = nil }
-        completion?()
-    }
-
-    func emit(_ event: BridgeEvent) {
-        let sink = lock.withLock { self.sink }
-        sink?(event)
-    }
 }

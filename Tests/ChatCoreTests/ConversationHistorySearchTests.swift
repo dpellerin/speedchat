@@ -306,6 +306,31 @@ private func extractedMatches(in text: String, ranges: [HistoryMatchRange]) -> [
     let startedNewChat = session.beginNewChat()
     #expect(startedNewChat)
     #expect(session.scrollTargetMessageId == nil)
+
+    // Consuming a scroll target returns it once and clears it so a remounted transcript cannot re-jump.
+    session.receive(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-a",
+        messages: messages,
+        models: models,
+        model: "gpt-6-luna",
+        scrollToMessageId: "m2"
+    ))
+    #expect(session.consumeScrollTarget() == "m2")
+    #expect(session.scrollTargetMessageId == nil)
+    #expect(session.consumeScrollTarget() == nil)
+
+    // Clearing a scroll target explicitly (e.g. clicking Latest or opening History) clears it.
+    session.receive(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-a",
+        messages: messages,
+        models: models,
+        model: "gpt-6-luna",
+        scrollToMessageId: "m1"
+    ))
+    session.clearScrollTarget()
+    #expect(session.scrollTargetMessageId == nil)
 }
 
 

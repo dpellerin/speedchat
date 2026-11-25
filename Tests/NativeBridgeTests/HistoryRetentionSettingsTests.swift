@@ -121,7 +121,7 @@ import Testing
 
 @MainActor
 @Test func chatStorePassesRetentionToBackendAndResetsPanelDraftAndHistoryWhenActiveRemoved() async throws {
-    let backend = RecordingRetentionBackend()
+    let backend = RecordingHistoryBackend()
     let store = ChatStore { backend }
     store.historyRetention = .days90
 
@@ -139,11 +139,11 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitUntil { store.session.conversationId == "conv-fresh" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-fresh" }
     store.draft = "Draft for fresh"
     store.openHistory()
     backend.emit(BridgeEvent(type: "history", history: [entryFresh, entryOld]))
-    try await waitUntil { store.historyEntries.count == 2 }
+    try await waitForHistoryCondition { store.historyEntries.count == 2 }
 
     // 1. Pruning removes ONLY conv-old (active conv-fresh survives):
     // History view updates, active conversation and draft remain untouched.
@@ -151,7 +151,7 @@ import Testing
     #expect(store.historyRetention == .days7)
     #expect(backend.commands.last == ["type": "applyRetention", "retention": "7d"])
     backend.emit(BridgeEvent(type: "history", history: [entryFresh], clearedActiveConversation: false))
-    try await waitUntil { store.historyEntries.map(\.id) == ["conv-fresh"] }
+    try await waitForHistoryCondition { store.historyEntries.map(\.id) == ["conv-fresh"] }
     #expect(store.showingHistory)
     #expect(store.session.conversationId == "conv-fresh")
     #expect(store.draft == "Draft for fresh")
@@ -170,7 +170,7 @@ import Testing
         clearedActiveConversation: true
     ))
     backend.emit(BridgeEvent(type: "history", history: [], clearedActiveConversation: true))
-    try await waitUntil { store.session.conversationId == nil && store.historyEntries.isEmpty }
+    try await waitForHistoryCondition { store.session.conversationId == nil && store.historyEntries.isEmpty }
     #expect(store.session.messages.isEmpty)
     #expect(store.draft.isEmpty)
     #expect(store.showingHistory)
@@ -186,7 +186,7 @@ import Testing
 
 @MainActor
 @Test func applyRetentionAndClearHistoryRespectActiveHistorySearchQuery() async throws {
-    let backend = RecordingRetentionBackend()
+    let backend = RecordingHistoryBackend()
     let store = ChatStore { backend }
     store.connect()
 
@@ -198,7 +198,7 @@ import Testing
         models: models,
         model: "gpt-6-luna"
     ))
-    try await waitUntil { store.session.conversationId == "conv-fresh" }
+    try await waitForHistoryCondition { store.session.conversationId == "conv-fresh" }
 
     store.openHistory()
     store.updateHistoryQuery("alfama")
@@ -223,20 +223,20 @@ import Testing
         firstMatchingMessageId: "f-u1"
     )
     backend.emit(BridgeEvent(type: "history", history: [matchedFresh, matchedOld], query: "alfama"))
-    try await waitUntil { store.historyEntries.count == 2 }
+    try await waitForHistoryCondition { store.historyEntries.count == 2 }
 
     // Pruning while a search query is active forwards the active query and updates filtered results.
     store.applyHistoryRetention(.days7)
     #expect(backend.commands.last == ["type": "applyRetention", "retention": "7d", "query": "alfama"])
     backend.emit(BridgeEvent(type: "history", history: [matchedFresh], clearedActiveConversation: false, query: "alfama"))
-    try await waitUntil { store.historyEntries == [matchedFresh] }
+    try await waitForHistoryCondition { store.historyEntries == [matchedFresh] }
     #expect(store.historyQuery == "alfama")
 
     // Clear All empties History even while a non-empty search query is active.
     store.clearAllHistory()
     #expect(backend.commands.last == ["type": "clearHistory"])
     backend.emit(BridgeEvent(type: "history", history: [], clearedActiveConversation: true))
-    try await waitUntil { store.historyEntries.isEmpty }
+    try await waitForHistoryCondition { store.historyEntries.isEmpty }
 
     store.stop()
 }
@@ -366,45 +366,5 @@ import Testing
 
     await withCheckedContinuation { cont in
         bridge.close { cont.resume() }
-    }
-}
-
-@MainActor
-private func waitUntil(timeout: Duration = .seconds(2), _ predicate: () -> Bool) async throws {
-    let deadline = ContinuousClock.now + timeout
-    while !predicate(), ContinuousClock.now < deadline {
-        try await Task.sleep(for: .milliseconds(5))
-    }
-    #expect(predicate())
-}
-
-private final class RecordingRetentionBackend: ChatBackend, @unchecked Sendable {
-    private let lock = NSLock()
-    private var sink: (@Sendable (BridgeEvent) -> Void)?
-    private var recorded = [[String: String]]()
-    private var capturedOptions: ChatClientOptions?
-
-    var commands: [[String: String]] { lock.withLock { recorded } }
-    var startedOptions: ChatClientOptions? { lock.withLock { capturedOptions } }
-
-    func start(codexOverride: String, options: ChatClientOptions, onEvent: @escaping @Sendable (BridgeEvent) -> Void) {
-        lock.withLock {
-            capturedOptions = options
-            sink = onEvent
-        }
-    }
-
-    func send(_ command: [String: String]) {
-        lock.withLock { recorded.append(command) }
-    }
-
-    func close(completion: (@Sendable () -> Void)?) {
-        lock.withLock { sink = nil }
-        completion?()
-    }
-
-    func emit(_ event: BridgeEvent) {
-        let sink = lock.withLock { self.sink }
-        sink?(event)
     }
 }

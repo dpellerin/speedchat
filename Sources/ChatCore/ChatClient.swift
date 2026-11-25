@@ -220,14 +220,54 @@ public final class ChatClient: @unchecked Sendable {
         }
     }
 
-    private func resetToBlankConversationLocked(now: Date) -> ReadyState {
-        checkedCodexSendId = nil
-        undispatchedCodexMessage = nil
-        uncheckedCodexReply = nil
+    private static func busyError() -> NSError {
+        NSError(domain: "SpeedChat.Client", code: 4, userInfo: [
+            NSLocalizedDescriptionKey: "Wait for the current response or change to finish.",
+        ])
+    }
+
+    private func ensureIdleLocked() throws {
+        if activeExecution != nil || mutationPending {
+            throw Self.busyError()
+        }
+    }
+
+    private func resetCitationStateLocked() {
         citationSources.removeAll()
         citationOrder.removeAll()
         citationStream.reset()
         linkStream.reset()
+    }
+
+    private func resetTransientTurnStateLocked() {
+        checkedCodexSendId = nil
+        undispatchedCodexMessage = nil
+        uncheckedCodexReply = nil
+        resetCitationStateLocked()
+    }
+
+    private func finishHistoryMutationLocked(
+        removedCount: Int,
+        activeRemoved: Bool,
+        now: Date
+    ) -> HistoryMutationResult {
+        guard activeRemoved else {
+            return HistoryMutationResult(
+                removedCount: removedCount,
+                clearedActiveConversation: false,
+                readyState: nil
+            )
+        }
+        let ready = resetToBlankConversationLocked(now: now)
+        return HistoryMutationResult(
+            removedCount: removedCount,
+            clearedActiveConversation: true,
+            readyState: ready
+        )
+    }
+
+    private func resetToBlankConversationLocked(now: Date) -> ReadyState {
+        resetTransientTurnStateLocked()
 
         let target = options.stateURL ?? StateStore.stateURL(env: options.env)
         let offlineReason = models.isEmpty ? (lastOfflineReason ?? "Codex is offline.") : nil
@@ -265,9 +305,7 @@ public final class ChatClient: @unchecked Sendable {
             if activeExecution != nil || mutationPending {
                 let expired = StateStore.countExpiredConversations(retention: policy, now: now, stateURL: target, env: options.env)
                 if expired > 0 {
-                    throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [
-                        NSLocalizedDescriptionKey: "Wait for the current response or change to finish.",
-                    ])
+                    throw Self.busyError()
                 }
                 retention = policy
                 return HistoryMutationResult(removedCount: 0, clearedActiveConversation: false, readyState: nil)
@@ -275,18 +313,10 @@ public final class ChatClient: @unchecked Sendable {
             retention = policy
             let pruned = try StateStore.pruneExpiredConversations(retention: policy, now: now, stateURL: target, env: options.env)
             let activeRemoved = conversation.conversationId.map { pruned.removedIds.contains($0) } ?? false
-            if activeRemoved {
-                let ready = resetToBlankConversationLocked(now: now)
-                return HistoryMutationResult(
-                    removedCount: pruned.removedIds.count,
-                    clearedActiveConversation: true,
-                    readyState: ready
-                )
-            }
-            return HistoryMutationResult(
+            return finishHistoryMutationLocked(
                 removedCount: pruned.removedIds.count,
-                clearedActiveConversation: false,
-                readyState: nil
+                activeRemoved: activeRemoved,
+                now: now
             )
         }
     }
@@ -294,27 +324,15 @@ public final class ChatClient: @unchecked Sendable {
     public func clearHistory() throws -> HistoryMutationResult {
         try sync {
             try requireOpen()
-            if activeExecution != nil || mutationPending {
-                throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [
-                    NSLocalizedDescriptionKey: "Wait for the current response or change to finish.",
-                ])
-            }
+            try ensureIdleLocked()
             let now = options.now()
             let target = options.stateURL ?? StateStore.stateURL(env: options.env)
             let cleared = try StateStore.clearAllConversations(now: now, stateURL: target, env: options.env)
             let activeRemoved = conversation.conversationId != nil || !conversation.messages.isEmpty
-            if activeRemoved {
-                let ready = resetToBlankConversationLocked(now: now)
-                return HistoryMutationResult(
-                    removedCount: cleared.removedIds.count,
-                    clearedActiveConversation: true,
-                    readyState: ready
-                )
-            }
-            return HistoryMutationResult(
+            return finishHistoryMutationLocked(
                 removedCount: cleared.removedIds.count,
-                clearedActiveConversation: false,
-                readyState: nil
+                activeRemoved: activeRemoved,
+                now: now
             )
         }
     }
@@ -322,27 +340,15 @@ public final class ChatClient: @unchecked Sendable {
     public func deleteConversation(id: String) throws -> HistoryMutationResult {
         try sync {
             try requireOpen()
-            if activeExecution != nil || mutationPending {
-                throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [
-                    NSLocalizedDescriptionKey: "Wait for the current response or change to finish.",
-                ])
-            }
+            try ensureIdleLocked()
             let now = options.now()
             let target = options.stateURL ?? StateStore.stateURL(env: options.env)
             let deleted = try StateStore.deleteConversation(id: id, now: now, stateURL: target, env: options.env)
             let activeRemoved = conversation.conversationId == id
-            if activeRemoved {
-                let ready = resetToBlankConversationLocked(now: now)
-                return HistoryMutationResult(
-                    removedCount: deleted.removed ? 1 : 0,
-                    clearedActiveConversation: true,
-                    readyState: ready
-                )
-            }
-            return HistoryMutationResult(
+            return finishHistoryMutationLocked(
                 removedCount: deleted.removed ? 1 : 0,
-                clearedActiveConversation: false,
-                readyState: nil
+                activeRemoved: activeRemoved,
+                now: now
             )
         }
     }
@@ -350,23 +356,13 @@ public final class ChatClient: @unchecked Sendable {
     public func openConversation(id: String) throws -> ReadyState {
         try sync {
             try requireOpen()
-            if activeExecution != nil || mutationPending {
-                throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [
-                    NSLocalizedDescriptionKey: "Wait for the current response or change to finish.",
-                ])
-            }
+            try ensureIdleLocked()
             guard let saved = StateStore.loadConversation(id: id, stateURL: options.stateURL, env: options.env) else {
                 throw NSError(domain: "SpeedChat.Client", code: 13, userInfo: [
                     NSLocalizedDescriptionKey: "That saved conversation is no longer available.",
                 ])
             }
-            checkedCodexSendId = nil
-            undispatchedCodexMessage = nil
-            uncheckedCodexReply = nil
-            citationSources.removeAll()
-            citationOrder.removeAll()
-            citationStream.reset()
-            linkStream.reset()
+            resetTransientTurnStateLocked()
 
             conversation = ConversationContinuity(restoring: saved)
             if models.isEmpty {
@@ -824,9 +820,7 @@ public final class ChatClient: @unchecked Sendable {
     public func newChat() async throws -> ReadyState {
         let (isCodexUp, codexModel, cwdPath) = try sync { () -> (Bool, String, String) in
             try requireOpen()
-            if activeExecution != nil || mutationPending {
-                throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [NSLocalizedDescriptionKey: "Wait for the current response or change to finish."])
-            }
+            try ensureIdleLocked()
             mutationPending = true
             return (codexAvailable, codexModelForSelection(), runtimeDir?.path ?? "")
         }
@@ -844,9 +838,7 @@ public final class ChatClient: @unchecked Sendable {
         let ready = try sync {
             try requireOpen()
             conversation = ConversationContinuity(thread: thread, titleNeeded: isCodexUp)
-            checkedCodexSendId = nil
-            undispatchedCodexMessage = nil
-            uncheckedCodexReply = nil
+            resetTransientTurnStateLocked()
             saveCurrentState(touchActivity: false)
             return readyStateLocked(resumed: false)
         }
@@ -859,9 +851,7 @@ public final class ChatClient: @unchecked Sendable {
     public func selectModel(_ candidate: String) async throws -> ReadyState {
         let (currentThread, shouldUpdateCodex) = try sync { () -> (String, Bool) in
             try requireOpen()
-            if activeExecution != nil || mutationPending {
-                throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [NSLocalizedDescriptionKey: "Wait for the current response or change to finish."])
-            }
+            try ensureIdleLocked()
             guard models.contains(where: { $0.model == candidate }) else {
                 throw NSError(domain: "SpeedChat.Client", code: 5, userInfo: [NSLocalizedDescriptionKey: "Selected model is unavailable."])
             }
@@ -1084,9 +1074,7 @@ public final class ChatClient: @unchecked Sendable {
 
     private func threadForNewTurn() throws -> ConversationContinuity.Thread {
         try requireOpen()
-        guard !busy else {
-            throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [NSLocalizedDescriptionKey: "Wait for the current response or change to finish."])
-        }
+        try ensureIdleLocked()
         guard let thread = conversation.thread else {
             throw NSError(domain: "SpeedChat.Client", code: 6, userInfo: [NSLocalizedDescriptionKey: "Chat is not ready."])
         }
@@ -1095,10 +1083,7 @@ public final class ChatClient: @unchecked Sendable {
 
     private func beginTurn(_ execution: ActiveExecution) {
         activeExecution = execution
-        citationSources.removeAll()
-        citationOrder.removeAll()
-        citationStream.reset()
-        linkStream.reset()
+        resetCitationStateLocked()
     }
 
     /// Register a Send before scheduling provider work, so Stop can settle it immediately.

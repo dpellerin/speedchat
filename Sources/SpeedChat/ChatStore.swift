@@ -180,8 +180,18 @@ import ChatCore
   }
   blankDraft="";draft="";showingHistory=false;historyQuery="";pendingDeleteEntry=nil;activeConversationDeletedInHistory=false;followBottom=true;command(["type":"newChat"])
  }
+ func clearScrollTarget() {
+  guard session.scrollTargetMessageId != nil else {return}
+  session.clearScrollTarget()
+ }
+ @discardableResult
+ func consumeScrollTarget() -> String? {
+  guard session.scrollTargetMessageId != nil else {return nil}
+  return session.consumeScrollTarget()
+ }
  func openHistory() {
   guard session.canOpenHistory else {return}
+  clearScrollTarget()
   showingHistory=true
   historyQuery=""
   pendingDeleteEntry=nil
@@ -258,6 +268,19 @@ import ChatCore
   pendingDeleteEntry=nil
   if showingHistory {historyFocusToken += 1}
  }
+ private func performOfflineHistoryMutation(
+  reloadHistory:Bool=true,
+  _ mutate:() throws -> Bool
+ ) {
+  guard let activeRemoved=try? mutate() else {return}
+  if activeRemoved {
+   receive(BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true))
+  }
+  let entries=reloadHistory
+   ? ConversationHistory.search(StateStore.loadConversations(stateURL:stateURL,env:environment),query:historyQuery)
+   : []
+  receive(BridgeEvent(type:"history",history:entries,clearedActiveConversation:activeRemoved,query:reloadHistory ? historyQuery : nil))
+ }
  func confirmDeleteHistoryConversation() {
   guard let entry=pendingDeleteEntry else {return}
   pendingDeleteEntry=nil
@@ -271,13 +294,11 @@ import ChatCore
    var cmd=["type":"deleteConversation","conversationId":entry.id]
    if !historyQuery.isEmpty {cmd["query"]=historyQuery}
    command(cmd)
-  } else if let deleted=try? StateStore.deleteConversation(id:entry.id,now:now(),stateURL:stateURL,env:environment) {
-   let remaining=ConversationHistory.search(StateStore.loadConversations(stateURL:stateURL,env:environment),query:historyQuery)
-   let activeRemoved=deletingActive || deleted.removedActive
-   if activeRemoved {
-    receive(BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true))
+  } else {
+   performOfflineHistoryMutation {
+    let deleted=try StateStore.deleteConversation(id:entry.id,now:now(),stateURL:stateURL,env:environment)
+    return deletingActive || deleted.removedActive
    }
-   receive(BridgeEvent(type:"history",history:remaining,clearedActiveConversation:activeRemoved,query:historyQuery))
   }
   if showingHistory {historyFocusToken += 1}
  }
@@ -298,14 +319,12 @@ import ChatCore
    var cmd=["type":"applyRetention","retention":policy.rawValue]
    if !historyQuery.isEmpty {cmd["query"]=historyQuery}
    command(cmd)
-  } else if let pruned=try? StateStore.pruneExpiredConversations(retention:policy,now:now(),stateURL:stateURL,env:environment) {
-   for removedId in pruned.removedIds {draftsByConversation.removeValue(forKey:removedId)}
-   let remaining=ConversationHistory.search(StateStore.loadConversations(stateURL:stateURL,env:environment),query:historyQuery)
-   let activeRemoved=session.conversationId.map {pruned.removedIds.contains($0)} ?? false
-   if activeRemoved {
-    receive(BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true))
+  } else {
+   performOfflineHistoryMutation {
+    let pruned=try StateStore.pruneExpiredConversations(retention:policy,now:now(),stateURL:stateURL,env:environment)
+    for removedId in pruned.removedIds {draftsByConversation.removeValue(forKey:removedId)}
+    return session.conversationId.map {pruned.removedIds.contains($0)} ?? false
    }
-   receive(BridgeEvent(type:"history",history:remaining,clearedActiveConversation:activeRemoved,query:historyQuery))
   }
  }
  func clearAllHistory() {
@@ -314,12 +333,11 @@ import ChatCore
   draftsByConversation.removeAll()
   if bridge != nil || fixtureMode {
    command(["type":"clearHistory"])
-  } else if let cleared=try? StateStore.clearAllConversations(now:now(),stateURL:stateURL,env:environment) {
-   let activeRemoved=session.conversationId != nil || !session.messages.isEmpty || cleared.removedActive
-   if activeRemoved {
-    receive(BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true))
+  } else {
+   performOfflineHistoryMutation(reloadHistory:false) {
+    let cleared=try StateStore.clearAllConversations(now:now(),stateURL:stateURL,env:environment)
+    return session.conversationId != nil || !session.messages.isEmpty || cleared.removedActive
    }
-   receive(BridgeEvent(type:"history",history:[],clearedActiveConversation:activeRemoved))
   }
  }
  func selectModel(_ model:String) {guard session.beginModelChange(model) else {return};command(["type":"selectModel","model":model])}

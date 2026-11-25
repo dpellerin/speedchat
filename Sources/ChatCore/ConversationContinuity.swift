@@ -37,39 +37,57 @@ struct ConversationContinuity {
     }
 
     init(restoring saved: PersistedState) {
-        conversationId = saved.conversationId
-        createdAt = saved.createdAt
-        updatedAt = saved.updatedAt
-        if saved.threadId.isEmpty {
-            thread = nil
-        } else {
-            thread = saved.threadId.hasPrefix("openrouter-") ? .standalone(saved.threadId) : .detached(saved.threadId)
-        }
-        messages = saved.messages ?? []
-        codexSyncedCount = min(max(saved.codexSyncedCount ?? 0, 0), messages.count)
-        if let attempt = saved.lastCodexSend, attempt.threadId == saved.threadId,
-           userIndex(messageId: attempt.userMessageId) != nil {
-            lastCodexSend = attempt
-        }
-        needsLegacyHistory = saved.messages == nil
+        self.init(
+            conversationId: saved.conversationId,
+            createdAt: saved.createdAt,
+            updatedAt: saved.updatedAt,
+            threadId: saved.threadId,
+            messages: saved.messages ?? [],
+            codexSyncedCount: saved.codexSyncedCount ?? 0,
+            lastCodexSend: saved.lastCodexSend,
+            needsLegacyHistory: saved.messages == nil
+        )
     }
 
     init(restoring saved: SavedConversation) {
-        conversationId = saved.id
-        createdAt = saved.createdAt
-        updatedAt = saved.updatedAt
-        if saved.threadId.isEmpty {
-            thread = nil
-        } else {
-            thread = saved.threadId.hasPrefix("openrouter-") ? .standalone(saved.threadId) : .detached(saved.threadId)
-        }
-        messages = saved.messages
-        codexSyncedCount = min(max(saved.codexSyncedCount, 0), messages.count)
-        if let attempt = saved.lastCodexSend, attempt.threadId == saved.threadId,
+        self.init(
+            conversationId: saved.id,
+            createdAt: saved.createdAt,
+            updatedAt: saved.updatedAt,
+            threadId: saved.threadId,
+            messages: saved.messages,
+            codexSyncedCount: saved.codexSyncedCount,
+            lastCodexSend: saved.lastCodexSend,
+            needsLegacyHistory: false
+        )
+    }
+
+    private init(
+        conversationId: String?,
+        createdAt: String?,
+        updatedAt: String?,
+        threadId: String,
+        messages: [ChatMessage],
+        codexSyncedCount: Int,
+        lastCodexSend: CodexSendAttempt?,
+        needsLegacyHistory: Bool
+    ) {
+        self.conversationId = conversationId
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.thread = Self.restoredThread(for: threadId)
+        self.messages = messages
+        self.codexSyncedCount = min(max(codexSyncedCount, 0), messages.count)
+        self.needsLegacyHistory = needsLegacyHistory
+        if let attempt = lastCodexSend, attempt.threadId == threadId,
            userIndex(messageId: attempt.userMessageId) != nil {
-            lastCodexSend = attempt
+            self.lastCodexSend = attempt
         }
-        needsLegacyHistory = false
+    }
+
+    private static func restoredThread(for threadId: String) -> Thread? {
+        guard !threadId.isEmpty else { return nil }
+        return threadId.hasPrefix("openrouter-") ? .standalone(threadId) : .detached(threadId)
     }
 
     mutating func recordUndispatchedCodexPrompt(_ user: ChatMessage) {

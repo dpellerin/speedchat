@@ -2,55 +2,13 @@ import Foundation
 import Testing
 @testable import ChatCore
 
-private final class DeleteTestClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var current: Date
-
-    init(_ start: Date) {
-        current = start
-    }
-
-    func now() -> Date {
-        lock.withLock { current }
-    }
-
-    func advance(seconds: TimeInterval) {
-        lock.withLock { current = current.addingTimeInterval(seconds) }
-    }
-}
-
-private func completeDeleteCodexTurn(
-    rpc: FakeCodexTransport,
-    threadId: String,
-    turnId: String = "turn-1",
-    userMessageId: String,
-    userText: String,
-    replyId: String,
-    replyText: String
-) {
-    rpc.onNotification?(CodexNotification(method: "item/started", params: [
-        "threadId": threadId, "turnId": turnId,
-        "item": [
-            "id": "codex-user-\(userMessageId)", "type": "userMessage", "clientId": userMessageId,
-            "content": [["type": "text", "text": userText]],
-        ],
-    ]))
-    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
-        "threadId": threadId, "turnId": turnId,
-        "item": ["id": replyId, "type": "agentMessage", "text": replyText],
-    ]))
-    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
-        "threadId": threadId, "turn": ["id": turnId, "status": "completed"],
-    ]))
-}
-
 @Test func deleteConversationRemovesOnlyLocalRecordWithoutCodexRPCsAndResetsActiveToBlankNewChat() async throws {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("history-delete-online-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: dir) }
     let stateURL = dir.appendingPathComponent("state.json")
     let configURL = dir.appendingPathComponent("openrouter.json")
 
-    let clock = DeleteTestClock(Date(timeIntervalSince1970: 1_765_000_000))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_765_000_000))
     let options = ChatClientOptions(
         openRouterConfigURL: configURL,
         stateURL: stateURL,
@@ -65,7 +23,7 @@ private func completeDeleteCodexTurn(
     // Create Conversation A
     let r1 = try await client.connect()
     try await client.send("Plan Lisbon weekend", userMessageId: "a-u1")
-    completeDeleteCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: r1.threadId, turnId: "turn-1",
         userMessageId: "a-u1", userText: "Plan Lisbon weekend",
         replyId: "a-a1", replyText: "Start in Alfama."
@@ -73,10 +31,10 @@ private func completeDeleteCodexTurn(
     let idA = try #require(client.conversationId)
 
     // Create Conversation B (becomes active)
-    clock.advance(seconds: 60)
+    clock.advance(by: 60)
     let r2 = try await client.newChat()
     try await client.send("Sourdough hydration ratio", userMessageId: "b-u1")
-    completeDeleteCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: r2.threadId, turnId: "turn-1",
         userMessageId: "b-u1", userText: "Sourdough hydration ratio",
         replyId: "b-a1", replyText: "Try 75% hydration."
@@ -120,7 +78,7 @@ private func completeDeleteCodexTurn(
     #expect(client.listHistory().map(\.id) == [idB])
     rpc.releaseTurnStart(turnId: "turn-2")
     await sendTask.value
-    completeDeleteCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: r2.threadId, turnId: "turn-2",
         userMessageId: "b-u2", userText: "Follow-up question",
         replyId: "b-a2", replyText: "Fold every 30 minutes."
@@ -156,7 +114,7 @@ private func completeDeleteCodexTurn(
     try await relaunched.send("Fresh topic after delete", userMessageId: "c-u1")
     let turnStart = try #require(relaunchRPC.calls.last { $0.method == "turn/start" })
     let freshThreadId = try #require(turnStart.params["threadId"] as? String)
-    completeDeleteCodexTurn(
+    completeHistoryCodexTurn(
         rpc: relaunchRPC, threadId: freshThreadId, turnId: "turn-1",
         userMessageId: "c-u1", userText: "Fresh topic after delete",
         replyId: "c-a1", replyText: "Fresh reply."
@@ -175,7 +133,7 @@ private func completeDeleteCodexTurn(
     let stateURL = dir.appendingPathComponent("state.json")
     let configURL = dir.appendingPathComponent("openrouter.json")
 
-    let clock = DeleteTestClock(Date(timeIntervalSince1970: 1_766_000_000))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_766_000_000))
     let older = SavedConversation(
         id: "offline-older",
         title: "Older offline chat",

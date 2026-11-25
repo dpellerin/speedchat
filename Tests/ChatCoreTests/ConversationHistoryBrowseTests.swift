@@ -2,23 +2,6 @@ import Foundation
 import Testing
 @testable import ChatCore
 
-private final class BrowseTestClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var current: Date
-
-    init(_ start: Date) {
-        current = start
-    }
-
-    func now() -> Date {
-        lock.withLock { current }
-    }
-
-    func advance(by seconds: TimeInterval) {
-        lock.withLock { current = current.addingTimeInterval(seconds) }
-    }
-}
-
 private func browseSSEStream(_ events: [[String: Any]]) -> OpenRouterHTTPResponse {
     let lines = AsyncThrowingStream<String, Error> { continuation in
         for event in events {
@@ -33,31 +16,6 @@ private func browseSSEStream(_ events: [[String: Any]]) -> OpenRouterHTTPRespons
     return OpenRouterHTTPResponse(statusCode: 200, lines: lines)
 }
 
-private func completeCodexReply(
-    rpc: FakeCodexTransport,
-    threadId: String,
-    turnId: String = "turn-1",
-    userMessageId: String,
-    userText: String,
-    replyId: String,
-    replyText: String
-) {
-    rpc.onNotification?(CodexNotification(method: "item/started", params: [
-        "threadId": threadId, "turnId": turnId,
-        "item": [
-            "id": "codex-user-\(userMessageId)", "type": "userMessage", "clientId": userMessageId,
-            "content": [["type": "text", "text": userText]],
-        ],
-    ]))
-    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
-        "threadId": threadId, "turnId": turnId,
-        "item": ["id": replyId, "type": "agentMessage", "text": replyText],
-    ]))
-    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
-        "threadId": threadId, "turn": ["id": turnId, "status": "completed"],
-    ]))
-}
-
 @Test func listHistoryReturnsRecentEntriesWithLatestPreviewExcludingBeamReasoning() async throws {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("history-list-" + UUID().uuidString)
     defer { try? FileManager.default.removeItem(at: dir) }
@@ -69,7 +27,7 @@ private func completeCodexReply(
         models: [ChatModel(model: beamModel, displayName: "Beam Test", provider: "openrouter")],
         to: configURL
     )
-    let clock = BrowseTestClock(Date(timeIntervalSince1970: 1_750_000_000))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_750_000_000))
     let fetch: OpenRouterFetch = { _ in
         browseSSEStream([
             ["choices": [["delta": ["reasoning": "SECRET BEAM CHAIN OF THOUGHT"]]]],
@@ -89,7 +47,7 @@ private func completeCodexReply(
     let client = ChatClient(rpc: rpc, options: options)
     let firstReady = try await client.connect()
     try await client.send("Please compare espresso grinders", userMessageId: "c1-u1")
-    completeCodexReply(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: firstReady.threadId,
         userMessageId: "c1-u1", userText: "Please compare espresso grinders",
         replyId: "c1-a1", replyText: "Flat burrs highlight clarity.\nConical burrs add body."
@@ -139,7 +97,7 @@ private func completeCodexReply(
         ],
         to: configURL
     )
-    let clock = BrowseTestClock(Date(timeIntervalSince1970: 1_750_100_000))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_750_100_000))
     let fetch: OpenRouterFetch = { _ in
         browseSSEStream([
             ["choices": [["delta": ["content": "Router reply."]]]],
@@ -158,7 +116,7 @@ private func completeCodexReply(
     let client = ChatClient(rpc: rpc, options: options)
     let firstReady = try await client.connect()
     try await client.send("First Codex question", userMessageId: "c1-u1")
-    completeCodexReply(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: firstReady.threadId,
         userMessageId: "c1-u1", userText: "First Codex question",
         replyId: "c1-a1", replyText: "First Codex answer."
@@ -214,7 +172,7 @@ private func completeCodexReply(
     ]))
     clock.advance(by: 60)
     try await client.send("Follow-up on Codex", userMessageId: "c1-u2")
-    completeCodexReply(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: firstReady.threadId, turnId: "turn-2",
         userMessageId: "c1-u2", userText: "Follow-up on Codex",
         replyId: "c1-a2", replyText: "Deferred resume worked."
@@ -231,7 +189,7 @@ private func completeCodexReply(
     defer { try? FileManager.default.removeItem(at: dir) }
     let stateURL = dir.appendingPathComponent("state.json")
     let configURL = dir.appendingPathComponent("openrouter.json")
-    let clock = BrowseTestClock(Date(timeIntervalSince1970: 1_750_200_000))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_750_200_000))
     let options = ChatClientOptions(
         openRouterConfigURL: configURL,
         stateURL: stateURL,
@@ -258,7 +216,7 @@ private func completeCodexReply(
     rpc.turnStartError = nil
     let secondReady = try await client.newChat()
     try await client.send("Clean conversation", userMessageId: "c2-u1")
-    completeCodexReply(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: secondReady.threadId,
         userMessageId: "c2-u1", userText: "Clean conversation",
         replyId: "c2-a1", replyText: "All good."
@@ -292,7 +250,7 @@ private func completeCodexReply(
         _ = try client.openConversation(id: id1)
     }
     rpc.releaseTurnStart()
-    completeCodexReply(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: secondReady.threadId, turnId: "turn-2",
         userMessageId: "c2-u2", userText: "In flight prompt",
         replyId: "c2-a2", replyText: "Finished."
@@ -330,7 +288,7 @@ private func completeCodexReply(
     let client = ChatClient(rpc: rpc, options: options)
     let firstReady = try await client.connect()
     try await client.send("Original topic", userMessageId: "c1-u1")
-    completeCodexReply(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: firstReady.threadId,
         userMessageId: "c1-u1", userText: "Original topic",
         replyId: "c1-a1", replyText: "Original reply."
@@ -353,7 +311,7 @@ private func completeCodexReply(
     #expect(input.contains("Original topic"))
     #expect(input.contains("Original reply."))
     #expect(input.contains("Continue after missing thread"))
-    completeCodexReply(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: replacementThreadId, turnId: "turn-replacement",
         userMessageId: "c1-u2", userText: input,
         replyId: "c1-a2", replyText: "Continued on replacement thread."

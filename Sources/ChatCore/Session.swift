@@ -147,6 +147,13 @@ public struct ChatSession: Sendable {
   phase = .selecting;notice="Changing model…";return true
  }
  public mutating func stopping() {if streaming {notice="Stopping…"}}
+ public mutating func clearScrollTarget() {scrollTargetMessageId=nil}
+ @discardableResult
+ public mutating func consumeScrollTarget() -> String? {
+  let target=scrollTargetMessageId
+  scrollTargetMessageId=nil
+  return target
+ }
  public func shouldStopIdle(hidden:Bool,elapsed:TimeInterval) -> Bool {hidden && !busy && elapsed >= 300}
  public mutating func receive(_ event:BridgeEvent) {
   guard event.executionID == nil || event.executionID == executionID else {return}

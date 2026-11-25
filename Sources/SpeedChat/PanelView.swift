@@ -372,11 +372,12 @@ struct PanelView:View {
     }
     .task(id:store.session.transcriptID) {
      guard !store.session.messages.isEmpty else {
+      store.clearScrollTarget()
       scroll.userScrolled=false
       store.followBottom=true
       return
      }
-     if let targetId=store.session.scrollTargetMessageId,
+     if let targetId=store.consumeScrollTarget(),
         store.session.messages.contains(where:{$0.id == targetId}) {
       scroll.userScrolled=true
       proxy.scrollTo(targetId,anchor:.center)
@@ -393,7 +394,7 @@ struct PanelView:View {
       proxy.scrollTo("bottom",anchor:.bottom)
      }
     }
-    if !store.followBottom {Button {scroll.userScrolled=false;store.followBottom=true;proxy.scrollTo("bottom",anchor:.bottom)} label:{Label("Latest",systemImage:"arrow.down")}.buttonStyle(.borderedProminent).padding(14).accessibilityIdentifier("speedchat-latest-button")}
+    if !store.followBottom {Button {store.clearScrollTarget();scroll.userScrolled=false;store.followBottom=true;proxy.scrollTo("bottom",anchor:.bottom)} label:{Label("Latest",systemImage:"arrow.down")}.buttonStyle(.borderedProminent).padding(14).accessibilityIdentifier("speedchat-latest-button")}
    }
   }.id(store.session.transcriptID)
  }

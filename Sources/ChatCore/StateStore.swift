@@ -96,8 +96,7 @@ public enum StateStore {
         stateURL url: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) -> URL {
-        let target = url ?? stateURL(env: env)
-        return target.deletingLastPathComponent().appendingPathComponent("conversations", isDirectory: true)
+        StateLocation(stateURL: url, env: env).conversationsDirectory
     }
 
     static func formatTimestamp(_ date: Date) -> String {
@@ -122,11 +121,6 @@ public enum StateStore {
 
     private static func isValidConversationId(_ id: String) -> Bool {
         !id.isEmpty && !id.contains("/") && !id.contains("\\") && !id.hasPrefix(".") && id != ".."
-    }
-
-    private static func conversationURL(id: String, stateURL target: URL) -> URL? {
-        guard isValidConversationId(id) else { return nil }
-        return conversationsDirectory(stateURL: target).appendingPathComponent("\(id).json")
     }
 
     private static func parseMessages(_ rawMessages: [[String: Any]]) -> [ChatMessage] {
@@ -194,48 +188,348 @@ public enum StateStore {
         return state
     }
 
+    private struct StateLocation {
+        let stateURL: URL
+
+        init(stateURL url: URL? = nil, env: [String: String] = ProcessInfo.processInfo.environment) {
+            self.stateURL = url ?? StateStore.stateURL(env: env)
+        }
+
+        init(resolved stateURL: URL) {
+            self.stateURL = stateURL
+        }
+
+        var stateDirectory: URL {
+            stateURL.deletingLastPathComponent()
+        }
+
+        var conversationsDirectory: URL {
+            stateDirectory.appendingPathComponent("conversations", isDirectory: true)
+        }
+
+        func conversationURL(id: String) -> URL? {
+            guard StateStore.isValidConversationId(id) else { return nil }
+            return conversationsDirectory.appendingPathComponent("\(id).json")
+        }
+
+        func readActiveStateRecord() -> ActiveStateRecord? {
+            guard let data = try? Data(contentsOf: stateURL),
+                  let record = try? JSONDecoder().decode(ActiveStateRecord.self, from: data),
+                  record.version == PersistedState.currentVersion else {
+                return nil
+            }
+            return record
+        }
+
+        @discardableResult
+        func migrateLegacyIfNeeded() -> PersistedState? {
+            guard let data = try? Data(contentsOf: stateURL),
+                  let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let version = raw["version"] as? Int, version == PersistedState.legacyVersion else {
+                return nil
+            }
+            return migrateLegacyV3(raw: raw)
+        }
+
+        func migrateLegacyV3(raw: [String: Any]) -> PersistedState? {
+            guard let threadId = raw["threadId"] as? String, !threadId.isEmpty,
+                  let model = raw["model"] as? String, !model.isEmpty,
+                  let updatedAt = raw["updatedAt"] as? String, !updatedAt.isEmpty else {
+                return nil
+            }
+            let codexSyncedCount = raw["codexSyncedCount"] as? Int
+            let lastCodexSend = StateStore.decodeLastCodexSend(from: raw)
+            if let rawMessages = raw["messages"] as? [[String: Any]] {
+                let validMessages = StateStore.parseMessages(rawMessages)
+                if validMessages.isEmpty {
+                    try? saveBlankActiveState(
+                        threadId: "",
+                        model: model,
+                        updatedAt: updatedAt,
+                        needsLegacyHistory: false
+                    )
+                    return PersistedState(
+                        version: PersistedState.currentVersion,
+                        conversationId: nil,
+                        threadId: "",
+                        model: model,
+                        updatedAt: updatedAt,
+                        messages: [],
+                        codexSyncedCount: 0
+                    )
+                }
+                let id = UUID().uuidString.lowercased()
+                var record = SavedConversation(
+                    id: id,
+                    title: StateStore.derivedTitle(from: validMessages),
+                    createdAt: updatedAt,
+                    updatedAt: updatedAt,
+                    model: model,
+                    threadId: threadId,
+                    messages: validMessages,
+                    codexSyncedCount: min(max(codexSyncedCount ?? 0, 0), validMessages.count)
+                )
+                record.lastCodexSend = lastCodexSend
+                try? saveActiveConversation(record)
+                return StateStore.persistedState(from: record)
+            }
+
+            // Legacy pre-ADR-0001 v3 state without saved messages: preserve threadId for one-time Codex backfill.
+            try? saveBlankActiveState(
+                threadId: threadId,
+                model: model,
+                updatedAt: updatedAt,
+                needsLegacyHistory: true
+            )
+            var state = PersistedState(
+                version: PersistedState.currentVersion,
+                conversationId: nil,
+                threadId: threadId,
+                model: model,
+                updatedAt: updatedAt,
+                messages: nil,
+                codexSyncedCount: codexSyncedCount
+            )
+            state.lastCodexSend = lastCodexSend
+            return state
+        }
+
+        func loadConversation(id: String) -> SavedConversation? {
+            _ = migrateLegacyIfNeeded()
+            guard let fileURL = conversationURL(id: id) else { return nil }
+            return StateStore.decodeConversation(from: fileURL)
+        }
+
+        func readConversations() -> [SavedConversation] {
+            guard let entries = try? FileManager.default.contentsOfDirectory(
+                at: conversationsDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                return []
+            }
+            let records = entries
+                .filter { $0.pathExtension == "json" }
+                .compactMap { StateStore.decodeConversation(from: $0) }
+            return records.sorted { lhs, rhs in
+                let lDate = StateStore.parseTimestamp(lhs.updatedAt) ?? .distantPast
+                let rDate = StateStore.parseTimestamp(rhs.updatedAt) ?? .distantPast
+                if lDate != rDate { return lDate > rDate }
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id < rhs.id
+            }
+        }
+
+        func loadConversations() -> [SavedConversation] {
+            _ = migrateLegacyIfNeeded()
+            return readConversations()
+        }
+
+        func clearActiveStateIfNeeded(_ activeRecord: ActiveStateRecord?, removedActive: Bool, now: Date) throws {
+            guard removedActive, let activeRecord else { return }
+            try saveBlankActiveState(
+                threadId: "",
+                model: activeRecord.model,
+                updatedAt: StateStore.formatTimestamp(now),
+                needsLegacyHistory: false
+            )
+        }
+
+        func pruneExpiredConversations(retention: HistoryRetention, now: Date) throws -> (removedIds: Set<String>, removedActive: Bool) {
+            guard retention.days != nil else { return ([], false) }
+            _ = migrateLegacyIfNeeded()
+            let activeRecord = readActiveStateRecord()
+            let conversations = readConversations()
+            var removedIds = Set<String>()
+            for conversation in conversations where retention.isExpired(updatedAt: conversation.updatedAt, relativeTo: now) {
+                if let fileURL = conversationURL(id: conversation.id) {
+                    try StateStore.removeFileIfExists(at: fileURL)
+                    removedIds.insert(conversation.id)
+                }
+            }
+            let removedActive = activeRecord?.activeConversationId.map { removedIds.contains($0) } ?? false
+            try clearActiveStateIfNeeded(activeRecord, removedActive: removedActive, now: now)
+            return (removedIds, removedActive)
+        }
+
+        func clearAllConversations(now: Date) throws -> (removedIds: Set<String>, removedActive: Bool) {
+            _ = migrateLegacyIfNeeded()
+            let activeRecord = readActiveStateRecord()
+            let conversations = readConversations()
+            var removedIds = Set<String>()
+            for conversation in conversations {
+                if let fileURL = conversationURL(id: conversation.id) {
+                    try StateStore.removeFileIfExists(at: fileURL)
+                    removedIds.insert(conversation.id)
+                }
+            }
+            // Also remove any stray/corrupt .json files in conversations/ so Clear All leaves the directory clean.
+            if let entries = try? FileManager.default.contentsOfDirectory(
+                at: conversationsDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) {
+                for entry in entries where entry.pathExtension == "json" {
+                    try StateStore.removeFileIfExists(at: entry)
+                }
+            }
+            let removedActive = activeRecord?.activeConversationId != nil
+            try clearActiveStateIfNeeded(activeRecord, removedActive: removedActive, now: now)
+            return (removedIds, removedActive)
+        }
+
+        func deleteConversation(id: String, now: Date) throws -> (removed: Bool, removedActive: Bool) {
+            _ = migrateLegacyIfNeeded()
+            guard let fileURL = conversationURL(id: id) else {
+                return (false, false)
+            }
+            let activeRecord = readActiveStateRecord()
+            let existed = FileManager.default.fileExists(atPath: fileURL.path)
+            if existed {
+                try StateStore.removeFileIfExists(at: fileURL)
+            }
+            let removedActive = activeRecord?.activeConversationId == id
+            try clearActiveStateIfNeeded(activeRecord, removedActive: removedActive, now: now)
+            return (existed, removedActive)
+        }
+
+        func load() -> PersistedState? {
+            guard let data = try? Data(contentsOf: stateURL),
+                  let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let version = raw["version"] as? Int else {
+                return nil
+            }
+
+            if version == PersistedState.legacyVersion {
+                return migrateLegacyV3(raw: raw)
+            }
+
+            guard version == PersistedState.currentVersion,
+                  let model = raw["model"] as? String, !model.isEmpty,
+                  let updatedAt = raw["updatedAt"] as? String, !updatedAt.isEmpty else {
+                return nil
+            }
+
+            if let activeId = raw["activeConversationId"] as? String, StateStore.isValidConversationId(activeId) {
+                if let fileURL = conversationURL(id: activeId),
+                   let saved = StateStore.decodeConversation(from: fileURL) {
+                    return StateStore.persistedState(from: saved)
+                }
+                return PersistedState(
+                    version: PersistedState.currentVersion,
+                    conversationId: nil,
+                    threadId: "",
+                    model: model,
+                    updatedAt: updatedAt,
+                    messages: [],
+                    codexSyncedCount: 0
+                )
+            }
+
+            let threadId = (raw["threadId"] as? String) ?? ""
+            let needsLegacy = (raw["needsLegacyHistory"] as? Bool) == true
+            if needsLegacy && threadId.isEmpty { return nil }
+            return PersistedState(
+                version: PersistedState.currentVersion,
+                conversationId: nil,
+                threadId: threadId,
+                model: model,
+                updatedAt: updatedAt,
+                messages: needsLegacy ? nil : [],
+                codexSyncedCount: needsLegacy ? nil : 0
+            )
+        }
+
+        func saveActiveConversation(_ record: SavedConversation) throws {
+            guard let destURL = conversationURL(id: record.id) else {
+                throw NSError(domain: "SpeedChat.Persistence", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "Invalid conversation identifier.",
+                ])
+            }
+            try StateStore.ensurePrivateDirectory(stateDirectory)
+            try StateStore.ensurePrivateDirectory(conversationsDirectory)
+
+            let conversationData = try StateStore.encodeJSON(record)
+            let activeState = ActiveStateRecord(
+                version: PersistedState.currentVersion,
+                activeConversationId: record.id,
+                threadId: record.threadId,
+                model: record.model,
+                updatedAt: record.updatedAt,
+                needsLegacyHistory: nil
+            )
+            let activeData = try StateStore.encodeJSON(activeState)
+
+            // Stage conversation file first, then commit state.json before replacing the
+            // saved conversation so a failed state.json write never mutates the last
+            // readable conversation journal on disk.
+            let convTempURL = try StateStore.writeStagedTempFile(conversationData, in: conversationsDirectory)
+            var convCommitted = false
+            defer {
+                if !convCommitted { try? FileManager.default.removeItem(at: convTempURL) }
+            }
+            try StateStore.writePrivateFile(activeData, to: stateURL)
+            try StateStore.replaceFile(at: destURL, withTemp: convTempURL)
+            convCommitted = true
+        }
+
+        func setActiveConversation(_ record: SavedConversation, model: String) throws {
+            guard StateStore.isValidConversationId(record.id) else {
+                throw NSError(domain: "SpeedChat.Persistence", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "Invalid conversation identifier.",
+                ])
+            }
+            let activeState = ActiveStateRecord(
+                version: PersistedState.currentVersion,
+                activeConversationId: record.id,
+                threadId: record.threadId,
+                model: model,
+                updatedAt: record.updatedAt,
+                needsLegacyHistory: nil
+            )
+            let activeData = try StateStore.encodeJSON(activeState)
+            try StateStore.writePrivateFile(activeData, to: stateURL)
+        }
+
+        func saveBlankActiveState(
+            threadId: String,
+            model: String,
+            updatedAt: String,
+            needsLegacyHistory: Bool
+        ) throws {
+            let activeState = ActiveStateRecord(
+                version: PersistedState.currentVersion,
+                activeConversationId: nil,
+                threadId: threadId,
+                model: model,
+                updatedAt: updatedAt,
+                needsLegacyHistory: needsLegacyHistory ? true : nil
+            )
+            let activeData = try StateStore.encodeJSON(activeState)
+            try StateStore.writePrivateFile(activeData, to: stateURL)
+        }
+    }
+
     public static func loadConversation(
         id: String,
         stateURL url: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) -> SavedConversation? {
-        let target = url ?? stateURL(env: env)
-        _ = migrateLegacyIfNeeded(target: target)
-        guard let fileURL = conversationURL(id: id, stateURL: target) else { return nil }
-        return decodeConversation(from: fileURL)
+        StateLocation(stateURL: url, env: env).loadConversation(id: id)
     }
 
     public static func loadConversations(
         stateURL url: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) -> [SavedConversation] {
-        let target = url ?? stateURL(env: env)
-        _ = migrateLegacyIfNeeded(target: target)
-        let dir = conversationsDirectory(stateURL: target)
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-        let records = entries
-            .filter { $0.pathExtension == "json" }
-            .compactMap { decodeConversation(from: $0) }
-        return records.sorted { lhs, rhs in
-            let lDate = parseTimestamp(lhs.updatedAt) ?? .distantPast
-            let rDate = parseTimestamp(rhs.updatedAt) ?? .distantPast
-            if lDate != rDate { return lDate > rDate }
-            if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
-            return lhs.id < rhs.id
-        }
+        StateLocation(stateURL: url, env: env).loadConversations()
     }
 
     public static func countSavedConversations(
         stateURL url: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) -> Int {
-        loadConversations(stateURL: url, env: env).count
+        StateLocation(stateURL: url, env: env).loadConversations().count
     }
 
     public static func countExpiredConversations(
@@ -245,18 +539,9 @@ public enum StateStore {
         env: [String: String] = ProcessInfo.processInfo.environment
     ) -> Int {
         guard retention.days != nil else { return 0 }
-        return loadConversations(stateURL: url, env: env).filter {
+        return StateLocation(stateURL: url, env: env).loadConversations().filter {
             retention.isExpired(updatedAt: $0.updatedAt, relativeTo: now)
         }.count
-    }
-
-    private static func readActiveStateRecord(from target: URL) -> ActiveStateRecord? {
-        guard let data = try? Data(contentsOf: target),
-              let record = try? JSONDecoder().decode(ActiveStateRecord.self, from: data),
-              record.version == PersistedState.currentVersion else {
-            return nil
-        }
-        return record
     }
 
     private static func removeFileIfExists(at url: URL) throws {
@@ -274,29 +559,7 @@ public enum StateStore {
         stateURL url: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> (removedIds: Set<String>, removedActive: Bool) {
-        guard retention.days != nil else { return ([], false) }
-        let target = url ?? stateURL(env: env)
-        _ = migrateLegacyIfNeeded(target: target)
-        let activeRecord = readActiveStateRecord(from: target)
-        let conversations = loadConversations(stateURL: target, env: [:])
-        var removedIds = Set<String>()
-        for conversation in conversations where retention.isExpired(updatedAt: conversation.updatedAt, relativeTo: now) {
-            if let fileURL = conversationURL(id: conversation.id, stateURL: target) {
-                try removeFileIfExists(at: fileURL)
-                removedIds.insert(conversation.id)
-            }
-        }
-        let removedActive = activeRecord?.activeConversationId.map { removedIds.contains($0) } ?? false
-        if removedActive, let activeRecord {
-            try saveBlankActiveState(
-                threadId: "",
-                model: activeRecord.model,
-                updatedAt: formatTimestamp(now),
-                needsLegacyHistory: false,
-                to: target
-            )
-        }
-        return (removedIds, removedActive)
+        try StateLocation(stateURL: url, env: env).pruneExpiredConversations(retention: retention, now: now)
     }
 
     @discardableResult
@@ -305,39 +568,7 @@ public enum StateStore {
         stateURL url: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> (removedIds: Set<String>, removedActive: Bool) {
-        let target = url ?? stateURL(env: env)
-        _ = migrateLegacyIfNeeded(target: target)
-        let activeRecord = readActiveStateRecord(from: target)
-        let conversations = loadConversations(stateURL: target, env: [:])
-        var removedIds = Set<String>()
-        for conversation in conversations {
-            if let fileURL = conversationURL(id: conversation.id, stateURL: target) {
-                try removeFileIfExists(at: fileURL)
-                removedIds.insert(conversation.id)
-            }
-        }
-        // Also remove any stray/corrupt .json files in conversations/ so Clear All leaves the directory clean.
-        let dir = conversationsDirectory(stateURL: target)
-        if let entries = try? FileManager.default.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) {
-            for entry in entries where entry.pathExtension == "json" {
-                try removeFileIfExists(at: entry)
-            }
-        }
-        let removedActive = activeRecord?.activeConversationId != nil
-        if removedActive, let activeRecord {
-            try saveBlankActiveState(
-                threadId: "",
-                model: activeRecord.model,
-                updatedAt: formatTimestamp(now),
-                needsLegacyHistory: false,
-                to: target
-            )
-        }
-        return (removedIds, removedActive)
+        try StateLocation(stateURL: url, env: env).clearAllConversations(now: now)
     }
 
     @discardableResult
@@ -347,150 +578,11 @@ public enum StateStore {
         stateURL url: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> (removed: Bool, removedActive: Bool) {
-        let target = url ?? stateURL(env: env)
-        _ = migrateLegacyIfNeeded(target: target)
-        guard let fileURL = conversationURL(id: id, stateURL: target) else {
-            return (false, false)
-        }
-        let activeRecord = readActiveStateRecord(from: target)
-        let existed = FileManager.default.fileExists(atPath: fileURL.path)
-        if existed {
-            try removeFileIfExists(at: fileURL)
-        }
-        let removedActive = activeRecord?.activeConversationId == id
-        if removedActive, let activeRecord {
-            try saveBlankActiveState(
-                threadId: "",
-                model: activeRecord.model,
-                updatedAt: formatTimestamp(now),
-                needsLegacyHistory: false,
-                to: target
-            )
-        }
-        return (existed, removedActive)
-    }
-
-    @discardableResult
-    private static func migrateLegacyIfNeeded(target: URL) -> PersistedState? {
-        guard let data = try? Data(contentsOf: target),
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = raw["version"] as? Int, version == PersistedState.legacyVersion else {
-            return nil
-        }
-        return migrateLegacyV3(raw: raw, target: target)
-    }
-
-    private static func migrateLegacyV3(raw: [String: Any], target: URL) -> PersistedState? {
-        guard let threadId = raw["threadId"] as? String, !threadId.isEmpty,
-              let model = raw["model"] as? String, !model.isEmpty,
-              let updatedAt = raw["updatedAt"] as? String, !updatedAt.isEmpty else {
-            return nil
-        }
-        let codexSyncedCount = raw["codexSyncedCount"] as? Int
-        let lastCodexSend = decodeLastCodexSend(from: raw)
-        if let rawMessages = raw["messages"] as? [[String: Any]] {
-            let validMessages = parseMessages(rawMessages)
-            if validMessages.isEmpty {
-                try? saveBlankActiveState(
-                    threadId: "",
-                    model: model,
-                    updatedAt: updatedAt,
-                    needsLegacyHistory: false,
-                    to: target
-                )
-                return PersistedState(
-                    version: PersistedState.currentVersion,
-                    conversationId: nil,
-                    threadId: "",
-                    model: model,
-                    updatedAt: updatedAt,
-                    messages: [],
-                    codexSyncedCount: 0
-                )
-            }
-            let id = UUID().uuidString.lowercased()
-            var record = SavedConversation(
-                id: id,
-                title: derivedTitle(from: validMessages),
-                createdAt: updatedAt,
-                updatedAt: updatedAt,
-                model: model,
-                threadId: threadId,
-                messages: validMessages,
-                codexSyncedCount: min(max(codexSyncedCount ?? 0, 0), validMessages.count)
-            )
-            record.lastCodexSend = lastCodexSend
-            try? saveActiveConversation(record, to: target)
-            return persistedState(from: record)
-        }
-
-        // Legacy pre-ADR-0001 v3 state without saved messages: preserve threadId for one-time Codex backfill.
-        try? saveBlankActiveState(
-            threadId: threadId,
-            model: model,
-            updatedAt: updatedAt,
-            needsLegacyHistory: true,
-            to: target
-        )
-        var state = PersistedState(
-            version: PersistedState.currentVersion,
-            conversationId: nil,
-            threadId: threadId,
-            model: model,
-            updatedAt: updatedAt,
-            messages: nil,
-            codexSyncedCount: codexSyncedCount
-        )
-        state.lastCodexSend = lastCodexSend
-        return state
+        try StateLocation(stateURL: url, env: env).deleteConversation(id: id, now: now)
     }
 
     public static func load(from url: URL? = nil, env: [String: String] = ProcessInfo.processInfo.environment) -> PersistedState? {
-        let target = url ?? stateURL(env: env)
-        guard let data = try? Data(contentsOf: target),
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = raw["version"] as? Int else {
-            return nil
-        }
-
-        if version == PersistedState.legacyVersion {
-            return migrateLegacyV3(raw: raw, target: target)
-        }
-
-        guard version == PersistedState.currentVersion,
-              let model = raw["model"] as? String, !model.isEmpty,
-              let updatedAt = raw["updatedAt"] as? String, !updatedAt.isEmpty else {
-            return nil
-        }
-
-        if let activeId = raw["activeConversationId"] as? String, isValidConversationId(activeId) {
-            if let fileURL = conversationURL(id: activeId, stateURL: target),
-               let saved = decodeConversation(from: fileURL) {
-                return persistedState(from: saved)
-            }
-            return PersistedState(
-                version: PersistedState.currentVersion,
-                conversationId: nil,
-                threadId: "",
-                model: model,
-                updatedAt: updatedAt,
-                messages: [],
-                codexSyncedCount: 0
-            )
-        }
-
-        let threadId = (raw["threadId"] as? String) ?? ""
-        let needsLegacy = (raw["needsLegacyHistory"] as? Bool) == true
-        if needsLegacy && threadId.isEmpty { return nil }
-        return PersistedState(
-            version: PersistedState.currentVersion,
-            conversationId: nil,
-            threadId: threadId,
-            model: model,
-            updatedAt: updatedAt,
-            messages: needsLegacy ? nil : [],
-            codexSyncedCount: needsLegacy ? nil : 0
-        )
+        StateLocation(stateURL: url, env: env).load()
     }
 
     private static func ensurePrivateDirectory(_ dir: URL) throws {
@@ -543,56 +635,11 @@ public enum StateStore {
     }
 
     static func saveActiveConversation(_ record: SavedConversation, to target: URL) throws {
-        guard let destURL = conversationURL(id: record.id, stateURL: target) else {
-            throw NSError(domain: "SpeedChat.Persistence", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "Invalid conversation identifier.",
-            ])
-        }
-        let stateDir = target.deletingLastPathComponent()
-        let conversationsDir = conversationsDirectory(stateURL: target)
-        try ensurePrivateDirectory(stateDir)
-        try ensurePrivateDirectory(conversationsDir)
-
-        let conversationData = try encodeJSON(record)
-        let activeState = ActiveStateRecord(
-            version: PersistedState.currentVersion,
-            activeConversationId: record.id,
-            threadId: record.threadId,
-            model: record.model,
-            updatedAt: record.updatedAt,
-            needsLegacyHistory: nil
-        )
-        let activeData = try encodeJSON(activeState)
-
-        // Stage conversation file first, then commit state.json before replacing the
-        // saved conversation so a failed state.json write never mutates the last
-        // readable conversation journal on disk.
-        let convTempURL = try writeStagedTempFile(conversationData, in: conversationsDir)
-        var convCommitted = false
-        defer {
-            if !convCommitted { try? FileManager.default.removeItem(at: convTempURL) }
-        }
-        try writePrivateFile(activeData, to: target)
-        try replaceFile(at: destURL, withTemp: convTempURL)
-        convCommitted = true
+        try StateLocation(resolved: target).saveActiveConversation(record)
     }
 
     static func setActiveConversation(_ record: SavedConversation, model: String, to target: URL) throws {
-        guard isValidConversationId(record.id) else {
-            throw NSError(domain: "SpeedChat.Persistence", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "Invalid conversation identifier.",
-            ])
-        }
-        let activeState = ActiveStateRecord(
-            version: PersistedState.currentVersion,
-            activeConversationId: record.id,
-            threadId: record.threadId,
-            model: model,
-            updatedAt: record.updatedAt,
-            needsLegacyHistory: nil
-        )
-        let activeData = try encodeJSON(activeState)
-        try writePrivateFile(activeData, to: target)
+        try StateLocation(resolved: target).setActiveConversation(record, model: model)
     }
 
     static func saveBlankActiveState(
@@ -602,16 +649,12 @@ public enum StateStore {
         needsLegacyHistory: Bool,
         to target: URL
     ) throws {
-        let activeState = ActiveStateRecord(
-            version: PersistedState.currentVersion,
-            activeConversationId: nil,
+        try StateLocation(resolved: target).saveBlankActiveState(
             threadId: threadId,
             model: model,
             updatedAt: updatedAt,
-            needsLegacyHistory: needsLegacyHistory ? true : nil
+            needsLegacyHistory: needsLegacyHistory
         )
-        let activeData = try encodeJSON(activeState)
-        try writePrivateFile(activeData, to: target)
     }
 
     public static func save(
@@ -635,7 +678,7 @@ public enum StateStore {
         lastCodexSend: CodexSendAttempt?,
         env: [String: String]
     ) throws {
-        let target = url ?? stateURL(env: env)
+        let location = StateLocation(stateURL: url, env: env)
         let now = formatTimestamp(Date())
         if let messages, !messages.isEmpty {
             let id = UUID().uuidString.lowercased()
@@ -650,14 +693,13 @@ public enum StateStore {
                 codexSyncedCount: min(max(codexSyncedCount ?? 0, 0), messages.count)
             )
             record.lastCodexSend = lastCodexSend
-            try saveActiveConversation(record, to: target)
+            try location.saveActiveConversation(record)
         } else {
-            try saveBlankActiveState(
+            try location.saveBlankActiveState(
                 threadId: threadId,
                 model: model,
                 updatedAt: now,
-                needsLegacyHistory: messages == nil,
-                to: target
+                needsLegacyHistory: messages == nil
             )
         }
     }

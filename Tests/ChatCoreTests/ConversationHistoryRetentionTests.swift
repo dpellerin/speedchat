@@ -2,52 +2,6 @@ import Foundation
 import Testing
 @testable import ChatCore
 
-private final class RetentionTestClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var current: Date
-
-    init(_ start: Date) {
-        current = start
-    }
-
-    func now() -> Date {
-        lock.withLock { current }
-    }
-
-    func advance(days: Double) {
-        lock.withLock { current = current.addingTimeInterval(days * 86_400) }
-    }
-
-    func advance(seconds: TimeInterval) {
-        lock.withLock { current = current.addingTimeInterval(seconds) }
-    }
-}
-
-private func completeRetentionCodexTurn(
-    rpc: FakeCodexTransport,
-    threadId: String,
-    turnId: String = "turn-1",
-    userMessageId: String,
-    userText: String,
-    replyId: String,
-    replyText: String
-) {
-    rpc.onNotification?(CodexNotification(method: "item/started", params: [
-        "threadId": threadId, "turnId": turnId,
-        "item": [
-            "id": "codex-user-\(userMessageId)", "type": "userMessage", "clientId": userMessageId,
-            "content": [["type": "text", "text": userText]],
-        ],
-    ]))
-    rpc.onNotification?(CodexNotification(method: "item/completed", params: [
-        "threadId": threadId, "turnId": turnId,
-        "item": ["id": replyId, "type": "agentMessage", "text": replyText],
-    ]))
-    rpc.onNotification?(CodexNotification(method: "turn/completed", params: [
-        "threadId": threadId, "turn": ["id": turnId, "status": "completed"],
-    ]))
-}
-
 @Test func historyRetentionPresetsAndOrderingMatchSpec() {
     #expect(HistoryRetention.defaultPolicy == .days30)
     #expect(HistoryRetention.allCases == [.days7, .days30, .days90, .year1, .forever])
@@ -69,7 +23,7 @@ private func completeRetentionCodexTurn(
     let stateURL = dir.appendingPathComponent("state.json")
     let configURL = dir.appendingPathComponent("openrouter.json")
 
-    let clock = RetentionTestClock(Date(timeIntervalSince1970: 1_760_000_000))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_760_000_000))
     func makeOptions(retention: HistoryRetention = .days30) -> ChatClientOptions {
         ChatClientOptions(
             openRouterConfigURL: configURL,
@@ -85,7 +39,7 @@ private func completeRetentionCodexTurn(
     let client1 = ChatClient(rpc: rpc1, options: makeOptions())
     let firstReady = try await client1.connect()
     try await client1.send("Old topic from day zero", userMessageId: "c1-u1")
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc1, threadId: firstReady.threadId,
         userMessageId: "c1-u1", userText: "Old topic from day zero",
         replyId: "c1-a1", replyText: "Day zero reply."
@@ -96,7 +50,7 @@ private func completeRetentionCodexTurn(
     clock.advance(days: 20)
     let secondReady = try await client1.newChat()
     try await client1.send("Recent topic from day twenty", userMessageId: "c2-u1")
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc1, threadId: secondReady.threadId,
         userMessageId: "c2-u1", userText: "Recent topic from day twenty",
         replyId: "c2-a1", replyText: "Day twenty reply."
@@ -140,7 +94,7 @@ private func completeRetentionCodexTurn(
     let stateURL = dir.appendingPathComponent("state.json")
     let configURL = dir.appendingPathComponent("openrouter.json")
 
-    let clock = RetentionTestClock(Date(timeIntervalSince1970: 1_761_000_000))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_761_000_000))
     let options = ChatClientOptions(
         openRouterConfigURL: configURL,
         stateURL: stateURL,
@@ -155,7 +109,7 @@ private func completeRetentionCodexTurn(
     // Day 0: Conversation A (100 days old by Day 100)
     let r1 = try await client.connect()
     try await client.send("Hundred day old topic", userMessageId: "a-u1")
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: r1.threadId,
         userMessageId: "a-u1", userText: "Hundred day old topic",
         replyId: "a-a1", replyText: "Reply A."
@@ -166,7 +120,7 @@ private func completeRetentionCodexTurn(
     clock.advance(days: 80)
     let r2 = try await client.newChat()
     try await client.send("Twenty day old topic", userMessageId: "b-u1")
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: r2.threadId,
         userMessageId: "b-u1", userText: "Twenty day old topic",
         replyId: "b-a1", replyText: "Reply B."
@@ -177,7 +131,7 @@ private func completeRetentionCodexTurn(
     clock.advance(days: 18)
     let r3 = try await client.newChat()
     try await client.send("Two day old topic", userMessageId: "c-u1")
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: r3.threadId,
         userMessageId: "c-u1", userText: "Two day old topic",
         replyId: "c-a1", replyText: "Reply C."
@@ -227,7 +181,7 @@ private func completeRetentionCodexTurn(
     try await client.send("Fresh prompt after prune", userMessageId: "fresh-u1")
     let turnStart = try #require(rpc.calls.last { $0.method == "turn/start" })
     let newThreadId = try #require(turnStart.params["threadId"] as? String)
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: newThreadId, turnId: "turn-fresh",
         userMessageId: "fresh-u1", userText: "Fresh prompt after prune",
         replyId: "fresh-a1", replyText: "Fresh reply."
@@ -245,7 +199,7 @@ private func completeRetentionCodexTurn(
     let stateURL = dir.appendingPathComponent("state.json")
     let configURL = dir.appendingPathComponent("openrouter.json")
 
-    let clock = RetentionTestClock(Date(timeIntervalSince1970: 1_762_000_000))
+    let clock = HistoryTestClock(Date(timeIntervalSince1970: 1_762_000_000))
     let options = ChatClientOptions(
         openRouterConfigURL: configURL,
         stateURL: stateURL,
@@ -258,16 +212,16 @@ private func completeRetentionCodexTurn(
     let client = ChatClient(rpc: rpc, options: options)
     let firstReady = try await client.connect()
     try await client.send("First saved chat", userMessageId: "u1")
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: firstReady.threadId,
         userMessageId: "u1", userText: "First saved chat",
         replyId: "a1", replyText: "First reply."
     )
 
-    clock.advance(seconds: 60)
+    clock.advance(by: 60)
     let secondReady = try await client.newChat()
     try await client.send("Second saved chat", userMessageId: "u2")
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: secondReady.threadId,
         userMessageId: "u2", userText: "Second saved chat",
         replyId: "a2", replyText: "Second reply."
@@ -289,7 +243,7 @@ private func completeRetentionCodexTurn(
     }
     #expect(client.countSavedConversations() == 2)
     rpc.releaseTurnStart()
-    completeRetentionCodexTurn(
+    completeHistoryCodexTurn(
         rpc: rpc, threadId: secondReady.threadId, turnId: "turn-2",
         userMessageId: "u3", userText: "In flight prompt",
         replyId: "a3", replyText: "Finished."
