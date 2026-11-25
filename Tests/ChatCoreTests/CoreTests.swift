@@ -220,12 +220,17 @@ import Foundation
  #expect(KeyboardPolicy.action(code:40,modifiers:[.command,.shift]) == .normal)
  #expect(KeyboardPolicy.action(code:40,modifiers:[]) == .normal)
 
- // History mode navigation & close shortcuts.
+ // History mode navigation, delete, & close shortcuts.
  #expect(KeyboardPolicy.action(code:53,modifiers:[],showingHistory:true) == .closeHistory)
  #expect(KeyboardPolicy.action(code:126,modifiers:[],showingHistory:true) == .historyUp)
  #expect(KeyboardPolicy.action(code:125,modifiers:[],showingHistory:true) == .historyDown)
  #expect(KeyboardPolicy.action(code:36,modifiers:[],showingHistory:true) == .historyOpen)
  #expect(KeyboardPolicy.action(code:76,modifiers:[],showingHistory:true) == .historyOpen)
+ #expect(KeyboardPolicy.action(code:51,modifiers:[.command],showingHistory:true) == .historyDelete)
+ #expect(KeyboardPolicy.action(code:51,modifiers:[],showingHistory:true) == .normal)
+ #expect(KeyboardPolicy.action(code:51,modifiers:[.option],showingHistory:true) == .normal)
+ #expect(KeyboardPolicy.action(code:51,modifiers:[.command,.shift],showingHistory:true) == .normal)
+ #expect(KeyboardPolicy.action(code:51,modifiers:[.command],showingHistory:false) == .normal)
  #expect(KeyboardPolicy.action(code:45,modifiers:[.command],showingHistory:true) == .newChat)
  #expect(KeyboardPolicy.action(code:13,modifiers:[.command],showingHistory:true) == .dismiss)
 

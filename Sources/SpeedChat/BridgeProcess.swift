@@ -290,6 +290,41 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                 }
                 return
             }
+            if type == "deleteConversation" {
+                guard let id = command["conversationId"], !id.isEmpty else { return }
+                let query = command["query"] ?? ""
+                do {
+                    let result = try chatClient.deleteConversation(id: id)
+                    if result.clearedActiveConversation, let ready = result.readyState {
+                        let offlineReason = ready.offlineReason
+                        onEvent?(BridgeEvent(
+                            type: offlineReason == nil ? "ready" : "offlineConversation",
+                            conversationId: ready.conversationId,
+                            messages: ready.messages,
+                            models: offlineReason == nil ? ready.models : [],
+                            model: ready.model,
+                            notice: offlineReason.map { "Offline · \($0)" } ?? "New chat",
+                            stateSaveError: ready.stateSaveError,
+                            codexRetry: ready.codexRetry,
+                            clearedActiveConversation: true
+                        ))
+                    }
+                    onEvent?(BridgeEvent(
+                        type: "history",
+                        history: chatClient.listHistory(query: query),
+                        clearedActiveConversation: result.clearedActiveConversation,
+                        query: query
+                    ))
+                } catch {
+                    onEvent?(BridgeEvent(
+                        type: "error",
+                        message: StateStore.friendlyError(error),
+                        busy: chatClient.busy,
+                        codexRetry: chatClient.codexRetry
+                    ))
+                }
+                return
+            }
             if type == "applyRetention" {
                 let policy = command["retention"].flatMap(HistoryRetention.init(rawValue:)) ?? .defaultPolicy
                 let query = command["query"] ?? ""

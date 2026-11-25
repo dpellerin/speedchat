@@ -198,6 +198,23 @@ struct PanelView:View {
    .background(colorScheme == .light ? Color.white : Color(nsColor:.windowBackgroundColor))
    .environment(\.openURL,OpenURLAction {url in NativeActions.open(url) ? .handled : .discarded})
    .onAppear {scroll.changed={near in store.followBottom=near}}
+   .alert(
+    "Delete conversation?",
+    isPresented:Binding(
+     get:{store.pendingDeleteEntry != nil},
+     set:{if !$0 {store.cancelDeleteHistoryConversation()}}
+    ),
+    presenting:store.pendingDeleteEntry
+   ) { _ in
+    Button("Delete",role:.destructive) {
+     store.confirmDeleteHistoryConversation()
+    }
+    Button("Cancel",role:.cancel) {
+     store.cancelDeleteHistoryConversation()
+    }
+   } message: {entry in
+    Text("“\(entry.title)” will be permanently deleted from SpeedChat. External Codex threads will not be touched.")
+   }
  }
  private var header:some View {
   let openAiModels=store.session.models.filter{!$0.isOpenRouter}
@@ -291,7 +308,7 @@ struct PanelView:View {
       Text("Try different words or clear the search.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
      } else {
       Image(systemName:"clock.arrow.circlepath").font(.system(size:30)).foregroundStyle(.secondary)
-      Text("No saved conversations yet").font(.title3.weight(.medium))
+      Text("No saved conversations yet").font(.title3.weight(.medium)).textSelection(.enabled)
        .accessibilityLabel("No saved conversations yet")
        .accessibilityIdentifier("speedchat-history-empty")
       Text("Conversations with at least one message appear here.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
@@ -311,6 +328,9 @@ struct PanelView:View {
            id:entry.id,
            scrollToMessageId:store.hasActiveHistoryQuery ? entry.firstMatchingMessageId : nil
           )
+         },
+         delete:{
+          store.requestDeleteHistoryConversation(entry)
          }
         ).id(entry.id)
        }
@@ -326,7 +346,7 @@ struct PanelView:View {
  }
  private var historyFooter:some View {
   HStack {
-   Text("↑↓ Navigate   ↵ Open   ⌘N New   Esc Back").font(.system(size:10)).foregroundStyle(.secondary)
+   Text("↑↓ Navigate   ↵ Open   ⌘⌫ Delete   ⌘N New   Esc Back").font(.system(size:10)).foregroundStyle(.secondary)
    Spacer(minLength:0)
   }.padding(.horizontal,18).padding(.vertical,10)
  }
@@ -460,54 +480,67 @@ private struct HistoryRowView:View {
  let isCurrent:Bool
  let isSelected:Bool
  let open:()->Void
+ let delete:()->Void
  private typealias ViewState<Value> = SwiftUI.State<Value>
  @ViewState private var hovered=false
  var body:some View {
-  Button(action:open) {
-   VStack(alignment:.leading,spacing:4) {
-    HStack(spacing:8) {
-     Text(Self.highlighted(entry.title,ranges:entry.titleMatchRanges,fontSize:14,highlightWeight:.bold))
-      .font(.system(size:14,weight:.semibold))
-      .foregroundStyle(.primary)
-      .lineLimit(1)
-     if isCurrent {
-      Text("Current")
-       .font(.caption2.weight(.medium))
-       .foregroundStyle(Color.accentColor)
-       .padding(.horizontal,6)
-       .padding(.vertical,2)
-       .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+  HStack(alignment:.center,spacing:8) {
+   Button(action:open) {
+    VStack(alignment:.leading,spacing:4) {
+     HStack(spacing:8) {
+      Text(Self.highlighted(entry.title,ranges:entry.titleMatchRanges,fontSize:14,highlightWeight:.bold))
+       .font(.system(size:14,weight:.semibold))
+       .foregroundStyle(.primary)
+       .lineLimit(1)
+      if isCurrent {
+       Text("Current")
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(Color.accentColor)
+        .padding(.horizontal,6)
+        .padding(.vertical,2)
+        .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+      }
+      Spacer(minLength:8)
+      Text(HistoryTimeFormatter.relativeString(for:entry.updatedAt))
+       .font(.caption)
+       .foregroundStyle(.secondary)
+       .lineLimit(1)
      }
-     Spacer(minLength:8)
-     Text(HistoryTimeFormatter.relativeString(for:entry.updatedAt))
-      .font(.caption)
-      .foregroundStyle(.secondary)
-      .lineLimit(1)
+     if !entry.preview.isEmpty {
+      Text(Self.highlighted(entry.preview,ranges:entry.previewMatchRanges,fontSize:13,highlightWeight:.semibold))
+       .font(.system(size:13))
+       .foregroundStyle(.secondary)
+       .lineLimit(2)
+       .multilineTextAlignment(.leading)
+     }
     }
-    if !entry.preview.isEmpty {
-     Text(Self.highlighted(entry.preview,ranges:entry.previewMatchRanges,fontSize:13,highlightWeight:.semibold))
-      .font(.system(size:13))
-      .foregroundStyle(.secondary)
-      .lineLimit(2)
-      .multilineTextAlignment(.leading)
-    }
+    .frame(maxWidth:.infinity,alignment:.leading)
+    .contentShape(Rectangle())
    }
-   .frame(maxWidth:.infinity,alignment:.leading)
-   .padding(.horizontal,12)
-   .padding(.vertical,10)
-   .background {
-    RoundedRectangle(cornerRadius:10)
-     .fill(isSelected ? Color.accentColor.opacity(0.14) : (hovered ? Color.secondary.opacity(0.08) : Color.clear))
+   .buttonStyle(.plain)
+   .accessibilityIdentifier("history-row-\(entry.id)")
+
+   if hovered || isSelected {
+    HistoryRowDeleteButton(
+     conversationId:entry.id,
+     title:entry.title,
+     action:delete
+    )
+    .frame(width:24,height:24)
    }
-   .overlay {
-    RoundedRectangle(cornerRadius:10)
-     .stroke(isSelected ? Color.accentColor.opacity(0.35) : Color.clear,lineWidth:1)
-   }
-   .contentShape(RoundedRectangle(cornerRadius:10))
   }
-  .buttonStyle(.plain)
+  .padding(.horizontal,12)
+  .padding(.vertical,10)
+  .background {
+   RoundedRectangle(cornerRadius:10)
+    .fill(isSelected ? Color.accentColor.opacity(0.14) : (hovered ? Color.secondary.opacity(0.08) : Color.clear))
+  }
+  .overlay {
+   RoundedRectangle(cornerRadius:10)
+    .stroke(isSelected ? Color.accentColor.opacity(0.35) : Color.clear,lineWidth:1)
+  }
+  .contentShape(RoundedRectangle(cornerRadius:10))
   .onHover {hovered=$0}
-  .accessibilityIdentifier("history-row-\(entry.id)")
  }
 
  private static func highlighted(
@@ -530,5 +563,61 @@ private struct HistoryRowView:View {
    attributed[attrLower..<attrUpper].font = .system(size:fontSize,weight:highlightWeight)
   }
   return attributed
+ }
+}
+
+@MainActor final class HistoryDeleteNSButton:NSButton {
+ var onDelete:(()->Void)?
+ private var tracking:NSTrackingArea?
+ private var isHovered=false {
+  didSet {
+   contentTintColor=isHovered ? .systemRed : .secondaryLabelColor
+   layer?.backgroundColor=isHovered ? NSColor.systemRed.withAlphaComponent(0.12).cgColor : NSColor.clear.cgColor
+  }
+ }
+ override init(frame frameRect:NSRect) {
+  super.init(frame:frameRect)
+  isBordered=false
+  bezelStyle = .inline
+  wantsLayer=true
+  layer?.cornerRadius=6
+  image=NSImage(systemSymbolName:"trash",accessibilityDescription:"Delete conversation")
+  symbolConfiguration=NSImage.SymbolConfiguration(pointSize:12,weight:.regular)
+  contentTintColor = .secondaryLabelColor
+  imageScaling = .scaleNone
+  toolTip="Delete conversation (⌘⌫)"
+  refusesFirstResponder=true
+  target=self
+  action=#selector(pressed)
+ }
+ required init?(coder:NSCoder) {fatalError()}
+ override func updateTrackingAreas() {
+  super.updateTrackingAreas()
+  if let tracking {removeTrackingArea(tracking)}
+  let area=NSTrackingArea(rect:.zero,options:[.mouseEnteredAndExited,.activeAlways,.inVisibleRect],owner:self,userInfo:nil)
+  addTrackingArea(area)
+  tracking=area
+ }
+ override func mouseEntered(with event:NSEvent) {isHovered=true}
+ override func mouseExited(with event:NSEvent) {isHovered=false}
+ @objc private func pressed() {onDelete?()}
+}
+
+private struct HistoryRowDeleteButton:NSViewRepresentable {
+ let conversationId:String
+ let title:String
+ let action:()->Void
+ func makeNSView(context:Context)->HistoryDeleteNSButton {
+  let button=HistoryDeleteNSButton()
+  update(button)
+  return button
+ }
+ func updateNSView(_ button:HistoryDeleteNSButton,context:Context) {
+  update(button)
+ }
+ private func update(_ button:HistoryDeleteNSButton) {
+  button.onDelete=action
+  button.setAccessibilityLabel("Delete \(title)")
+  button.setAccessibilityIdentifier("history-delete-\(conversationId)")
  }
 }

@@ -21,6 +21,12 @@ extension AppDelegate {
    func findSearchField(_ view:NSView)->HistorySearchTextField? {
     findSearchBar(view)?.field
    }
+   func findDeleteButtons(_ view:NSView)->[HistoryDeleteNSButton] {
+    var found=[HistoryDeleteNSButton]()
+    if let button=view as? HistoryDeleteNSButton {found.append(button)}
+    for sub in view.subviews {found += findDeleteButtons(sub)}
+    return found
+   }
    let coldComposer=panel.contentView.flatMap(composerIn)
    check("Opening focuses editable composer before backend ready",coldComposer != nil && panel.firstResponder === coldComposer && coldComposer?.isEditable == true)
    let ready=try JSONDecoder().decode(BridgeEvent.self,from:Data(fixture.utf8));store.session.receive(ready)
@@ -379,6 +385,77 @@ extension AppDelegate {
     let blockedWhileStreaming = !self.store.showingHistory && self.store.session.streaming
     self.store.receive(BridgeEvent(type:"done",conversationId:historyB.id,executionID:self.store.session.executionID))
     check("History is blocked while an active turn is streaming",blockedWhileStreaming && self.store.session.canOpenHistory)
+
+    // Individual deletion (#25): row delete button exposed on selected row, row click & ⌘⌫ confirmation/cancel,
+    // deleting active conversation + deleting all saved conversations -> "No saved conversations yet" empty state,
+    // and abandoning History lands cleanly on a fresh blank New Chat with clean Draft and composer focus.
+    self.store.draft="Draft to discard on active delete"
+    self.store.openHistory()
+    self.store.receive(BridgeEvent(type:"history",history:[historyA,historyB],query:""))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    let initialDeleteButtons=self.panel.contentView.map(findDeleteButtons) ?? []
+    let deleteButtonExposedForSelectedRow=initialDeleteButtons.count == 1 &&
+     initialDeleteButtons.first?.accessibilityIdentifier() == "history-delete-\(historyA.id)"
+    self.store.moveHistorySelection(1) // select active historyB
+    try? await Task.sleep(for:.milliseconds(100))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    let movedDeleteButtons=self.panel.contentView.map(findDeleteButtons) ?? []
+    let deleteButtonMovedToSelectedRow=movedDeleteButtons.count == 1 &&
+     movedDeleteButtons.first?.accessibilityIdentifier() == "history-delete-\(historyB.id)"
+    let cmdsBeforeDeletePrompt=self.store.fixtureCommands.count
+    movedDeleteButtons.first?.performClick(nil)
+    let promptedViaButton=self.store.pendingDeleteEntry == historyB && self.store.fixtureCommands.count == cmdsBeforeDeletePrompt
+    self.store.cancelDeleteHistoryConversation()
+    let cancelledDeleteKeepsState=self.store.pendingDeleteEntry == nil &&
+     self.store.historyEntries == [historyA,historyB] &&
+     self.store.session.conversationId == historyB.id &&
+     self.store.draft == "Draft to discard on active delete" &&
+     self.store.fixtureCommands.count == cmdsBeforeDeletePrompt
+    check("History exposes delete button on selected row, opens confirmation on click, and cancels cleanly",
+          deleteButtonExposedForSelectedRow && deleteButtonMovedToSelectedRow && promptedViaButton && cancelledDeleteKeepsState)
+
+    // Trigger via ⌘⌫ path, confirm deletion of active historyB, then delete remaining historyA -> empty state,
+    // then abandon History -> fresh blank New Chat with clean Draft and focused composer.
+    let promptedViaShortcut=self.store.requestDeleteSelectedHistoryConversation() && self.store.pendingDeleteEntry == historyB
+    self.store.confirmDeleteHistoryConversation()
+    let deletedActiveCmd=self.store.fixtureCommands.last
+    self.store.receive(BridgeEvent(
+     type:"ready",
+     conversationId:nil,
+     messages:[],
+     models:ready.models,
+     model:"gpt-6-sol",
+     notice:"New chat",
+     clearedActiveConversation:true
+    ))
+    self.store.receive(BridgeEvent(type:"history",history:[historyA],clearedActiveConversation:true,query:""))
+    try? await Task.sleep(for:.milliseconds(100))
+    self.store.requestDeleteHistoryConversation(historyA)
+    self.store.confirmDeleteHistoryConversation()
+    let deletedLastCmd=self.store.fixtureCommands.last
+    self.store.receive(BridgeEvent(type:"history",history:[],clearedActiveConversation:false,query:""))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    let emptyAfterDeleteElements=self.panel.flatMap{accessibleElements($0)} ?? []
+    let emptyAfterDeleteRendered=emptyAfterDeleteElements.contains {
+     $0.accessibilityIdentifier() == "speedchat-history-empty" ||
+     $0.accessibilityLabel() == "No saved conversations yet" ||
+     ($0.accessibilityValue() as? String) == "No saved conversations yet" ||
+     $0.accessibilityTitle() == "No saved conversations yet"
+    }
+    let emptyAfterDeleteNoScroll=self.panel.contentView.map{!hasScrollView($0)} ?? false
+    self.store.closeHistory()
+    try? await Task.sleep(for:.milliseconds(150))
+    let composerAfterDeleteAbandon=self.panel.contentView.flatMap(composerIn)
+    check("Confirming deletion removes active conversation, shows empty state when all deleted, and abandons to blank New Chat",
+          promptedViaShortcut &&
+          deletedActiveCmd == ["type":"deleteConversation","conversationId":historyB.id] &&
+          deletedLastCmd == ["type":"deleteConversation","conversationId":historyA.id] &&
+          emptyAfterDeleteRendered && emptyAfterDeleteNoScroll &&
+          !self.store.showingHistory && self.store.session.conversationId == nil &&
+          self.store.session.messages.isEmpty && self.store.draft.isEmpty &&
+          composerAfterDeleteAbandon != nil && self.panel.firstResponder === composerAfterDeleteAbandon)
 
     // Settings History retention & Clear All History wiring in fixture mode (restoring UserDefaults afterward).
     let savedRetentionRaw=self.preferences.defaults.object(forKey:"historyRetention")

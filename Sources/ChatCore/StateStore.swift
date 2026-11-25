@@ -341,6 +341,36 @@ public enum StateStore {
     }
 
     @discardableResult
+    public static func deleteConversation(
+        id: String,
+        now: Date = Date(),
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (removed: Bool, removedActive: Bool) {
+        let target = url ?? stateURL(env: env)
+        _ = migrateLegacyIfNeeded(target: target)
+        guard let fileURL = conversationURL(id: id, stateURL: target) else {
+            return (false, false)
+        }
+        let activeRecord = readActiveStateRecord(from: target)
+        let existed = FileManager.default.fileExists(atPath: fileURL.path)
+        if existed {
+            try removeFileIfExists(at: fileURL)
+        }
+        let removedActive = activeRecord?.activeConversationId == id
+        if removedActive, let activeRecord {
+            try saveBlankActiveState(
+                threadId: "",
+                model: activeRecord.model,
+                updatedAt: formatTimestamp(now),
+                needsLegacyHistory: false,
+                to: target
+            )
+        }
+        return (existed, removedActive)
+    }
+
+    @discardableResult
     private static func migrateLegacyIfNeeded(target: URL) -> PersistedState? {
         guard let data = try? Data(contentsOf: target),
               let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

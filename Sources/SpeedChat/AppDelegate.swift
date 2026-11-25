@@ -65,7 +65,7 @@ import ChatCore
   createMainMenu()
   if !fixture {do {try hotkey.register(preferences.hotkey)} catch {preferences.error=error.localizedDescription};createMenu()}
   keyMonitor=NSEvent.addLocalMonitorForEvents(matching:.keyDown) { [weak self] event in
-   guard let self,self.panel.isKeyWindow,self.panel.attachedSheet == nil,!(self.panel.firstResponder is RecorderButton) else {return event}
+   guard let self,self.panel.isKeyWindow,self.panel.attachedSheet == nil,self.store.pendingDeleteEntry == nil,!(self.panel.firstResponder is RecorderButton) else {return event}
    switch KeyboardPolicy.action(
     code:event.keyCode,
     modifiers:event.modifierFlags.chatModifiers,
@@ -77,6 +77,7 @@ import ChatCore
    case .historyUp:self.store.moveHistorySelection(-1);return nil
    case .historyDown:self.store.moveHistorySelection(1);return nil
    case .historyOpen:self.store.openSelectedHistoryConversation();return nil
+   case .historyDelete:return self.store.requestDeleteSelectedHistoryConversation() ? nil : event
    case .newChat:self.store.newChat();return nil
    case .stop:self.store.interrupt();return nil
    case .dismiss:self.hide();return nil

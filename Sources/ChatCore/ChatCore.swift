@@ -34,7 +34,7 @@ public struct KeyModifiers: OptionSet, Sendable {
 }
 public enum KeyboardPolicy {
  public enum Action: Equatable {
-  case send,newline,newChat,stop,dismiss,pageUp,pageDown,toggleHistory,closeHistory,historyUp,historyDown,historyOpen,normal
+  case send,newline,newChat,stop,dismiss,pageUp,pageDown,toggleHistory,closeHistory,historyUp,historyDown,historyOpen,historyDelete,normal
  }
  public static func action(code:UInt16,modifiers:KeyModifiers,streaming:Bool=false,showingHistory:Bool=false) -> Action {
   if code == 13 && modifiers == [.command] {return .dismiss}
@@ -44,6 +44,7 @@ public enum KeyboardPolicy {
    if code == 126 && modifiers.isEmpty {return .historyUp}
    if code == 125 && modifiers.isEmpty {return .historyDown}
    if (code == 36 || code == 76) && modifiers.isEmpty {return .historyOpen}
+   if code == 51 && modifiers == [.command] {return .historyDelete}
    if code == 45 && (modifiers.contains(.command) || modifiers.contains(.control)) {return .newChat}
    return .normal
   }

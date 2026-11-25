@@ -319,6 +319,34 @@ public final class ChatClient: @unchecked Sendable {
         }
     }
 
+    public func deleteConversation(id: String) throws -> HistoryMutationResult {
+        try sync {
+            try requireOpen()
+            if activeExecution != nil || mutationPending {
+                throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [
+                    NSLocalizedDescriptionKey: "Wait for the current response or change to finish.",
+                ])
+            }
+            let now = options.now()
+            let target = options.stateURL ?? StateStore.stateURL(env: options.env)
+            let deleted = try StateStore.deleteConversation(id: id, now: now, stateURL: target, env: options.env)
+            let activeRemoved = conversation.conversationId == id
+            if activeRemoved {
+                let ready = resetToBlankConversationLocked(now: now)
+                return HistoryMutationResult(
+                    removedCount: deleted.removed ? 1 : 0,
+                    clearedActiveConversation: true,
+                    readyState: ready
+                )
+            }
+            return HistoryMutationResult(
+                removedCount: deleted.removed ? 1 : 0,
+                clearedActiveConversation: false,
+                readyState: nil
+            )
+        }
+    }
+
     public func openConversation(id: String) throws -> ReadyState {
         try sync {
             try requireOpen()

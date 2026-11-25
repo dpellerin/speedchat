@@ -16,7 +16,9 @@ import ChatCore
  @Published var historyEntries=[HistoryEntry]()
  @Published var selectedHistoryIndex=0
  @Published var historyFocusToken=0
+ @Published var pendingDeleteEntry:HistoryEntry?
  var hasActiveHistoryQuery:Bool {!historyQuery.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
+ private var activeConversationDeletedInHistory=false
  private var draftsByConversation=[String:String]()
  private var blankDraft=""
  var bridge:(any ChatBackend)?
@@ -46,7 +48,22 @@ import ChatCore
   if bridge != nil {warmReopens += 1} else if !fixtureMode {connect()}
   if !showingHistory {focusToken += 1}
  }
- func hide() {showingHistory=false;historyQuery="";hiddenAt=Date();scheduleIdle()}
+ func hide() {
+  showingHistory=false;historyQuery="";pendingDeleteEntry=nil
+  resetDeletedActiveConversationIfNeeded()
+  hiddenAt=Date();scheduleIdle()
+ }
+ private func resetDeletedActiveConversationIfNeeded() {
+  guard activeConversationDeletedInHistory else {return}
+  activeConversationDeletedInHistory=false
+  draft="";blankDraft="";followBottom=true
+  if session.conversationId != nil || !session.messages.isEmpty {
+   let event=session.phase == .offline
+    ? BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true)
+    : BridgeEvent(type:"ready",conversationId:nil,messages:[],models:session.models,model:session.selectedModel,notice:"New chat",clearedActiveConversation:true)
+   session.receive(event);changed?()
+  }
+ }
  private func scheduleIdle() {
   idleTimer?.invalidate()
   idleTimer=Timer.scheduledTimer(withTimeInterval:15,repeats:true) { [weak self] _ in Task { @MainActor in
@@ -56,7 +73,7 @@ import ChatCore
  }
  func connect() {
   guard !quitting else {return}
-  showingHistory=false;historyQuery=""
+  showingHistory=false;historyQuery="";pendingDeleteEntry=nil;activeConversationDeletedInHistory=false
   stop();session.connecting()
   guard let teardown else {startBridge();return}
   let current=generation
@@ -107,7 +124,9 @@ import ChatCore
   if event.type == "ready" || event.type == "offlineConversation" {
    if event.clearedActiveConversation == true {
     if let oldId=session.conversationId {draftsByConversation.removeValue(forKey:oldId)}
-    draft="";blankDraft="";followBottom=true
+    draft="";blankDraft="";followBottom=true;activeConversationDeletedInHistory=false
+   } else if event.conversationId == nil {
+    activeConversationDeletedInHistory=false
    }
    if event.type == "ready" {
     if session.phase == .connecting {readyMs=Date().timeIntervalSince(startedAt)*1000}
@@ -159,12 +178,14 @@ import ChatCore
    if draft.isEmpty {draftsByConversation.removeValue(forKey:cid)}
    else {draftsByConversation[cid]=draft}
   }
-  blankDraft="";draft="";showingHistory=false;historyQuery="";followBottom=true;command(["type":"newChat"])
+  blankDraft="";draft="";showingHistory=false;historyQuery="";pendingDeleteEntry=nil;activeConversationDeletedInHistory=false;followBottom=true;command(["type":"newChat"])
  }
  func openHistory() {
   guard session.canOpenHistory else {return}
   showingHistory=true
   historyQuery=""
+  pendingDeleteEntry=nil
+  activeConversationDeletedInHistory=false
   selectedHistoryIndex=0
   historyFocusToken += 1
   command(["type":"listHistory"])
@@ -188,6 +209,8 @@ import ChatCore
   guard showingHistory else {return}
   showingHistory=false
   historyQuery=""
+  pendingDeleteEntry=nil
+  resetDeletedActiveConversationIfNeeded()
   if shouldFocusComposer() {focusToken += 1}
  }
  func toggleHistory() {
@@ -210,12 +233,53 @@ import ChatCore
   }
   showingHistory=false
   historyQuery=""
+  pendingDeleteEntry=nil
+  activeConversationDeletedInHistory=false
   followBottom=(scrollToMessageId == nil)
   var cmd=["type":"openConversation","conversationId":id]
   if let scrollToMessageId,!scrollToMessageId.isEmpty {
    cmd["scrollToMessageId"]=scrollToMessageId
   }
   command(cmd)
+ }
+ @discardableResult
+ func requestDeleteSelectedHistoryConversation() -> Bool {
+  guard showingHistory,session.canOpenHistory,pendingDeleteEntry == nil,
+        historyEntries.indices.contains(selectedHistoryIndex) else {return false}
+  pendingDeleteEntry=historyEntries[selectedHistoryIndex]
+  return true
+ }
+ func requestDeleteHistoryConversation(_ entry:HistoryEntry) {
+  guard showingHistory,session.canOpenHistory else {return}
+  pendingDeleteEntry=entry
+ }
+ func cancelDeleteHistoryConversation() {
+  guard pendingDeleteEntry != nil else {return}
+  pendingDeleteEntry=nil
+  if showingHistory {historyFocusToken += 1}
+ }
+ func confirmDeleteHistoryConversation() {
+  guard let entry=pendingDeleteEntry else {return}
+  pendingDeleteEntry=nil
+  guard session.canOpenHistory else {return}
+  draftsByConversation.removeValue(forKey:entry.id)
+  let deletingActive=entry.id == session.conversationId
+  if deletingActive {
+   draft="";blankDraft="";activeConversationDeletedInHistory=true
+  }
+  if bridge != nil || fixtureMode {
+   var cmd=["type":"deleteConversation","conversationId":entry.id]
+   if !historyQuery.isEmpty {cmd["query"]=historyQuery}
+   command(cmd)
+  } else if let deleted=try? StateStore.deleteConversation(id:entry.id,now:now(),stateURL:stateURL,env:environment) {
+   let remaining=ConversationHistory.search(StateStore.loadConversations(stateURL:stateURL,env:environment),query:historyQuery)
+   let activeRemoved=deletingActive || deleted.removedActive
+   if activeRemoved {
+    receive(BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true))
+   }
+   receive(BridgeEvent(type:"history",history:remaining,clearedActiveConversation:activeRemoved,query:historyQuery))
+  }
+  if showingHistory {historyFocusToken += 1}
  }
  func countSavedHistory()->Int {
   if fixtureMode {return historyEntries.count}
@@ -245,6 +309,8 @@ import ChatCore
   }
  }
  func clearAllHistory() {
+  pendingDeleteEntry=nil
+  activeConversationDeletedInHistory=false
   draftsByConversation.removeAll()
   if bridge != nil || fixtureMode {
    command(["type":"clearHistory"])
