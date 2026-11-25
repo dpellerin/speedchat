@@ -35,6 +35,7 @@ import ChatCore
    onHide:{ [weak self] in self?.store.hide() },
    onNewChat:{ [weak self] in self?.store.newChat() }
   )
+  store.shouldFocusComposer={ [weak self] in self?.windowCoordinator.canFocusComposerOnActiveSpace() ?? false }
   if !fixture {panel.setFrameAutosaveName("SpeedChat.Panel");if !panel.setFrameUsingName("SpeedChat.Panel") {panel.center()}} else {panel.center()}
   hotkey.action={ [weak self] in self?.toggleFromHotKey() }
   preferences.updateHotkey={ [weak self] binding in try self?.hotkey.register(binding) }
@@ -157,6 +158,7 @@ import ChatCore
  @objc func quit() {NSApp.terminate(nil)}
  func windowShouldClose(_ sender:NSWindow)->Bool {if sender === panel {hide();return false};return true}
  func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
+  windowCoordinator?.stop()
   hotkey.remove();if let keyMonitor {NSEvent.removeMonitor(keyMonitor)}
   store.quit {Task { @MainActor in NSApp.reply(toApplicationShouldTerminate:true) }}
   return .terminateLater
