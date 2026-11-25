@@ -42,7 +42,8 @@ import ChatCore
    ),
    onShow:{ [weak self] in self?.store.show() },
    onHide:{ [weak self] in self?.store.hide() },
-   onNewChat:{ [weak self] in self?.store.newChat() }
+   onNewChat:{ [weak self] in self?.store.newChat() },
+   onShowHistory:{ [weak self] in self?.store.openHistory() }
   )
   store.shouldFocusComposer={ [weak self] in self?.windowCoordinator.canFocusComposerOnActiveSpace() ?? false }
   if !fixture {panel.setFrameAutosaveName("SpeedChat.Panel");if !panel.setFrameUsingName("SpeedChat.Panel") {panel.center()}} else {panel.center()}
@@ -60,8 +61,18 @@ import ChatCore
   createMainMenu()
   if !fixture {do {try hotkey.register(preferences.hotkey)} catch {preferences.error=error.localizedDescription};createMenu()}
   keyMonitor=NSEvent.addLocalMonitorForEvents(matching:.keyDown) { [weak self] event in
-   guard let self,self.panel.isKeyWindow,!(self.panel.firstResponder is RecorderButton) else {return event}
-   switch KeyboardPolicy.action(code:event.keyCode,modifiers:event.modifierFlags.chatModifiers,streaming:self.store.session.streaming) {
+   guard let self,self.panel.isKeyWindow,self.panel.attachedSheet == nil,!(self.panel.firstResponder is RecorderButton) else {return event}
+   switch KeyboardPolicy.action(
+    code:event.keyCode,
+    modifiers:event.modifierFlags.chatModifiers,
+    streaming:self.store.session.streaming,
+    showingHistory:self.store.showingHistory
+   ) {
+   case .toggleHistory:self.store.toggleHistory();return nil
+   case .closeHistory:self.store.closeHistory();return nil
+   case .historyUp:self.store.moveHistorySelection(-1);return nil
+   case .historyDown:self.store.moveHistorySelection(1);return nil
+   case .historyOpen:self.store.openSelectedHistoryConversation();return nil
    case .newChat:self.store.newChat();return nil
    case .stop:self.store.interrupt();return nil
    case .dismiss:self.hide();return nil
@@ -100,6 +111,7 @@ import ChatCore
  static let statusMenuSpec:[(title:String,action:Selector,key:String)]=[
   ("Show SpeedChat",#selector(showFromMenu),""),
   ("New Chat",#selector(newChat),"n"),
+  ("History",#selector(showHistory),"k"),
   ("Settings…",#selector(showSettings),","),
   ("About SpeedChat",#selector(showAbout),""),
   ("Quit SpeedChat",#selector(quit),"q")
@@ -141,6 +153,7 @@ import ChatCore
  }
  func hide() {windowCoordinator.hidePanel()}
  @objc func newChat() {windowCoordinator.newChatFromMenu()}
+ @objc func showHistory() {windowCoordinator.showHistoryFromMenu()}
  @objc func showSettings() {
   preferences.refreshLogin()
   if settingsWindow == nil {

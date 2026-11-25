@@ -11,11 +11,17 @@ import ChatCore
  @Published var readyMs:Double=0
  @Published var coldStarts=0
  @Published var warmReopens=0
+ @Published var showingHistory=false
+ @Published var historyEntries=[HistoryEntry]()
+ @Published var selectedHistoryIndex=0
+ private var draftsByConversation=[String:String]()
+ private var blankDraft=""
  var bridge:(any ChatBackend)?
  private let makeBridge:()->any ChatBackend
  private var teardown:Task<Void,Never>?
  private var quitting=false
  var eventTask:Task<Void,Never>?
+ private var eventContinuation:AsyncStream<BridgeEvent>.Continuation?
  var generation=0
  var hiddenAt:Date?
  var idleTimer:Timer?
@@ -30,9 +36,9 @@ import ChatCore
  func show() {
   hiddenAt=nil;idleTimer?.invalidate();idleTimer=nil
   if bridge != nil {warmReopens += 1} else if !fixtureMode {connect()}
-  focusToken += 1
+  if !showingHistory {focusToken += 1}
  }
- func hide() {hiddenAt=Date();scheduleIdle()}
+ func hide() {showingHistory=false;hiddenAt=Date();scheduleIdle()}
  private func scheduleIdle() {
   idleTimer?.invalidate()
   idleTimer=Timer.scheduledTimer(withTimeInterval:15,repeats:true) { [weak self] _ in Task { @MainActor in
@@ -42,6 +48,7 @@ import ChatCore
  }
  func connect() {
   guard !quitting else {return}
+  showingHistory=false
   stop();session.connecting()
   guard let teardown else {startBridge();return}
   let current=generation
@@ -57,21 +64,35 @@ import ChatCore
   let current=generation
   let backend=makeBridge();bridge=backend
   let (events,continuation)=AsyncStream<BridgeEvent>.makeStream()
+  eventContinuation=continuation
   eventTask=Task { @MainActor [weak self] in
    for await event in events {
     guard let self,!Task.isCancelled,self.generation == current else {return}
-    if event.type == "ready" {if self.session.phase == .connecting {self.readyMs=Date().timeIntervalSince(self.startedAt)*1000};if self.shouldFocusComposer() {self.focusToken += 1}}
-    self.session.receive(event);self.changed?()
-    if event.type == "done",self.shouldFocusComposer() {self.focusToken += 1}
+    self.receive(event)
    }
   }
   backend.start(codexOverride:codexOverride,options:ChatClientOptions()) {event in
    continuation.yield(event)
-   if event.type == "fatal" {continuation.finish()}
   }
  }
+ func receive(_ event:BridgeEvent) {
+  if event.type == "history" {
+   historyEntries=event.history ?? []
+   selectedHistoryIndex=historyEntries.isEmpty ? 0 : min(max(selectedHistoryIndex,0),historyEntries.count-1)
+   changed?()
+   return
+  }
+  if event.type == "ready" {
+   if session.phase == .connecting {readyMs=Date().timeIntervalSince(startedAt)*1000}
+   if shouldFocusComposer() && !showingHistory {focusToken += 1}
+  } else if event.type == "offlineConversation" {
+   if shouldFocusComposer() && !showingHistory {focusToken += 1}
+  }
+  session.receive(event);changed?()
+  if event.type == "done",shouldFocusComposer() && !showingHistory {focusToken += 1}
+ }
  func stop(completion:(()->Void)?=nil) {
-  generation += 1;eventTask?.cancel();eventTask=nil;idleTimer?.invalidate();idleTimer=nil
+  generation += 1;eventContinuation?.finish();eventContinuation=nil;eventTask?.cancel();eventTask=nil;idleTimer?.invalidate();idleTimer=nil
   if let outgoing=bridge {
    bridge=nil
    let (closed,signal)=AsyncStream<Void>.makeStream()
@@ -87,12 +108,58 @@ import ChatCore
   stop(completion:completion)
  }
  func command(_ value:[String:String]) {if fixtureMode {fixtureCommands.append(value)} else {bridge?.send(value)}}
+ private func saveDraftForCurrentConversation() {
+  if let id=session.conversationId {
+   if draft.isEmpty {draftsByConversation.removeValue(forKey:id)}
+   else {draftsByConversation[id]=draft}
+  } else {
+   blankDraft=draft
+  }
+ }
  func send() {
   guard let text=session.beginSend(draft),let id=session.messages.last?.id,
         let executionID=session.executionID else {return}
+  if let cid=session.conversationId {draftsByConversation.removeValue(forKey:cid)} else {blankDraft=""}
   draft="";followBottom=true;command(["type":"send","text":text,"itemId":id,"executionID":executionID.uuidString])
  }
- func newChat() {guard session.beginNewChat() else {return};followBottom=true;command(["type":"newChat"])}
+ func newChat() {
+  guard session.beginNewChat() else {return}
+  if let cid=session.conversationId {
+   if draft.isEmpty {draftsByConversation.removeValue(forKey:cid)}
+   else {draftsByConversation[cid]=draft}
+  }
+  blankDraft="";draft="";showingHistory=false;followBottom=true;command(["type":"newChat"])
+ }
+ func openHistory() {
+  guard session.canOpenHistory else {return}
+  showingHistory=true
+  selectedHistoryIndex=0
+  command(["type":"listHistory"])
+ }
+ func closeHistory() {
+  guard showingHistory else {return}
+  showingHistory=false
+  if shouldFocusComposer() {focusToken += 1}
+ }
+ func toggleHistory() {
+  if showingHistory {closeHistory()} else {openHistory()}
+ }
+ func moveHistorySelection(_ delta:Int) {
+  guard showingHistory,!historyEntries.isEmpty else {return}
+  selectedHistoryIndex=min(max(selectedHistoryIndex+delta,0),historyEntries.count-1)
+ }
+ func openSelectedHistoryConversation() {
+  guard showingHistory,historyEntries.indices.contains(selectedHistoryIndex) else {return}
+  openHistoryConversation(id:historyEntries[selectedHistoryIndex].id)
+ }
+ func openHistoryConversation(id:String) {
+  guard session.canOpenHistory else {return}
+  saveDraftForCurrentConversation()
+  draft=draftsByConversation[id] ?? ""
+  showingHistory=false
+  followBottom=true
+  command(["type":"openConversation","conversationId":id])
+ }
  func selectModel(_ model:String) {guard session.beginModelChange(model) else {return};command(["type":"selectModel","model":model])}
  func reloadConfig() {
   if bridge != nil && session.phase != .offline {command(["type":"reloadConfig"])}

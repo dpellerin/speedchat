@@ -18,6 +18,7 @@ public struct ChatModel: Codable, Identifiable, Equatable, Sendable {
 }
 public struct BridgeEvent: Codable, Sendable {
  public var type: String
+ public var conversationId: String?
  public var messages: [ChatMessage]?
  public var models: [ChatModel]?
  public var model: String?
@@ -32,8 +33,10 @@ public struct BridgeEvent: Codable, Sendable {
     public var stateSaveError: String?
     public var codexRetry: CodexRetry?
     public var executionID: UUID?
+    public var history: [HistoryEntry]?
     public init(
         type: String,
+        conversationId: String? = nil,
         messages: [ChatMessage]? = nil,
         models: [ChatModel]? = nil,
         model: String? = nil,
@@ -47,9 +50,11 @@ public struct BridgeEvent: Codable, Sendable {
         busy: Bool? = nil,
         stateSaveError: String? = nil,
         codexRetry: CodexRetry? = nil,
-        executionID: UUID? = nil
+        executionID: UUID? = nil,
+        history: [HistoryEntry]? = nil
     ) {
         self.type = type
+        self.conversationId = conversationId
         self.messages = messages
         self.models = models
         self.model = model
@@ -64,11 +69,13 @@ public struct BridgeEvent: Codable, Sendable {
         self.stateSaveError = stateSaveError
         self.codexRetry = codexRetry
         self.executionID = executionID
+        self.history = history
     }
 }
 public struct ChatSession: Sendable {
  public enum Phase: Sendable { case offline,connecting,ready,sending,selecting,resetting,checkingDelivery }
  public private(set) var phase: Phase = .offline
+ public private(set) var conversationId: String?
  public private(set) var messages=[ChatMessage]()
  public private(set) var transcriptID=UUID()
  public private(set) var models=[ChatModel]()
@@ -84,6 +91,7 @@ public struct ChatSession: Sendable {
  public private(set) var failed=false
  public private(set) var metrics=[String:Double]()
  public var canInteract: Bool { phase == .ready }
+ public var canOpenHistory: Bool { phase == .ready || phase == .offline }
  private var selectedOpenRouter:Bool {
   models.first(where:{$0.model == selectedModel})?.isOpenRouter ?? selectedModel.contains("/")
  }
@@ -133,7 +141,7 @@ public struct ChatSession: Sendable {
   guard event.executionID == nil || event.executionID == executionID else {return}
   switch event.type {
   case "ready","offlineConversation":
-   transcriptID=UUID();messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel
+   transcriptID=UUID();conversationId=event.conversationId;messages=event.messages ?? [];models=event.models ?? [];selectedModel=event.model ?? "";activeModel=selectedModel
    let isOffline=event.type == "offlineConversation"
    phase = isOffline ? .offline : .ready
    notice=(isOffline ? event.notice : (event.stateSaveError ?? event.notice)) ?? "Ready"
@@ -150,6 +158,7 @@ public struct ChatSession: Sendable {
    messages=event.messages ?? messages;phase = .sending;notice="Thinking…";codexRetry=nil
   case "conversationUpdated":
    guard streaming || phase == .checkingDelivery else {return}
+   if let id=event.conversationId {conversationId=id}
    messages=event.messages ?? messages
    phase = .ready;notice=event.stateSaveError ?? event.notice ?? "Ready";activeCodexPromptId=nil;executionID=nil
    failed=event.stateSaveError != nil;failureDetails=event.stateSaveError
@@ -187,10 +196,12 @@ public struct ChatSession: Sendable {
   case "searching": if streaming {notice="Searching the web…"}
   case "done":
    guard streaming else {return}
+   if let id=event.conversationId {conversationId=id}
    phase = .ready;activeCodexPromptId=nil;executionID=nil;if !failed {notice=event.stateSaveError ?? "Ready"}
    updateCodexRetry(event.codexRetry)
   case "error":
    guard phase != .offline else {return}
+   if let id=event.conversationId {conversationId=id}
    failed=true;notice=event.message ?? "Something went wrong.";failureDetails=notice
    phase = phase == .connecting ? .offline : (event.busy == true ? .sending : .ready)
    if !streaming {executionID=nil}

@@ -54,6 +54,24 @@ struct ConversationContinuity {
         needsLegacyHistory = saved.messages == nil
     }
 
+    init(restoring saved: SavedConversation) {
+        conversationId = saved.id
+        createdAt = saved.createdAt
+        updatedAt = saved.updatedAt
+        if saved.threadId.isEmpty {
+            thread = nil
+        } else {
+            thread = saved.threadId.hasPrefix("openrouter-") ? .standalone(saved.threadId) : .detached(saved.threadId)
+        }
+        messages = saved.messages
+        codexSyncedCount = min(max(saved.codexSyncedCount, 0), messages.count)
+        if let attempt = saved.lastCodexSend, attempt.threadId == saved.threadId,
+           userIndex(messageId: attempt.userMessageId) != nil {
+            lastCodexSend = attempt
+        }
+        needsLegacyHistory = false
+    }
+
     mutating func recordUndispatchedCodexPrompt(_ user: ChatMessage) {
         guard let thread else { return }
         if userIndex(messageId: user.id) == nil {

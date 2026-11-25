@@ -127,14 +127,115 @@ import Foundation
  session.receive(BridgeEvent(type:"done")); #expect(session.canInteract); #expect(session.notice == "Blocked"); #expect(session.shouldStopIdle(hidden:true,elapsed:301)); #expect(!session.shouldStopIdle(hidden:false,elapsed:600))
 }
 
-@Test func openRouterModelIdentificationAndCatalogHotReload() throws {
+ @Test func openRouterModelIdentificationAndCatalogHotReload() throws {
+  var session=ChatSession()
+  let ready=try JSONDecoder().decode(BridgeEvent.self,from:Data("{\"type\":\"ready\",\"messages\":[],\"model\":\"gpt-6-luna\",\"models\":[{\"model\":\"gpt-6-luna\",\"displayName\":\"GPT-6 Luna\",\"provider\":\"openai\"}]}".utf8))
+  session.receive(ready)
+  #expect(session.models.first?.isOpenRouter == false)
+  let update=try JSONDecoder().decode(BridgeEvent.self,from:Data("{\"type\":\"modelsUpdated\",\"model\":\"deepseek/deepseek-v4.1-flash\",\"models\":[{\"model\":\"gpt-6-luna\",\"displayName\":\"GPT-6 Luna\",\"provider\":\"openai\"},{\"model\":\"deepseek/deepseek-v4.1-flash\",\"displayName\":\"DeepSeek V4.1 Flash\",\"provider\":\"openrouter\"}]}".utf8))
+  session.receive(update)
+  #expect(session.models.count == 2)
+  #expect(session.models.last?.isOpenRouter == true)
+  #expect(session.selectedModel == "deepseek/deepseek-v4.1-flash")
+ }
+
+@Test func sessionHistoryGatingAndConversationIdTracking() {
  var session=ChatSession()
- let ready=try JSONDecoder().decode(BridgeEvent.self,from:Data("{\"type\":\"ready\",\"messages\":[],\"model\":\"gpt-6-luna\",\"models\":[{\"model\":\"gpt-6-luna\",\"displayName\":\"GPT-6 Luna\",\"provider\":\"openai\"}]}".utf8))
- session.receive(ready)
- #expect(session.models.first?.isOpenRouter == false)
- let update=try JSONDecoder().decode(BridgeEvent.self,from:Data("{\"type\":\"modelsUpdated\",\"model\":\"deepseek/deepseek-v4.1-flash\",\"models\":[{\"model\":\"gpt-6-luna\",\"displayName\":\"GPT-6 Luna\",\"provider\":\"openai\"},{\"model\":\"deepseek/deepseek-v4.1-flash\",\"displayName\":\"DeepSeek V4.1 Flash\",\"provider\":\"openrouter\"}]}".utf8))
- session.receive(update)
- #expect(session.models.count == 2)
- #expect(session.models.last?.isOpenRouter == true)
- #expect(session.selectedModel == "deepseek/deepseek-v4.1-flash")
+ // Offline allows History; connecting blocks it.
+ #expect(session.phase == .offline)
+ #expect(session.canOpenHistory)
+ session.connecting()
+ #expect(!session.canOpenHistory)
+
+ // Ready allows History and tracks conversationId.
+ session.receive(BridgeEvent(
+  type:"ready",
+  conversationId:"conv-1",
+  messages:[ChatMessage(id:"u1",role:"user",text:"Hi")],
+  models:[ChatModel(model:"gpt-6-luna",displayName:"GPT-6 Luna",provider:"openai")],
+  model:"gpt-6-luna"
+ ))
+ #expect(session.canOpenHistory)
+ #expect(session.conversationId == "conv-1")
+
+ // Active turn blocks History; done restores History and updates conversationId.
+ _ = session.beginSend("Follow up")
+ #expect(!session.canOpenHistory)
+ session.receive(BridgeEvent(type:"done",conversationId:"conv-1",executionID:session.executionID))
+ #expect(session.canOpenHistory)
+
+ // Model change and New Chat mutations block History until complete.
+ let changingModel=session.beginModelChange("gpt-6-luna")
+ #expect(changingModel)
+ #expect(!session.canOpenHistory)
+ session.receive(BridgeEvent(type:"modelSelected",model:"gpt-6-luna"))
+ #expect(session.canOpenHistory)
+
+ let startingNew=session.beginNewChat()
+ #expect(startingNew)
+ #expect(!session.canOpenHistory)
+ session.receive(BridgeEvent(
+  type:"ready",
+  conversationId:nil,
+  messages:[],
+  models:[ChatModel(model:"gpt-6-luna",displayName:"GPT-6 Luna",provider:"openai")],
+  model:"gpt-6-luna"
+ ))
+ #expect(session.canOpenHistory)
+ #expect(session.conversationId == nil)
+
+ // Checking Codex delivery blocks History.
+ session.receive(BridgeEvent(
+  type:"ready",
+  conversationId:"conv-retry",
+  messages:[ChatMessage(id:"p1",role:"user",text:"Pending")],
+  models:[ChatModel(model:"gpt-6-luna",displayName:"GPT-6 Luna",provider:"openai")],
+  model:"gpt-6-luna",
+  codexRetry:CodexRetry(userMessageId:"p1",action:.checkDelivery)
+ ))
+ let checkingId=session.beginCodexRetry(resend:false)
+ #expect(checkingId == "p1")
+ #expect(!session.canOpenHistory)
+ session.receive(BridgeEvent(type:"conversationUpdated",conversationId:"conv-retry",messages:[ChatMessage(id:"p1",role:"user",text:"Pending")],executionID:session.executionID))
+ #expect(session.canOpenHistory)
+
+ // Offline conversation keeps History allowed and preserves conversationId.
+ session.receive(BridgeEvent(
+  type:"offlineConversation",
+  conversationId:"conv-offline",
+  messages:[ChatMessage(id:"o1",role:"user",text:"Saved")],
+  models:[],
+  model:"gpt-6-luna",
+  notice:"Offline"
+ ))
+ #expect(session.phase == .offline)
+ #expect(session.canOpenHistory)
+ #expect(session.conversationId == "conv-offline")
+}
+
+@Test func keyboardPolicySupportsHistoryModeWithoutOverridingSystemShortcuts() {
+ // ⌘K toggles History in both normal and History modes, never with extra modifiers.
+ #expect(KeyboardPolicy.action(code:40,modifiers:[.command]) == .toggleHistory)
+ #expect(KeyboardPolicy.action(code:40,modifiers:[.command],showingHistory:true) == .toggleHistory)
+ #expect(KeyboardPolicy.action(code:40,modifiers:[.command,.shift]) == .normal)
+ #expect(KeyboardPolicy.action(code:40,modifiers:[]) == .normal)
+
+ // History mode navigation & close shortcuts.
+ #expect(KeyboardPolicy.action(code:53,modifiers:[],showingHistory:true) == .closeHistory)
+ #expect(KeyboardPolicy.action(code:126,modifiers:[],showingHistory:true) == .historyUp)
+ #expect(KeyboardPolicy.action(code:125,modifiers:[],showingHistory:true) == .historyDown)
+ #expect(KeyboardPolicy.action(code:36,modifiers:[],showingHistory:true) == .historyOpen)
+ #expect(KeyboardPolicy.action(code:76,modifiers:[],showingHistory:true) == .historyOpen)
+ #expect(KeyboardPolicy.action(code:45,modifiers:[.command],showingHistory:true) == .newChat)
+ #expect(KeyboardPolicy.action(code:13,modifiers:[.command],showingHistory:true) == .dismiss)
+
+ // Arrows and typing stay normal outside History mode.
+ #expect(KeyboardPolicy.action(code:126,modifiers:[]) == .normal)
+ #expect(KeyboardPolicy.action(code:125,modifiers:[]) == .normal)
+
+ // Standard macOS Edit/system shortcuts remain untouched in both modes (C, V, X, Z, A, Q, comma).
+ for code: UInt16 in [8, 9, 7, 6, 0, 12, 43] {
+  #expect(KeyboardPolicy.action(code:code,modifiers:[.command],showingHistory:false) == .normal)
+  #expect(KeyboardPolicy.action(code:code,modifiers:[.command],showingHistory:true) == .normal)
+ }
 }

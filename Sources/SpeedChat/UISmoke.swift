@@ -214,12 +214,82 @@ extension AppDelegate {
           (self.panel.contentView.map(findProse) ?? []).contains {$0.storage.string == reply.text && !$0.visibleRect.isEmpty})
 
     let offlineNotice="Codex is offline. Reconnect to continue."
-    self.store.session.receive(BridgeEvent(type:"offlineConversation",messages:[pending,reply],models:[],model:"gpt-6-luna",notice:offlineNotice))
+    self.store.session.receive(BridgeEvent(type:"offlineConversation",conversationId:"conv-offline-a",messages:[pending,reply],models:[],model:"gpt-6-luna",notice:offlineNotice))
     try? await Task.sleep(for:.milliseconds(150))
     self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
     check("Panel shows the saved conversation while offline",
           self.store.session.phase == .offline && !self.store.session.canSend && self.store.fixtureStatusNotice == offlineNotice &&
           (self.panel.contentView.map(findProse) ?? []).contains {$0.storage.string == reply.text && !$0.visibleRect.isEmpty})
+
+    // Conversation History smoke checks: status menu entry, offline browse/open,
+    // online in-place UI with compact header, keyboard navigation, scroll-to-bottom,
+    // per-conversation draft preservation, and Esc / hide abandon back to composer focus.
+    check("Status menu includes History with Command-K shortcut",
+          Self.statusMenuSpec.contains {$0.title == "History" && $0.key == "k" && $0.action == #selector(AppDelegate.showHistory)})
+
+    let smokeNow=Date()
+    let iso=ISO8601DateFormatter()
+    iso.formatOptions=[.withInternetDateTime,.withFractionalSeconds]
+    let historyA=HistoryEntry(id:"conv-offline-a",title:"Orchard opening hours",updatedAt:iso.string(from:smokeNow.addingTimeInterval(-120)),preview:"The orchard opens at noon.",model:"gpt-6-luna",messageCount:2)
+    let historyB=HistoryEntry(id:"conv-older-b",title:"Lisbon weekend itinerary",updatedAt:iso.string(from:smokeNow.addingTimeInterval(-7200)),preview:"Start in Alfama and ride Tram 28.",model:"gpt-6-sol",messageCount:10)
+
+    self.store.openHistory()
+    self.store.receive(BridgeEvent(type:"history",history:[]))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    let emptyHistoryRendered=self.panel.contentView.map{!hasScrollView($0) && composerIn($0) == nil} ?? false
+    self.store.receive(BridgeEvent(type:"history",history:[historyA,historyB]))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    let historyWindows=NSApp.windows.filter{$0 !== self.panel && $0.isVisible}
+    let historyHeaderCompact=self.panel.contentView.flatMap(findDrag).map{$0.bounds.height <= 32} ?? false
+    let populatedHistoryScrollable=self.panel.contentView.map{hasScrollView($0) && composerIn($0) == nil} ?? false
+    check("History opens in-place inside Panel while offline with empty state and compact header",
+          self.store.showingHistory && historyWindows.isEmpty && historyHeaderCompact && emptyHistoryRendered && populatedHistoryScrollable &&
+          self.store.fixtureCommands.last?["type"] == "listHistory")
+    if let content=self.panel.contentView,let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) {content.cacheDisplay(in:content.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/history.png"))}
+
+    self.store.moveHistorySelection(1)
+    self.store.openSelectedHistoryConversation()
+    let offlineResumedMessages=(0..<10).map {idx in
+     ChatMessage(id:"lisbon-\(idx)",role:idx.isMultiple(of:2) ? "user" : "assistant",text:idx == 9 ? "Final Lisbon recommendation at bottom." : String(repeating:"Lisbon notes paragraph. ",count:12))
+    }
+    self.store.receive(BridgeEvent(type:"offlineConversation",conversationId:historyB.id,messages:offlineResumedMessages,models:[],model:"gpt-6-sol",notice:offlineNotice))
+    try? await Task.sleep(for:.milliseconds(200))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    check("Selecting a saved conversation while offline opens it in read-only mode scrolled to bottom",
+          !self.store.showingHistory && self.store.session.phase == .offline && self.store.session.conversationId == historyB.id &&
+          self.store.fixtureCommands.last == ["type":"openConversation","conversationId":historyB.id] &&
+          (self.panel.contentView.map(findProse) ?? []).contains {$0.storage.string == "Final Lisbon recommendation at bottom." && !$0.visibleRect.isEmpty})
+
+    // Online ready mode: draft preservation, Esc abandon, hide abandon with composer focus, and active-turn gating.
+    self.store.receive(BridgeEvent(type:"ready",conversationId:historyB.id,messages:offlineResumedMessages,models:ready.models,model:"gpt-6-sol"))
+    self.store.draft="Unsent Lisbon note"
+    self.store.openHistory()
+    self.store.receive(BridgeEvent(type:"history",history:[historyA,historyB]))
+    try? await Task.sleep(for:.milliseconds(100))
+    self.store.closeHistory()
+    try? await Task.sleep(for:.milliseconds(150))
+    let composerAfterEsc=self.panel.contentView.flatMap(composerIn)
+    check("Abandoning History returns to active conversation with draft intact and composer focused",
+          !self.store.showingHistory && self.store.session.conversationId == historyB.id &&
+          self.store.draft == "Unsent Lisbon note" && composerAfterEsc != nil && self.panel.firstResponder === composerAfterEsc)
+
+    self.store.openHistory()
+    self.hide()
+    let hiddenResetHistory = !self.store.showingHistory
+    self.show()
+    try? await Task.sleep(for:.milliseconds(150))
+    let composerAfterHide=self.panel.contentView.flatMap(composerIn)
+    check("Hiding Panel while History is open abandons History and focuses composer on reopen",
+          hiddenResetHistory && !self.store.showingHistory && self.store.draft == "Unsent Lisbon note" &&
+          composerAfterHide != nil && self.panel.firstResponder === composerAfterHide)
+
+    self.store.send()
+    self.store.openHistory()
+    let blockedWhileStreaming = !self.store.showingHistory && self.store.session.streaming
+    self.store.receive(BridgeEvent(type:"done",conversationId:historyB.id,executionID:self.store.session.executionID))
+    check("History is blocked while an active turn is streaming",blockedWhileStreaming && self.store.session.canOpenHistory)
 
     if CommandLine.arguments.contains("--new-chat-smoke") {
      let failures=checks.filter{($0["passed"] as? Bool) != true}.count
@@ -251,8 +321,9 @@ extension AppDelegate {
     if let notice {
      // SwiftUI's virtual buttons are absent from in-process AX children. Send
      // mouse events only to this fixture window, at the screenshot-verified
-     // Details position (100 points from the right edge, beside Retry).
-     let screen=NSPoint(x:self.panel.frame.maxX-100,y:notice.accessibilityFrame().midY)
+     // Details position (100 points from right edge beside Retry, or 46 points when alone).
+     let detailsOffset:CGFloat=(self.store.session.canRetryOpenRouter || self.store.session.visibleCodexRetry != nil) ? 100 : 46
+     let screen=NSPoint(x:self.panel.frame.maxX-detailsOffset,y:notice.accessibilityFrame().midY)
      let point=self.panel.convertPoint(fromScreen:screen)
      for type in [NSEvent.EventType.leftMouseDown,.leftMouseUp] {
       if let event=NSEvent.mouseEvent(with:type,location:point,modifierFlags:[],timestamp:ProcessInfo.processInfo.systemUptime,windowNumber:self.panel.windowNumber,context:nil,eventNumber:0,clickCount:1,pressure:0) {self.panel.sendEvent(event)}

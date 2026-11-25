@@ -82,6 +82,7 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                         let notice = (ready.resumed && !ready.messages.isEmpty) ? "Resumed previous chat" : "Ready"
                         self.onEvent?(BridgeEvent(
                             type: offlineReason == nil ? "ready" : "offlineConversation",
+                            conversationId: ready.conversationId,
                             messages: ready.messages,
                             models: offlineReason == nil ? ready.models : [],
                             model: ready.model,
@@ -212,6 +213,7 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                             guard let self, !self.closing else { return }
                             self.onEvent?(BridgeEvent(
                                 type: "ready",
+                                conversationId: ready.conversationId,
                                 messages: ready.messages,
                                 models: ready.models,
                                 model: ready.model,
@@ -252,6 +254,36 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                         guard let self, !self.closing else { return }
                         self.onEvent?(BridgeEvent(type: "modelsUpdated", models: ready.models, model: ready.model, codexRetry: ready.codexRetry))
                     }
+                }
+                return
+            }
+            if type == "listHistory" {
+                let entries = chatClient.listHistory()
+                onEvent?(BridgeEvent(type: "history", history: entries))
+                return
+            }
+            if type == "openConversation" {
+                guard let id = command["conversationId"], !id.isEmpty else { return }
+                do {
+                    let ready = try chatClient.openConversation(id: id)
+                    let offlineReason = ready.offlineReason
+                    onEvent?(BridgeEvent(
+                        type: offlineReason == nil ? "ready" : "offlineConversation",
+                        conversationId: ready.conversationId,
+                        messages: ready.messages,
+                        models: offlineReason == nil ? ready.models : [],
+                        model: ready.model,
+                        notice: offlineReason.map { "Offline · \($0)" } ?? "Ready",
+                        stateSaveError: ready.stateSaveError,
+                        codexRetry: ready.codexRetry
+                    ))
+                } catch {
+                    onEvent?(BridgeEvent(
+                        type: "error",
+                        message: StateStore.friendlyError(error),
+                        busy: chatClient.busy,
+                        codexRetry: chatClient.codexRetry
+                    ))
                 }
                 return
             }

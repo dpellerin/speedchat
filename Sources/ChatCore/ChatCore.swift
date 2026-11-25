@@ -33,9 +33,20 @@ public struct KeyModifiers: OptionSet, Sendable {
  public static let shift=Self(rawValue:1), command=Self(rawValue:2), control=Self(rawValue:4), option=Self(rawValue:8)
 }
 public enum KeyboardPolicy {
- public enum Action: Equatable {case send,newline,newChat,stop,dismiss,pageUp,pageDown,normal}
- public static func action(code:UInt16,modifiers:KeyModifiers,streaming:Bool=false) -> Action {
+ public enum Action: Equatable {
+  case send,newline,newChat,stop,dismiss,pageUp,pageDown,toggleHistory,closeHistory,historyUp,historyDown,historyOpen,normal
+ }
+ public static func action(code:UInt16,modifiers:KeyModifiers,streaming:Bool=false,showingHistory:Bool=false) -> Action {
   if code == 13 && modifiers == [.command] {return .dismiss}
+  if code == 40 && modifiers == [.command] {return .toggleHistory}
+  if showingHistory {
+   if code == 53 {return .closeHistory}
+   if code == 126 && modifiers.isEmpty {return .historyUp}
+   if code == 125 && modifiers.isEmpty {return .historyDown}
+   if (code == 36 || code == 76) && modifiers.isEmpty {return .historyOpen}
+   if code == 45 && (modifiers.contains(.command) || modifiers.contains(.control)) {return .newChat}
+   return .normal
+  }
   if code == 53 {return streaming ? .stop : .dismiss}
   if code == 45 && (modifiers.contains(.command) || modifiers.contains(.control)) {return .newChat}
   if code == 116 {return .pageUp}; if code == 121 {return .pageDown}

@@ -106,7 +106,7 @@ public enum StateStore {
         return formatter.string(from: date)
     }
 
-    static func parseTimestamp(_ value: String) -> Date? {
+    public static func parseTimestamp(_ value: String) -> Date? {
         let fractional = ISO8601DateFormatter()
         fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         if let date = fractional.date(from: value) { return date }
@@ -436,6 +436,24 @@ public enum StateStore {
         try writePrivateFile(activeData, to: target)
         try replaceFile(at: destURL, withTemp: convTempURL)
         convCommitted = true
+    }
+
+    static func setActiveConversation(_ record: SavedConversation, model: String, to target: URL) throws {
+        guard isValidConversationId(record.id) else {
+            throw NSError(domain: "SpeedChat.Persistence", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Invalid conversation identifier.",
+            ])
+        }
+        let activeState = ActiveStateRecord(
+            version: PersistedState.currentVersion,
+            activeConversationId: record.id,
+            threadId: record.threadId,
+            model: model,
+            updatedAt: record.updatedAt,
+            needsLegacyHistory: nil
+        )
+        let activeData = try encodeJSON(activeState)
+        try writePrivateFile(activeData, to: target)
     }
 
     static func saveBlankActiveState(

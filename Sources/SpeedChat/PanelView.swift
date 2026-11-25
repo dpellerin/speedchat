@@ -179,7 +179,19 @@ struct PanelView:View {
  private typealias ViewState<Value> = SwiftUI.State<Value>
  @ViewState private var showingErrorDetails=false
  var body:some View {
-  VStack(spacing:0) {header;Divider();transcript;Divider();footer}
+  VStack(spacing:0) {
+   header
+   Divider()
+   if store.showingHistory {
+    historyList
+    Divider()
+    historyFooter
+   } else {
+    transcript
+    Divider()
+    footer
+   }
+  }
    .frame(minWidth:400,minHeight:460)
    .background(colorScheme == .light ? Color.white : Color(nsColor:.windowBackgroundColor))
    .environment(\.openURL,OpenURLAction {url in NativeActions.open(url) ? .handled : .discarded})
@@ -189,28 +201,87 @@ struct PanelView:View {
   let openAiModels=store.session.models.filter{!$0.isOpenRouter}
   let openRouterModels=store.session.models.filter{$0.isOpenRouter}
   return HStack(spacing:12) {
-   DragHeader().frame(height:24).frame(minWidth:50,maxWidth:.infinity)
-   Menu {
-    if !openAiModels.isEmpty {
-     Section("OpenAI") {
-      ForEach(openAiModels) {model in
-       Button {store.selectModel(model.model)} label:{if model.model == store.session.selectedModel {Label(model.displayName,systemImage:"checkmark")} else {Text(model.displayName)}}
+   if store.showingHistory {
+    // Clear the macOS window traffic lights in fullSizeContentView titlebars.
+    Spacer().frame(width:60)
+    Button {store.closeHistory()} label:{Label("Back",systemImage:"chevron.left").font(.callout)}
+     .buttonStyle(.borderless)
+     .help("Return to current conversation (Esc)")
+     .accessibilityIdentifier("speedchat-history-back")
+    DragHeader().frame(height:24).frame(minWidth:50,maxWidth:.infinity)
+    Button {store.newChat()} label:{Label("New Chat",systemImage:"square.and.pencil").font(.callout)}
+     .buttonStyle(.borderless)
+     .disabled(!store.session.canInteract)
+     .help("Start a new conversation (⌘N)")
+     .accessibilityIdentifier("speedchat-history-new-chat")
+   } else {
+    DragHeader().frame(height:24).frame(minWidth:50,maxWidth:.infinity)
+    Button {store.openHistory()} label:{Label("History",systemImage:"clock.arrow.circlepath").font(.callout)}
+     .buttonStyle(.borderless)
+     .disabled(!store.session.canOpenHistory)
+     .help("Conversation History (⌘K)")
+     .accessibilityLabel("Conversation History")
+     .accessibilityIdentifier("speedchat-history-button")
+    Menu {
+     if !openAiModels.isEmpty {
+      Section("OpenAI") {
+       ForEach(openAiModels) {model in
+        Button {store.selectModel(model.model)} label:{if model.model == store.session.selectedModel {Label(model.displayName,systemImage:"checkmark")} else {Text(model.displayName)}}
+       }
       }
      }
-    }
-    Section("OpenRouter") {
-     if openRouterModels.isEmpty {
-      Button("Configure OpenRouter in Settings…") {settings()}
-     } else {
-      ForEach(openRouterModels) {model in
-       Button {store.selectModel(model.model)} label:{if model.model == store.session.selectedModel {Label(model.displayName,systemImage:"checkmark")} else {Text(model.displayName)}}
+     Section("OpenRouter") {
+      if openRouterModels.isEmpty {
+       Button("Configure OpenRouter in Settings…") {settings()}
+      } else {
+       ForEach(openRouterModels) {model in
+        Button {store.selectModel(model.model)} label:{if model.model == store.session.selectedModel {Label(model.displayName,systemImage:"checkmark")} else {Text(model.displayName)}}
+       }
+       Divider()
+       Button("OpenRouter Settings…") {settings()}
       }
-      Divider()
-      Button("OpenRouter Settings…") {settings()}
      }
-    }
-   } label:{Label(modelLabel,systemImage:"sparkle").font(.callout)}.disabled(!store.session.canInteract || store.session.models.isEmpty).help("Select the model for your next message")
+    } label:{Label(modelLabel,systemImage:"sparkle").font(.callout)}.disabled(!store.session.canInteract || store.session.models.isEmpty).help("Select the model for your next message")
+   }
   }.padding(.horizontal,18).padding(.vertical,8)
+ }
+ private var historyList:some View {
+  Group {
+   if store.historyEntries.isEmpty {
+    VStack(spacing:12) {
+     Image(systemName:"clock.arrow.circlepath").font(.system(size:30)).foregroundStyle(.secondary)
+     Text("No saved conversations yet").font(.title3.weight(.medium))
+      .accessibilityLabel("No saved conversations yet")
+      .accessibilityIdentifier("speedchat-history-empty")
+     Text("Conversations with at least one message appear here.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+    }.frame(maxWidth:.infinity,maxHeight:.infinity).padding(24)
+   } else {
+    ScrollViewReader {proxy in
+     ScrollView {
+      LazyVStack(alignment:.leading,spacing:6) {
+       ForEach(Array(store.historyEntries.enumerated()),id:\.element.id) {index,entry in
+        HistoryRowView(
+         entry:entry,
+         isCurrent:entry.id == store.session.conversationId,
+         isSelected:index == store.selectedHistoryIndex,
+         open:{store.openHistoryConversation(id:entry.id)}
+        ).id(entry.id)
+       }
+      }.padding(14)
+     }
+     .onChange(of:store.selectedHistoryIndex) {_,index in
+      guard store.historyEntries.indices.contains(index) else {return}
+      proxy.scrollTo(store.historyEntries[index].id,anchor:nil)
+     }
+    }
+   }
+  }.frame(maxWidth:.infinity,maxHeight:.infinity)
+ }
+ private var historyFooter:some View {
+  HStack {
+   Text("↑↓ Navigate   ↵ Open   ⌘N New   Esc Back").font(.system(size:10)).foregroundStyle(.secondary)
+   Spacer(minLength:0)
+  }.padding(.horizontal,18).padding(.vertical,10)
  }
  private var transcript:some View {
   // Rebuild the scroll container when loading a conversation so its lazy
@@ -231,6 +302,14 @@ struct PanelView:View {
      }
      guard store.followBottom && !scroll.userScrolled else {return}
      proxy.scrollTo(last.id,anchor:.top)
+    }
+    .task(id:store.session.transcriptID) {
+     scroll.userScrolled=false
+     store.followBottom=true
+     guard !store.session.messages.isEmpty else {return}
+     proxy.scrollTo("bottom",anchor:.bottom)
+     await Task.yield()
+     proxy.scrollTo("bottom",anchor:.bottom)
     }
     if !store.followBottom {Button {scroll.userScrolled=false;store.followBottom=true;proxy.scrollTo("bottom",anchor:.bottom)} label:{Label("Latest",systemImage:"arrow.down")}.buttonStyle(.borderedProminent).padding(14)}
    }
@@ -283,7 +362,7 @@ struct PanelView:View {
  }
  private var hints:some View {
   VStack(alignment:.leading,spacing:4) {
-   Text("↵ Send   ⇧↵ Newline   ⌘N New   Esc Hide / Stop")
+   Text("↵ Send   ⇧↵ Newline   ⌘K History   ⌘N New   Esc Hide / Stop")
    if preferences.metrics {Text("Ready \(Int(store.readyMs)) ms · First \(Int(store.session.metrics["first-token"] ?? 0)) ms · Total \(Int(store.session.metrics["response"] ?? 0)) ms").help("Cold starts: \(store.coldStarts), warm reopens: \(store.warmReopens)")}
   }.font(.system(size:10)).foregroundStyle(.secondary)
  }
@@ -299,4 +378,70 @@ struct DragHeader:NSViewRepresentable {
 }
 @MainActor final class HeaderDragView:NSView {
  override func mouseDown(with event:NSEvent) {window?.performDrag(with:event)}
+}
+
+@MainActor private enum HistoryTimeFormatter {
+ private static let formatter:RelativeDateTimeFormatter={
+  let value=RelativeDateTimeFormatter()
+  value.unitsStyle = .abbreviated
+  return value
+ }()
+ static func relativeString(for isoTimestamp:String,now:Date=Date()) -> String {
+  guard let date=StateStore.parseTimestamp(isoTimestamp) else {return ""}
+  if abs(now.timeIntervalSince(date)) < 45 {return "Just now"}
+  return formatter.localizedString(for:date,relativeTo:now)
+ }
+}
+
+private struct HistoryRowView:View {
+ let entry:HistoryEntry
+ let isCurrent:Bool
+ let isSelected:Bool
+ let open:()->Void
+ private typealias ViewState<Value> = SwiftUI.State<Value>
+ @ViewState private var hovered=false
+ var body:some View {
+  Button(action:open) {
+   VStack(alignment:.leading,spacing:4) {
+    HStack(spacing:8) {
+     Text(entry.title).font(.system(size:14,weight:.semibold)).foregroundStyle(.primary).lineLimit(1)
+     if isCurrent {
+      Text("Current")
+       .font(.caption2.weight(.medium))
+       .foregroundStyle(Color.accentColor)
+       .padding(.horizontal,6)
+       .padding(.vertical,2)
+       .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+     }
+     Spacer(minLength:8)
+     Text(HistoryTimeFormatter.relativeString(for:entry.updatedAt))
+      .font(.caption)
+      .foregroundStyle(.secondary)
+      .lineLimit(1)
+    }
+    if !entry.preview.isEmpty {
+     Text(entry.preview)
+      .font(.system(size:13))
+      .foregroundStyle(.secondary)
+      .lineLimit(2)
+      .multilineTextAlignment(.leading)
+    }
+   }
+   .frame(maxWidth:.infinity,alignment:.leading)
+   .padding(.horizontal,12)
+   .padding(.vertical,10)
+   .background {
+    RoundedRectangle(cornerRadius:10)
+     .fill(isSelected ? Color.accentColor.opacity(0.14) : (hovered ? Color.secondary.opacity(0.08) : Color.clear))
+   }
+   .overlay {
+    RoundedRectangle(cornerRadius:10)
+     .stroke(isSelected ? Color.accentColor.opacity(0.35) : Color.clear,lineWidth:1)
+   }
+   .contentShape(RoundedRectangle(cornerRadius:10))
+  }
+  .buttonStyle(.plain)
+  .onHover {hovered=$0}
+  .accessibilityIdentifier("history-row-\(entry.id)")
+ }
 }
