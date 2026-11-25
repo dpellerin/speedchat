@@ -12,6 +12,7 @@ import ChatCore
  let scroll=TranscriptScroll()
  let hotkey=GlobalHotKey()
  var panel:FloatingPanel!
+ var windowCoordinator:WindowCoordinator!
  var settingsWindow:NSWindow?
  var aboutWindow:NSWindow?
  var statusItem:NSStatusItem?
@@ -25,11 +26,17 @@ import ChatCore
   panel=FloatingPanel(contentRect:NSRect(x:0,y:0,width:790,height:740),styleMask:[.titled,.closable,.resizable,.fullSizeContentView,.nonactivatingPanel],backing:.buffered,defer:false)
   panel.title="SpeedChat";panel.titleVisibility = .hidden;panel.titlebarAppearsTransparent=true
   panel.isFloatingPanel=false;panel.level = .normal;panel.hidesOnDeactivate=false;panel.isReleasedWhenClosed=false
-  panel.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary];panel.minSize=NSSize(width:580,height:480)
+  panel.collectionBehavior=WindowCoordinator.panelCollectionBehavior;panel.minSize=NSSize(width:580,height:480)
   panel.delegate=self
   panel.contentView=NSHostingView(rootView:PanelView(store:store,preferences:preferences,scroll:scroll,settings:{[weak self] in self?.showSettings()},dismiss:{[weak self] in self?.hide()}))
+  windowCoordinator=WindowCoordinator(
+   workspace:AppKitWindowWorkspace(panel:panel) { [weak self] in self?.focusComposer() },
+   onShow:{ [weak self] in self?.store.show() },
+   onHide:{ [weak self] in self?.store.hide() },
+   onNewChat:{ [weak self] in self?.store.newChat() }
+  )
   if !fixture {panel.setFrameAutosaveName("SpeedChat.Panel");if !panel.setFrameUsingName("SpeedChat.Panel") {panel.center()}} else {panel.center()}
-  hotkey.action={ [weak self] in self?.show() }
+  hotkey.action={ [weak self] in self?.toggleFromHotKey() }
   preferences.updateHotkey={ [weak self] binding in try self?.hotkey.register(binding) }
   preferences.reconnect={ [weak self] in self?.applyPreferences();self?.store.connect() }
   preferences.reloadConfig={ [weak self] in
@@ -109,18 +116,9 @@ import ChatCore
   }
   statusItem?.menu=menu
  }
- @objc func showFromMenu() {show()}
- func show() {
-  // Put the all-Spaces panel in front before activating the app. Activating
-  // first can switch to the Space containing another SpeedChat window.
-  store.show();panel.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
-  panel.contentView?.layoutSubtreeIfNeeded()
-  focusComposer()
-  DispatchQueue.main.async { [weak self] in
-   guard let self,self.panel.isVisible,self.panel.isKeyWindow else {return}
-   self.focusComposer()
-  }
- }
+ @objc func showFromMenu() {windowCoordinator.showPanel()}
+ func toggleFromHotKey() {windowCoordinator.togglePanelFromHotKey()}
+ func show() {windowCoordinator.showPanel()}
  private func focusComposer() {
   func find(_ view:NSView)->ComposerTextView? {
    if let composer=view as? ComposerTextView {return composer}
@@ -131,8 +129,8 @@ import ChatCore
    panel.makeFirstResponder(composer)
   }
  }
- func hide() {panel.orderOut(nil);store.hide()}
- @objc func newChat() {show();store.newChat()}
+ func hide() {windowCoordinator.hidePanel()}
+ @objc func newChat() {windowCoordinator.newChatFromMenu()}
  @objc func showSettings() {
   preferences.refreshLogin()
   if settingsWindow == nil {
