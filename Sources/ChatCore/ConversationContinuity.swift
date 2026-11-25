@@ -16,6 +16,9 @@ struct ConversationContinuity {
         }
     }
 
+    var conversationId: String?
+    var createdAt: String?
+    var updatedAt: String?
     var thread: Thread?
     var messages: [ChatMessage] = []
     var codexSyncedCount = 0
@@ -34,14 +37,57 @@ struct ConversationContinuity {
     }
 
     init(restoring saved: PersistedState) {
-        thread = saved.threadId.hasPrefix("openrouter-") ? .standalone(saved.threadId) : .detached(saved.threadId)
-        messages = saved.messages ?? []
-        codexSyncedCount = min(max(saved.codexSyncedCount ?? 0, 0), messages.count)
-        if let attempt = saved.lastCodexSend, attempt.threadId == saved.threadId,
+        self.init(
+            conversationId: saved.conversationId,
+            createdAt: saved.createdAt,
+            updatedAt: saved.updatedAt,
+            threadId: saved.threadId,
+            messages: saved.messages ?? [],
+            codexSyncedCount: saved.codexSyncedCount ?? 0,
+            lastCodexSend: saved.lastCodexSend,
+            needsLegacyHistory: saved.messages == nil
+        )
+    }
+
+    init(restoring saved: SavedConversation) {
+        self.init(
+            conversationId: saved.id,
+            createdAt: saved.createdAt,
+            updatedAt: saved.updatedAt,
+            threadId: saved.threadId,
+            messages: saved.messages,
+            codexSyncedCount: saved.codexSyncedCount,
+            lastCodexSend: saved.lastCodexSend,
+            needsLegacyHistory: false
+        )
+    }
+
+    private init(
+        conversationId: String?,
+        createdAt: String?,
+        updatedAt: String?,
+        threadId: String,
+        messages: [ChatMessage],
+        codexSyncedCount: Int,
+        lastCodexSend: CodexSendAttempt?,
+        needsLegacyHistory: Bool
+    ) {
+        self.conversationId = conversationId
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.thread = Self.restoredThread(for: threadId)
+        self.messages = messages
+        self.codexSyncedCount = min(max(codexSyncedCount, 0), messages.count)
+        self.needsLegacyHistory = needsLegacyHistory
+        if let attempt = lastCodexSend, attempt.threadId == threadId,
            userIndex(messageId: attempt.userMessageId) != nil {
-            lastCodexSend = attempt
+            self.lastCodexSend = attempt
         }
-        needsLegacyHistory = saved.messages == nil
+    }
+
+    private static func restoredThread(for threadId: String) -> Thread? {
+        guard !threadId.isEmpty else { return nil }
+        return threadId.hasPrefix("openrouter-") ? .standalone(threadId) : .detached(threadId)
     }
 
     mutating func recordUndispatchedCodexPrompt(_ user: ChatMessage) {
@@ -198,16 +244,43 @@ struct ConversationContinuity {
         needsLegacyHistory = false
     }
 
-    func save(model: String, to url: URL?, env: [String: String]) throws {
+    mutating func save(
+        model: String,
+        to url: URL?,
+        env: [String: String],
+        now: Date = Date(),
+        touchActivity: Bool = true
+    ) throws {
         guard let thread else { return }
-        try StateStore.save(
-            threadId: thread.id,
-            model: model,
-            to: url,
-            messages: needsLegacyHistory && messages.isEmpty ? nil : messages,
-            codexSyncedCount: codexSyncedCount,
-            lastCodexSend: lastCodexSend,
-            env: env
-        )
+        let target = url ?? StateStore.stateURL(env: env)
+        let timestamp = StateStore.formatTimestamp(now)
+        if !messages.isEmpty {
+            let id = conversationId ?? UUID().uuidString.lowercased()
+            let created = createdAt ?? timestamp
+            let updated = (touchActivity || updatedAt == nil) ? timestamp : (updatedAt ?? timestamp)
+            var record = SavedConversation(
+                id: id,
+                title: StateStore.derivedTitle(from: messages),
+                createdAt: created,
+                updatedAt: updated,
+                model: model,
+                threadId: thread.id,
+                messages: messages,
+                codexSyncedCount: min(max(codexSyncedCount, 0), messages.count)
+            )
+            record.lastCodexSend = lastCodexSend
+            try StateStore.saveActiveConversation(record, to: target)
+            conversationId = id
+            createdAt = created
+            updatedAt = updated
+        } else {
+            try StateStore.saveBlankActiveState(
+                threadId: thread.id,
+                model: model,
+                updatedAt: timestamp,
+                needsLegacyHistory: needsLegacyHistory,
+                to: target
+            )
+        }
     }
 }

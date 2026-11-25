@@ -131,9 +131,9 @@ private func waitFor(_ log:EventLog,_ type:String) async throws {
  #expect(!reloaded.openRouterModels.contains{$0.model == "meta/muse-spark-open"})
 }
 @Test @MainActor func statusMenuKeepsShortcutsAndAddsAbout() {
- #expect(AppDelegate.statusMenuSpec.map(\.title) == ["Show SpeedChat","New Chat","Settings…","About SpeedChat","Quit SpeedChat"])
- #expect(AppDelegate.statusMenuSpec.map(\.key) == ["","n",",","","q"])
- #expect(AppDelegate.statusMenuSpec.map(\.action) == [#selector(AppDelegate.showFromMenu),#selector(AppDelegate.newChat),#selector(AppDelegate.showSettings),#selector(AppDelegate.showAbout),#selector(AppDelegate.quit)])
+ #expect(AppDelegate.statusMenuSpec.map(\.title) == ["Show SpeedChat","New Chat","History","Settings…","About SpeedChat","Quit SpeedChat"])
+ #expect(AppDelegate.statusMenuSpec.map(\.key) == ["","n","k",",","","q"])
+ #expect(AppDelegate.statusMenuSpec.map(\.action) == [#selector(AppDelegate.showFromMenu),#selector(AppDelegate.newChat),#selector(AppDelegate.showHistory),#selector(AppDelegate.showSettings),#selector(AppDelegate.showAbout),#selector(AppDelegate.quit)])
 }
 private func visibleDate(_ value:String)->String {
  value.replacingOccurrences(of:"\u{202F}",with:" ").replacingOccurrences(of:"\u{00A0}",with:" ")

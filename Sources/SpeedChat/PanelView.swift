@@ -179,38 +179,182 @@ struct PanelView:View {
  private typealias ViewState<Value> = SwiftUI.State<Value>
  @ViewState private var showingErrorDetails=false
  var body:some View {
-  VStack(spacing:0) {header;Divider();transcript;Divider();footer}
+  VStack(spacing:0) {
+   header
+   Divider()
+   if store.showingHistory {
+    historySearchBar
+    Divider()
+    historyList
+    Divider()
+    historyFooter
+   } else {
+    transcript
+    Divider()
+    footer
+   }
+  }
    .frame(minWidth:400,minHeight:460)
    .background(colorScheme == .light ? Color.white : Color(nsColor:.windowBackgroundColor))
    .environment(\.openURL,OpenURLAction {url in NativeActions.open(url) ? .handled : .discarded})
    .onAppear {scroll.changed={near in store.followBottom=near}}
+   .alert(
+    "Delete conversation?",
+    isPresented:Binding(
+     get:{store.pendingDeleteEntry != nil},
+     set:{if !$0 {store.cancelDeleteHistoryConversation()}}
+    ),
+    presenting:store.pendingDeleteEntry
+   ) { _ in
+    Button("Delete",role:.destructive) {
+     store.confirmDeleteHistoryConversation()
+    }
+    Button("Cancel",role:.cancel) {
+     store.cancelDeleteHistoryConversation()
+    }
+   } message: {entry in
+    Text("“\(entry.title)” will be permanently deleted from SpeedChat. External Codex threads will not be touched.")
+   }
  }
  private var header:some View {
   let openAiModels=store.session.models.filter{!$0.isOpenRouter}
   let openRouterModels=store.session.models.filter{$0.isOpenRouter}
   return HStack(spacing:12) {
-   DragHeader().frame(height:24).frame(minWidth:50,maxWidth:.infinity)
-   Menu {
-    if !openAiModels.isEmpty {
-     Section("OpenAI") {
-      ForEach(openAiModels) {model in
-       Button {store.selectModel(model.model)} label:{if model.model == store.session.selectedModel {Label(model.displayName,systemImage:"checkmark")} else {Text(model.displayName)}}
+   if store.showingHistory {
+    Button {store.closeHistory()} label:{Label("Back",systemImage:"chevron.left").font(.callout)}
+     .buttonStyle(.borderless)
+     .help("Return to current conversation (Esc)")
+     .accessibilityIdentifier("speedchat-history-back")
+    DragHeader().frame(height:24).frame(minWidth:50,maxWidth:.infinity)
+    Button {store.newChat()} label:{Label("New Chat",systemImage:"square.and.pencil").font(.callout)}
+     .buttonStyle(.borderless)
+     .disabled(!store.session.canInteract)
+     .help("Start a new conversation (⌘N)")
+     .accessibilityIdentifier("speedchat-history-new-chat")
+   } else {
+    Button {store.openHistory()} label:{Label("History",systemImage:"clock.arrow.circlepath").font(.callout)}
+     .buttonStyle(.borderless)
+     .disabled(!store.session.canOpenHistory)
+     .help("Conversation History (⌘K)")
+     .accessibilityLabel("Conversation History")
+     .accessibilityIdentifier("speedchat-history-button")
+    DragHeader().frame(height:24).frame(minWidth:50,maxWidth:.infinity)
+    Menu {
+     if !openAiModels.isEmpty {
+      Section("OpenAI") {
+       ForEach(openAiModels) {model in
+        Button {store.selectModel(model.model)} label:{if model.model == store.session.selectedModel {Label(model.displayName,systemImage:"checkmark")} else {Text(model.displayName)}}
+       }
       }
      }
-    }
-    Section("OpenRouter") {
-     if openRouterModels.isEmpty {
-      Button("Configure OpenRouter in Settings…") {settings()}
-     } else {
-      ForEach(openRouterModels) {model in
-       Button {store.selectModel(model.model)} label:{if model.model == store.session.selectedModel {Label(model.displayName,systemImage:"checkmark")} else {Text(model.displayName)}}
+     Section("OpenRouter") {
+      if openRouterModels.isEmpty {
+       Button("Configure OpenRouter in Settings…") {settings()}
+      } else {
+       ForEach(openRouterModels) {model in
+        Button {store.selectModel(model.model)} label:{if model.model == store.session.selectedModel {Label(model.displayName,systemImage:"checkmark")} else {Text(model.displayName)}}
+       }
+       Divider()
+       Button("OpenRouter Settings…") {settings()}
       }
-      Divider()
-      Button("OpenRouter Settings…") {settings()}
      }
-    }
-   } label:{Label(modelLabel,systemImage:"sparkle").font(.callout)}.disabled(!store.session.canInteract || store.session.models.isEmpty).help("Select the model for your next message")
+    } label:{Label(modelLabel,systemImage:"sparkle").font(.callout)}.disabled(!store.session.canInteract || store.session.models.isEmpty).help("Select the model for your next message")
+   }
   }.padding(.horizontal,18).padding(.vertical,8)
+ }
+ private var historySearchBar:some View {
+  HStack(spacing:8) {
+   Image(systemName:"magnifyingglass")
+    .font(.system(size:13))
+    .foregroundStyle(.secondary)
+   HistorySearchField(
+    text:Binding(
+     get:{store.historyQuery},
+     set:{store.updateHistoryQuery($0)}
+    ),
+    focusToken:store.historyFocusToken,
+    onClear:{store.clearHistoryQuery()},
+    onEscape:{store.closeHistory()},
+    onMoveUp:{store.moveHistorySelection(-1)},
+    onMoveDown:{store.moveHistorySelection(1)},
+    onSubmit:{store.openSelectedHistoryConversation()}
+   )
+   .frame(height:22)
+  }
+  .padding(.horizontal,12)
+  .padding(.vertical,8)
+  .background {
+   RoundedRectangle(cornerRadius:10)
+    .fill(Color(nsColor:.textBackgroundColor).opacity(0.75))
+  }
+  .overlay {
+   RoundedRectangle(cornerRadius:10)
+    .stroke(Color.secondary.opacity(0.2),lineWidth:1)
+  }
+  .padding(.horizontal,14)
+  .padding(.vertical,10)
+ }
+ private var historyList:some View {
+  Group {
+   if store.historyEntries.isEmpty {
+    let emptyTitle=store.hasActiveHistoryQuery ? "No matching conversations" : "No saved conversations yet"
+    VStack(spacing:12) {
+     if store.hasActiveHistoryQuery {
+      Image(systemName:"magnifyingglass").font(.system(size:30)).foregroundStyle(.secondary)
+      Text(emptyTitle).font(.title3.weight(.medium)).textSelection(.enabled)
+       .accessibilityLabel(emptyTitle)
+       .accessibilityIdentifier("speedchat-history-no-matches")
+      Text("Try different words or clear the search.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+     } else {
+      Image(systemName:"clock.arrow.circlepath").font(.system(size:30)).foregroundStyle(.secondary)
+      Text(emptyTitle).font(.title3.weight(.medium)).textSelection(.enabled)
+       .accessibilityLabel(emptyTitle)
+       .accessibilityIdentifier("speedchat-history-empty")
+      Text("Conversations with at least one message appear here.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+     }
+    }
+    .frame(maxWidth:.infinity,maxHeight:.infinity).padding(24)
+    .onChange(of:emptyTitle,initial:true) {_,title in
+     if store.fixtureMode {store.fixtureHistoryEmptyTitle=title}
+    }
+    .onDisappear {
+     if store.fixtureMode {store.fixtureHistoryEmptyTitle=""}
+    }
+   } else {
+    ScrollViewReader {proxy in
+     ScrollView {
+      LazyVStack(alignment:.leading,spacing:6) {
+       ForEach(Array(store.historyEntries.enumerated()),id:\.element.id) {index,entry in
+        HistoryRowView(
+         entry:entry,
+         isCurrent:entry.id == store.session.conversationId,
+         isSelected:index == store.selectedHistoryIndex,
+         open:{
+          store.openHistoryConversation(
+           id:entry.id,
+           scrollToMessageId:store.hasActiveHistoryQuery ? entry.firstMatchingMessageId : nil
+          )
+         },
+         delete:{
+          store.requestDeleteHistoryConversation(entry)
+         }
+        ).id(entry.id)
+       }
+      }.padding(14)
+     }
+     .onChange(of:store.selectedHistoryIndex) {_,index in
+      guard store.historyEntries.indices.contains(index) else {return}
+      proxy.scrollTo(store.historyEntries[index].id,anchor:nil)
+     }
+    }
+   }
+  }.frame(maxWidth:.infinity,maxHeight:.infinity)
+ }
+ private var historyFooter:some View {
+  HStack {
+   Text("↑↓ Navigate   ↵ Open   ⌘⌫ Delete   ⌘N New   Esc Back").font(.system(size:10)).foregroundStyle(.secondary)
+   Spacer(minLength:0)
+  }.padding(.horizontal,18).padding(.vertical,10)
  }
  private var transcript:some View {
   // Rebuild the scroll container when loading a conversation so its lazy
@@ -221,8 +365,8 @@ struct PanelView:View {
      LazyVStack(alignment:.leading,spacing:18) {
       if store.session.messages.isEmpty {emptyState}
       ForEach(store.session.messages) {message in MessageView(message:message).id(message.id)}
-      Color.clear.frame(height:1).id("bottom").background(ScrollProbe(controller:scroll))
-     }.padding(20)
+      Color.clear.frame(height:1).id("bottom")
+     }.padding(20).background(ScrollProbe(controller:scroll))
     }.onChange(of:store.session.messages) {old,messages in
      guard let last=messages.last else {return}
      if old.last?.id != last.id {
@@ -232,7 +376,31 @@ struct PanelView:View {
      guard store.followBottom && !scroll.userScrolled else {return}
      proxy.scrollTo(last.id,anchor:.top)
     }
-    if !store.followBottom {Button {scroll.userScrolled=false;store.followBottom=true;proxy.scrollTo("bottom",anchor:.bottom)} label:{Label("Latest",systemImage:"arrow.down")}.buttonStyle(.borderedProminent).padding(14)}
+    .task(id:store.session.transcriptID) {
+     guard !store.session.messages.isEmpty else {
+      store.clearScrollTarget()
+      scroll.userScrolled=false
+      store.followBottom=true
+      return
+     }
+     if let targetId=store.consumeScrollTarget(),
+        store.session.messages.contains(where:{$0.id == targetId}) {
+      scroll.userScrolled=true
+      proxy.scrollTo(targetId,anchor:.center)
+      await Task.yield()
+      proxy.scrollTo(targetId,anchor:.center)
+      try? await Task.sleep(for:.milliseconds(30))
+      proxy.scrollTo(targetId,anchor:.center)
+      scroll.syncFollowBottom()
+     } else {
+      scroll.userScrolled=false
+      store.followBottom=true
+      proxy.scrollTo("bottom",anchor:.bottom)
+      await Task.yield()
+      proxy.scrollTo("bottom",anchor:.bottom)
+     }
+    }
+    if !store.followBottom {Button {store.clearScrollTarget();scroll.userScrolled=false;store.followBottom=true;proxy.scrollTo("bottom",anchor:.bottom)} label:{Label("Latest",systemImage:"arrow.down")}.buttonStyle(.borderedProminent).padding(14).accessibilityIdentifier("speedchat-latest-button")}
    }
   }.id(store.session.transcriptID)
  }
@@ -283,7 +451,7 @@ struct PanelView:View {
  }
  private var hints:some View {
   VStack(alignment:.leading,spacing:4) {
-   Text("↵ Send   ⇧↵ Newline   ⌘N New   Esc Hide / Stop")
+   Text("↵ Send   ⇧↵ Newline   ⌘K History   ⌘N New   Esc Hide / Stop")
    if preferences.metrics {Text("Ready \(Int(store.readyMs)) ms · First \(Int(store.session.metrics["first-token"] ?? 0)) ms · Total \(Int(store.session.metrics["response"] ?? 0)) ms").help("Cold starts: \(store.coldStarts), warm reopens: \(store.warmReopens)")}
   }.font(.system(size:10)).foregroundStyle(.secondary)
  }
@@ -299,4 +467,164 @@ struct DragHeader:NSViewRepresentable {
 }
 @MainActor final class HeaderDragView:NSView {
  override func mouseDown(with event:NSEvent) {window?.performDrag(with:event)}
+}
+
+@MainActor private enum HistoryTimeFormatter {
+ private static let formatter:RelativeDateTimeFormatter={
+  let value=RelativeDateTimeFormatter()
+  value.unitsStyle = .abbreviated
+  return value
+ }()
+ static func relativeString(for isoTimestamp:String,now:Date=Date()) -> String {
+  guard let date=StateStore.parseTimestamp(isoTimestamp) else {return ""}
+  if abs(now.timeIntervalSince(date)) < 45 {return "Just now"}
+  return formatter.localizedString(for:date,relativeTo:now)
+ }
+}
+
+private struct HistoryRowView:View {
+ let entry:HistoryEntry
+ let isCurrent:Bool
+ let isSelected:Bool
+ let open:()->Void
+ let delete:()->Void
+ private typealias ViewState<Value> = SwiftUI.State<Value>
+ @ViewState private var hovered=false
+ var body:some View {
+  HStack(alignment:.center,spacing:8) {
+   Button(action:open) {
+    VStack(alignment:.leading,spacing:4) {
+     HStack(spacing:8) {
+      Text(Self.highlighted(entry.title,ranges:entry.titleMatchRanges,fontSize:14,highlightWeight:.bold))
+       .font(.system(size:14,weight:.semibold))
+       .foregroundStyle(.primary)
+       .lineLimit(1)
+      if isCurrent {
+       Text("Current")
+        .font(.caption2.weight(.medium))
+        .foregroundStyle(Color.accentColor)
+        .padding(.horizontal,6)
+        .padding(.vertical,2)
+        .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+      }
+      Spacer(minLength:8)
+      Text(HistoryTimeFormatter.relativeString(for:entry.updatedAt))
+       .font(.caption)
+       .foregroundStyle(.secondary)
+       .lineLimit(1)
+     }
+     if !entry.preview.isEmpty {
+      Text(Self.highlighted(entry.preview,ranges:entry.previewMatchRanges,fontSize:13,highlightWeight:.semibold))
+       .font(.system(size:13))
+       .foregroundStyle(.secondary)
+       .lineLimit(2)
+       .multilineTextAlignment(.leading)
+     }
+    }
+    .frame(maxWidth:.infinity,alignment:.leading)
+    .contentShape(Rectangle())
+   }
+   .buttonStyle(.plain)
+   .accessibilityIdentifier("history-row-\(entry.id)")
+
+   if hovered || isSelected {
+    HistoryRowDeleteButton(
+     conversationId:entry.id,
+     title:entry.title,
+     action:delete
+    )
+    .frame(width:24,height:24)
+   }
+  }
+  .padding(.horizontal,12)
+  .padding(.vertical,10)
+  .background {
+   RoundedRectangle(cornerRadius:10)
+    .fill(isSelected ? Color.accentColor.opacity(0.14) : (hovered ? Color.secondary.opacity(0.08) : Color.clear))
+  }
+  .overlay {
+   RoundedRectangle(cornerRadius:10)
+    .stroke(isSelected ? Color.accentColor.opacity(0.35) : Color.clear,lineWidth:1)
+  }
+  .contentShape(RoundedRectangle(cornerRadius:10))
+  .onHover {hovered=$0}
+ }
+
+ private static func highlighted(
+  _ text:String,
+  ranges:[HistoryMatchRange],
+  fontSize:CGFloat,
+  highlightWeight:Font.Weight
+ ) -> AttributedString {
+  var attributed=AttributedString(text)
+  guard !ranges.isEmpty else {return attributed}
+  let totalCount=text.count
+  for range in ranges {
+   guard range.start >= 0,range.end > range.start,range.end <= totalCount else {continue}
+   let lower=text.index(text.startIndex,offsetBy:range.start)
+   let upper=text.index(text.startIndex,offsetBy:range.end)
+   guard let attrLower=AttributedString.Index(lower,within:attributed),
+         let attrUpper=AttributedString.Index(upper,within:attributed) else {continue}
+   attributed[attrLower..<attrUpper].foregroundColor = .primary
+   attributed[attrLower..<attrUpper].backgroundColor = Color.accentColor.opacity(0.22)
+   attributed[attrLower..<attrUpper].font = .system(size:fontSize,weight:highlightWeight)
+  }
+  return attributed
+ }
+}
+
+@MainActor final class HistoryDeleteNSButton:NSButton {
+ var onDelete:(()->Void)?
+ private var tracking:NSTrackingArea?
+ private var isHovered=false {
+  didSet {
+   contentTintColor=isHovered ? .systemRed : .secondaryLabelColor
+   layer?.backgroundColor=isHovered ? NSColor.systemRed.withAlphaComponent(0.12).cgColor : NSColor.clear.cgColor
+  }
+ }
+ override init(frame frameRect:NSRect) {
+  super.init(frame:frameRect)
+  isBordered=false
+  bezelStyle = .inline
+  wantsLayer=true
+  layer?.cornerRadius=6
+  image=NSImage(systemSymbolName:"trash",accessibilityDescription:"Delete conversation")
+  symbolConfiguration=NSImage.SymbolConfiguration(pointSize:12,weight:.regular)
+  contentTintColor = .secondaryLabelColor
+  imageScaling = .scaleNone
+  toolTip="Delete conversation (⌘⌫)"
+  refusesFirstResponder=true
+  target=self
+  action=#selector(pressed)
+ }
+ required init?(coder:NSCoder) {fatalError()}
+ override func updateTrackingAreas() {
+  super.updateTrackingAreas()
+  if let tracking {removeTrackingArea(tracking)}
+  let area=NSTrackingArea(rect:.zero,options:[.mouseEnteredAndExited,.activeAlways,.inVisibleRect],owner:self,userInfo:nil)
+  addTrackingArea(area)
+  tracking=area
+ }
+ override func mouseEntered(with event:NSEvent) {isHovered=true}
+ override func mouseExited(with event:NSEvent) {isHovered=false}
+ @objc private func pressed() {onDelete?()}
+}
+
+private struct HistoryRowDeleteButton:NSViewRepresentable {
+ let conversationId:String
+ let title:String
+ let action:()->Void
+ func makeNSView(context:Context)->HistoryDeleteNSButton {
+  let button=HistoryDeleteNSButton()
+  update(button)
+  return button
+ }
+ func updateNSView(_ button:HistoryDeleteNSButton,context:Context) {
+  update(button)
+ }
+ private func update(_ button:HistoryDeleteNSButton) {
+  button.onDelete=action
+  button.setAccessibilityLabel("Delete \(title)")
+  button.setAccessibilityIdentifier("history-delete-\(conversationId)")
+ }
 }

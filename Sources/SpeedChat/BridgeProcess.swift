@@ -80,15 +80,7 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                             offlineReason = offlineReason ?? exitReason
                         }
                         let notice = (ready.resumed && !ready.messages.isEmpty) ? "Resumed previous chat" : "Ready"
-                        self.onEvent?(BridgeEvent(
-                            type: offlineReason == nil ? "ready" : "offlineConversation",
-                            messages: ready.messages,
-                            models: offlineReason == nil ? ready.models : [],
-                            model: ready.model,
-                            notice: offlineReason.map { "Offline · \($0)" } ?? notice,
-                            stateSaveError: ready.stateSaveError,
-                            codexRetry: ready.codexRetry
-                        ))
+                        self.emitReady(ready, offlineReason: offlineReason, onlineNotice: notice)
                     }
                 } catch {
                     self?.queue.async { [weak self] in
@@ -143,6 +135,42 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
         onEvent?(event)
     }
 
+    private func emitReady(
+        _ ready: ReadyState,
+        offlineReason overrideOfflineReason: String? = nil,
+        onlineNotice: String = "Ready",
+        clearedActiveConversation: Bool? = nil,
+        scrollToMessageId: String? = nil
+    ) {
+        let offlineReason = overrideOfflineReason ?? ready.offlineReason
+        onEvent?(BridgeEvent(
+            type: offlineReason == nil ? "ready" : "offlineConversation",
+            conversationId: ready.conversationId,
+            messages: ready.messages,
+            models: offlineReason == nil ? ready.models : [],
+            model: ready.model,
+            notice: offlineReason.map { "Offline · \($0)" } ?? onlineNotice,
+            stateSaveError: ready.stateSaveError,
+            codexRetry: ready.codexRetry,
+            clearedActiveConversation: clearedActiveConversation,
+            scrollToMessageId: scrollToMessageId
+        ))
+    }
+
+    private func emitError(
+        _ error: Error,
+        client chatClient: ChatClient,
+        executionID: UUID? = nil
+    ) {
+        onEvent?(BridgeEvent(
+            type: "error",
+            message: StateStore.friendlyError(error),
+            busy: chatClient.busy,
+            codexRetry: chatClient.codexRetry,
+            executionID: executionID
+        ))
+    }
+
     private func emitMetric(_ name: String, executionID: UUID? = nil) {
         guard let started = turnStartedAt else { return }
         let ms = max(0, round(Date().timeIntervalSince(started) * 1000))
@@ -185,9 +213,7 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                                                         executionID: executionID)
                     }
                 } catch {
-                    onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error),
-                                         busy: chatClient.busy, codexRetry: chatClient.codexRetry,
-                                         executionID: requestedExecutionID))
+                    emitError(error, client: chatClient, executionID: requestedExecutionID)
                     return
                 }
                 activeExecutionID = executionID
@@ -210,18 +236,12 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                         let ready = try await chatClient.newChat()
                         self?.queue.async { [weak self] in
                             guard let self, !self.closing else { return }
-                            self.onEvent?(BridgeEvent(
-                                type: "ready",
-                                messages: ready.messages,
-                                models: ready.models,
-                                model: ready.model,
-                                notice: "New chat"
-                            ))
+                            self.emitReady(ready, onlineNotice: "New chat")
                         }
                     } catch {
                         self?.queue.async { [weak self] in
                             guard let self, !self.closing else { return }
-                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy, codexRetry: chatClient.codexRetry))
+                            self.emitError(error, client: chatClient)
                         }
                     }
                 }
@@ -239,7 +259,7 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                     } catch {
                         self?.queue.async { [weak self] in
                             guard let self, !self.closing else { return }
-                            self.onEvent?(BridgeEvent(type: "error", message: StateStore.friendlyError(error), busy: chatClient.busy, codexRetry: chatClient.codexRetry))
+                            self.emitError(error, client: chatClient)
                         }
                     }
                 }
@@ -252,6 +272,77 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                         guard let self, !self.closing else { return }
                         self.onEvent?(BridgeEvent(type: "modelsUpdated", models: ready.models, model: ready.model, codexRetry: ready.codexRetry))
                     }
+                }
+                return
+            }
+            if type == "listHistory" {
+                let query = command["query"] ?? ""
+                let entries = chatClient.listHistory(query: query)
+                onEvent?(BridgeEvent(type: "history", history: entries, query: query))
+                return
+            }
+            if type == "openConversation" {
+                guard let id = command["conversationId"], !id.isEmpty else { return }
+                let scrollToMessageId = command["scrollToMessageId"].flatMap { $0.isEmpty ? nil : $0 }
+                do {
+                    let ready = try chatClient.openConversation(id: id)
+                    emitReady(ready, scrollToMessageId: scrollToMessageId)
+                } catch {
+                    emitError(error, client: chatClient)
+                }
+                return
+            }
+            if type == "deleteConversation" {
+                guard let id = command["conversationId"], !id.isEmpty else { return }
+                let query = command["query"] ?? ""
+                do {
+                    let result = try chatClient.deleteConversation(id: id)
+                    if result.clearedActiveConversation, let ready = result.readyState {
+                        emitReady(ready, onlineNotice: "New chat", clearedActiveConversation: true)
+                    }
+                    onEvent?(BridgeEvent(
+                        type: "history",
+                        history: chatClient.listHistory(query: query),
+                        clearedActiveConversation: result.clearedActiveConversation,
+                        query: query
+                    ))
+                } catch {
+                    emitError(error, client: chatClient)
+                }
+                return
+            }
+            if type == "applyRetention" {
+                let policy = command["retention"].flatMap(HistoryRetention.init(rawValue:)) ?? .defaultPolicy
+                let query = command["query"] ?? ""
+                do {
+                    let result = try chatClient.applyHistoryRetention(policy)
+                    if result.clearedActiveConversation, let ready = result.readyState {
+                        emitReady(ready, onlineNotice: "New chat", clearedActiveConversation: true)
+                    }
+                    onEvent?(BridgeEvent(
+                        type: "history",
+                        history: chatClient.listHistory(query: query),
+                        clearedActiveConversation: result.clearedActiveConversation,
+                        query: query
+                    ))
+                } catch {
+                    emitError(error, client: chatClient)
+                }
+                return
+            }
+            if type == "clearHistory" {
+                do {
+                    let result = try chatClient.clearHistory()
+                    if result.clearedActiveConversation, let ready = result.readyState {
+                        emitReady(ready, onlineNotice: "New chat", clearedActiveConversation: true)
+                    }
+                    onEvent?(BridgeEvent(
+                        type: "history",
+                        history: [],
+                        clearedActiveConversation: result.clearedActiveConversation
+                    ))
+                } catch {
+                    emitError(error, client: chatClient)
                 }
                 return
             }

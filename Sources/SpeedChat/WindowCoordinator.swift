@@ -110,6 +110,7 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
     private let onShow: () -> Void
     private let onHide: () -> Void
     private let onNewChat: () -> Void
+    private let onShowHistory: () -> Void
     private var panelOwnership: PanelSpaceOwnership = .none
     private var otherAppActivatedAt: TimeInterval?
     private var shouldRestoreOnSpaceReturn = false
@@ -118,12 +119,14 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
         workspace: any WindowWorkspace,
         onShow: @escaping () -> Void = {},
         onHide: @escaping () -> Void = {},
-        onNewChat: @escaping () -> Void = {}
+        onNewChat: @escaping () -> Void = {},
+        onShowHistory: @escaping () -> Void = {}
     ) {
         self.workspace = workspace
         self.onShow = onShow
         self.onHide = onHide
         self.onNewChat = onNewChat
+        self.onShowHistory = onShowHistory
         self.workspace.onEvent = { [weak self] event in
             self?.handle(event)
         }
@@ -179,6 +182,11 @@ enum WindowWorkspaceEvent: Equatable, Sendable {
     func newChatFromMenu() {
         showPanel()
         onNewChat()
+    }
+
+    func showHistoryFromMenu() {
+        showPanel()
+        onShowHistory()
     }
 
     func showSecondaryWindow(_ window: SecondaryWindow) {

@@ -2,6 +2,40 @@ import SwiftUI
 import ServiceManagement
 import ChatCore
 
+enum HistoryConfirmation:Equatable {
+ case shortenRetention(target:HistoryRetention,previous:HistoryRetention,affectedCount:Int)
+ case clearAll(affectedCount:Int)
+
+ var title:String {
+  switch self {
+  case .shortenRetention(_,_,let count):
+   return "Delete \(count) older \(count == 1 ? "conversation" : "conversations")?"
+  case .clearAll(let count):
+   return "Clear all \(count) saved \(count == 1 ? "conversation" : "conversations")?"
+  }
+ }
+
+ var message:String {
+  switch self {
+  case .shortenRetention(let target,_,let count):
+   let noun=count == 1 ? "saved conversation" : "saved conversations"
+   return "Shortening History retention to \(target.displayName) will permanently delete \(count) \(noun) from SpeedChat. External Codex threads will not be touched."
+  case .clearAll(let count):
+   let noun=count == 1 ? "saved conversation" : "saved conversations"
+   return "This will permanently delete all \(count) \(noun) from SpeedChat. External Codex threads will not be touched."
+  }
+ }
+
+ var confirmButtonTitle:String {
+  switch self {
+  case .shortenRetention(_,_,let count):
+   return "Delete \(count) \(count == 1 ? "Conversation" : "Conversations")"
+  case .clearAll:
+   return "Clear All History"
+  }
+ }
+}
+
 @MainActor final class Preferences:ObservableObject {
  static let defaultOpenRouterModels:[ChatModel]=OpenRouterClient.defaultModels
  let defaults:UserDefaults
@@ -9,24 +43,98 @@ import ChatCore
  @Published var codexPath:String {didSet {defaults.set(codexPath,forKey:"codexPath")}}
  @Published var metrics:Bool {didSet {defaults.set(metrics,forKey:"metrics")}}
  @Published var hotkey:HotKeyBinding
+ @Published var historyRetention:HistoryRetention
+ @Published var savedHistoryCount=0
+ @Published var pendingHistoryConfirmation:HistoryConfirmation?
  @Published var openRouterKey=""
  @Published var showOpenRouterKey=false
  @Published var openRouterModels:[ChatModel]=Preferences.defaultOpenRouterModels
  @Published var newModelInput=""
  @Published var openRouterStatus=""
- @Published var error=""
+ @Published var error="" {didSet {if error != oldValue {onLayoutChanged?()}}}
  @Published var loginEnabled=false
  @Published var loginStatus=""
  var updateHotkey:((HotKeyBinding)throws->Void)?
  var reconnect:(()->Void)?
  var reloadConfig:(()->Void)?
+ var countSavedHistory:(()->Int)?
+ var countExpiredHistory:((HistoryRetention)->Int)?
+ var isChatBusy:(()->Bool)?
+ var applyHistoryRetention:((HistoryRetention)->Void)?
+ var clearAllHistory:(()->Void)?
+ var onLayoutChanged:(()->Void)?
  init(defaults:UserDefaults = .standard,configURL:URL?=nil) {
   self.defaults=defaults
   self.configURL=configURL ?? OpenRouterClient.configURL()
   codexPath=defaults.string(forKey:"codexPath") ?? ""
   metrics=defaults.bool(forKey:"metrics")
   hotkey=(defaults.data(forKey:"hotkey").flatMap{try? JSONDecoder().decode(HotKeyBinding.self,from:$0)}) ?? .standard
+  historyRetention=defaults.string(forKey:"historyRetention").flatMap(HistoryRetention.init(rawValue:)) ?? .defaultPolicy
   loadOpenRouter()
+ }
+ func refreshHistoryCount() {
+  savedHistoryCount=max(0,countSavedHistory?() ?? 0)
+ }
+ func requestHistoryRetention(_ target:HistoryRetention) {
+  guard target != historyRetention else {return}
+  let previous=historyRetention
+  if target.isShorter(than:previous) {
+   let affected=countExpiredHistory?(target) ?? 0
+   if affected > 0 {
+    if isChatBusy?() == true {
+     error="Wait for the current response or change to finish."
+     return
+    }
+    historyRetention=target
+    pendingHistoryConfirmation = .shortenRetention(target:target,previous:previous,affectedCount:affected)
+    return
+   }
+  }
+  commitHistoryRetention(target)
+ }
+ func requestClearAllHistory() {
+  refreshHistoryCount()
+  guard savedHistoryCount > 0 else {return}
+  if isChatBusy?() == true {
+   error="Wait for the current response or change to finish."
+   return
+  }
+  pendingHistoryConfirmation = .clearAll(affectedCount:savedHistoryCount)
+ }
+ func confirmHistoryConfirmation() {
+  guard let confirmation=pendingHistoryConfirmation else {return}
+  pendingHistoryConfirmation=nil
+  switch confirmation {
+  case .shortenRetention(let target,let previous,_):
+   if isChatBusy?() == true {
+    historyRetention=previous
+    error="Wait for the current response or change to finish."
+    return
+   }
+   commitHistoryRetention(target)
+  case .clearAll:
+   if isChatBusy?() == true {
+    error="Wait for the current response or change to finish."
+    return
+   }
+   error=""
+   clearAllHistory?()
+   refreshHistoryCount()
+  }
+ }
+ func cancelHistoryConfirmation() {
+  guard let confirmation=pendingHistoryConfirmation else {return}
+  pendingHistoryConfirmation=nil
+  if case .shortenRetention(_,let previous,_) = confirmation {
+   historyRetention=previous
+  }
+ }
+ private func commitHistoryRetention(_ policy:HistoryRetention) {
+  historyRetention=policy
+  defaults.set(policy.rawValue,forKey:"historyRetention")
+  error=""
+  applyHistoryRetention?(policy)
+  refreshHistoryCount()
  }
  func loadOpenRouter() {
   let loaded=OpenRouterClient.loadConfig(from:configURL,env:[:])
@@ -129,6 +237,44 @@ struct SettingsView:View {
 
    VStack(alignment:.leading,spacing:10) {
     HStack {
+     Text("History").font(.headline)
+     Spacer()
+     Button("Clear All History…",role:.destructive) {
+      preferences.requestClearAllHistory()
+     }
+     .controlSize(.small)
+     .disabled(preferences.savedHistoryCount == 0)
+    }
+    HStack {
+     Text("Keep history")
+     Spacer()
+     // Explicit closure avoids Swift 6 IRGen actor-isolated method-reference crash.
+     Picker(
+      "Keep history",
+      selection:Binding(
+       get:{preferences.historyRetention},
+       set:{preferences.requestHistoryRetention($0)}
+      )
+     ) {
+      ForEach(HistoryRetention.allCases) {option in
+       Text(option.displayName).tag(option)
+      }
+     }
+     .labelsHidden()
+     .pickerStyle(.menu)
+     .fixedSize()
+    }
+    Text("Saved conversations older than this (by last message) are removed automatically.")
+     .font(.caption)
+     .foregroundStyle(.secondary)
+     .fixedSize(horizontal:false,vertical:true)
+   }
+   .padding(16)
+   .background(RoundedRectangle(cornerRadius:10).fill(Color(nsColor:.controlBackgroundColor)))
+   .overlay(RoundedRectangle(cornerRadius:10).stroke(Color.secondary.opacity(0.18),lineWidth:1))
+
+   VStack(alignment:.leading,spacing:10) {
+    HStack {
      Text("OpenRouter").font(.headline)
      Spacer()
      Circle().fill(preferences.openRouterKey.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty ? Color.secondary.opacity(0.5) : Color.green).frame(width:7,height:7)
@@ -193,6 +339,27 @@ struct SettingsView:View {
   .padding(20)
   .frame(width:460)
   .fixedSize(horizontal:false,vertical:true)
-  .onAppear {preferences.refreshLogin();preferences.loadOpenRouter()}
+  .onAppear {
+   preferences.refreshLogin()
+   preferences.loadOpenRouter()
+   preferences.refreshHistoryCount()
+  }
+  .alert(
+   preferences.pendingHistoryConfirmation?.title ?? "",
+   isPresented:Binding(
+    get:{preferences.pendingHistoryConfirmation != nil},
+    set:{if !$0 {preferences.cancelHistoryConfirmation()}}
+   ),
+   presenting:preferences.pendingHistoryConfirmation
+  ) {confirmation in
+   Button(confirmation.confirmButtonTitle,role:.destructive) {
+    preferences.confirmHistoryConfirmation()
+   }
+   Button("Cancel",role:.cancel) {
+    preferences.cancelHistoryConfirmation()
+   }
+  } message: {confirmation in
+   Text(confirmation.message)
+  }
  }
 }

@@ -90,6 +90,15 @@ struct Composer:NSViewRepresentable {
    self.changed?(scroll.contentView.bounds.maxY >= doc.bounds.height-70);self.userScrolling=false
   }}
  }
+ func isNearBottom() -> Bool? {
+  guard let scroll,let doc=scroll.documentView else {return nil}
+  return scroll.contentView.bounds.maxY >= doc.bounds.height-70
+ }
+ func syncFollowBottom() {
+  guard let scroll,let doc=scroll.documentView else {return}
+  scroll.layoutSubtreeIfNeeded()
+  changed?(scroll.contentView.bounds.maxY >= doc.bounds.height-70)
+ }
  func page(_ direction:CGFloat) {
   guard let scroll,let doc=scroll.documentView else {return}
   userScrolled=true
@@ -102,5 +111,8 @@ struct Composer:NSViewRepresentable {
 struct ScrollProbe:NSViewRepresentable {
  var controller:TranscriptScroll
  func makeNSView(context:Context) -> NSView {NSView()}
- func updateNSView(_ view:NSView,context:Context) {DispatchQueue.main.async {controller.attach(view)}}
+ func updateNSView(_ view:NSView,context:Context) {
+  if view.enclosingScrollView != nil {controller.attach(view)}
+  DispatchQueue.main.async {controller.attach(view)}
+ }
 }

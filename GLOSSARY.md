@@ -7,20 +7,24 @@ SpeedChat is a native macOS quick-chat panel for conversations with OpenAI and O
 ### Panel and conversation
 
 **Panel**:
-The keyboard-summoned window containing the model picker, transcript, and composer. An in-progress response can continue while the panel is hidden.
+The keyboard-summoned window that shows either the active conversation (model picker, transcript, and composer) or History in place. An in-progress response can continue while the panel is hidden.
 
 **Composer**:
 The text entry area where the user writes and sends a message.
 
 **Draft**:
-The unsent text in the composer. Hiding the panel preserves it while the app is running.
+The unsent text in the composer, preserved per conversation while the app is running.
 
 **Conversation**:
 The user's ongoing exchange with SpeedChat. It can continue across model and provider switches and can be reopened from saved messages if its Codex thread is unavailable.
-_Avoid_: Codex thread, session
+_Avoid_: Codex thread, session, discussion
 
 **Saved conversation**:
-SpeedChat's local record of the conversation. Its messages are the primary history when the conversation is reopened.
+SpeedChat's local record of a conversation with at least one message. Its messages are the primary record when the conversation is reopened.
+
+**History**:
+The searchable list of saved conversations shown inside the panel for browsing, deleting, or reopening earlier conversations.
+_Avoid_: archive, library, chat list
 
 **Transcript**:
 The messages shown in the panel for the current conversation, including the reply as it streams.

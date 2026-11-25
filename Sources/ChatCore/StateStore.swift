@@ -1,9 +1,45 @@
 import Foundation
 
+public struct SavedConversation: Codable, Equatable, Identifiable, Sendable {
+    public var id: String
+    public var title: String
+    public var createdAt: String
+    public var updatedAt: String
+    public var model: String
+    public var threadId: String
+    public var messages: [ChatMessage]
+    public var codexSyncedCount: Int
+    var lastCodexSend: CodexSendAttempt?
+
+    public init(
+        id: String,
+        title: String,
+        createdAt: String,
+        updatedAt: String,
+        model: String,
+        threadId: String,
+        messages: [ChatMessage],
+        codexSyncedCount: Int = 0
+    ) {
+        self.id = id
+        self.title = title
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.model = model
+        self.threadId = threadId
+        self.messages = messages
+        self.codexSyncedCount = codexSyncedCount
+    }
+}
+
 public struct PersistedState: Codable, Equatable, Sendable {
-    public static let currentVersion = 3
+    public static let currentVersion = 4
+    static let legacyVersion = 3
 
     public var version: Int
+    public var conversationId: String?
+    public var title: String?
+    public var createdAt: String?
     public var threadId: String
     public var model: String
     public var updatedAt: String
@@ -13,6 +49,9 @@ public struct PersistedState: Codable, Equatable, Sendable {
 
     public init(
         version: Int = Self.currentVersion,
+        conversationId: String? = nil,
+        title: String? = nil,
+        createdAt: String? = nil,
         threadId: String,
         model: String,
         updatedAt: String,
@@ -20,12 +59,24 @@ public struct PersistedState: Codable, Equatable, Sendable {
         codexSyncedCount: Int? = nil
     ) {
         self.version = version
+        self.conversationId = conversationId
+        self.title = title
+        self.createdAt = createdAt
         self.threadId = threadId
         self.model = model
         self.updatedAt = updatedAt
         self.messages = messages
         self.codexSyncedCount = codexSyncedCount
     }
+}
+
+private struct ActiveStateRecord: Codable {
+    var version: Int
+    var activeConversationId: String?
+    var threadId: String
+    var model: String
+    var updatedAt: String
+    var needsLegacyHistory: Bool?
 }
 
 public enum StateStore {
@@ -41,42 +92,569 @@ public enum StateStore {
         stateDirectory(env: env).appendingPathComponent("state.json")
     }
 
-    public static func load(from url: URL? = nil, env: [String: String] = ProcessInfo.processInfo.environment) -> PersistedState? {
-        let target = url ?? stateURL(env: env)
-        guard let data = try? Data(contentsOf: target),
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let version = raw["version"] as? Int, version == PersistedState.currentVersion,
-              let threadId = raw["threadId"] as? String, !threadId.isEmpty,
-              let model = raw["model"] as? String, !model.isEmpty,
-              let updatedAt = raw["updatedAt"] as? String else {
+    public static func conversationsDirectory(
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        StateLocation(stateURL: url, env: env).conversationsDirectory
+    }
+
+    static func formatTimestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    public static func parseTimestamp(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        return ISO8601DateFormatter().date(from: value)
+    }
+
+    static func derivedTitle(from messages: [ChatMessage]) -> String {
+        if let firstUser = messages.first(where: { $0.role == "user" }) {
+            return ChatClient.conversationTitle(firstUser.text)
+        }
+        return "New chat"
+    }
+
+    private static func isValidConversationId(_ id: String) -> Bool {
+        !id.isEmpty && !id.contains("/") && !id.contains("\\") && !id.hasPrefix(".") && id != ".."
+    }
+
+    private static func parseMessages(_ rawMessages: [[String: Any]]) -> [ChatMessage] {
+        rawMessages.compactMap { item in
+            guard let id = item["id"] as? String,
+                  let role = item["role"] as? String, (role == "user" || role == "assistant"),
+                  let text = item["text"] as? String else {
+                return nil
+            }
+            return ChatMessage(id: id, role: role, text: text, reasoning: role == "assistant" ? item["reasoning"] as? String : nil)
+        }
+    }
+
+    private static func decodeLastCodexSend(from raw: [String: Any]) -> CodexSendAttempt? {
+        guard let attempt = raw["lastCodexSend"], JSONSerialization.isValidJSONObject(attempt),
+              let data = try? JSONSerialization.data(withJSONObject: attempt) else {
             return nil
         }
+        return try? JSONDecoder().decode(CodexSendAttempt.self, from: data)
+    }
 
-        var validMessages: [ChatMessage]? = nil
-        if let rawMessages = raw["messages"] as? [[String: Any]] {
-            validMessages = rawMessages.compactMap { item in
-                guard let id = item["id"] as? String,
-                      let role = item["role"] as? String, (role == "user" || role == "assistant"),
-                      let text = item["text"] as? String else {
-                    return nil
-                }
-                return ChatMessage(id: id, role: role, text: text, reasoning: role == "assistant" ? item["reasoning"] as? String : nil)
-            }
+    private static func decodeConversation(from url: URL) -> SavedConversation? {
+        guard let data = try? Data(contentsOf: url),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = raw["id"] as? String, isValidConversationId(id),
+              let threadId = raw["threadId"] as? String, !threadId.isEmpty,
+              let model = raw["model"] as? String, !model.isEmpty,
+              let updatedAt = raw["updatedAt"] as? String, !updatedAt.isEmpty,
+              let rawMessages = raw["messages"] as? [[String: Any]] else {
+            return nil
         }
-        let codexSyncedCount = raw["codexSyncedCount"] as? Int
+        let messages = parseMessages(rawMessages)
+        guard !messages.isEmpty else { return nil }
+        let rawTitle = (raw["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let title = rawTitle.isEmpty ? derivedTitle(from: messages) : rawTitle
+        let createdAt = (raw["createdAt"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? updatedAt
+        let syncedCount = min(max((raw["codexSyncedCount"] as? Int) ?? 0, 0), messages.count)
+        var saved = SavedConversation(
+            id: id,
+            title: title,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            model: model,
+            threadId: threadId,
+            messages: messages,
+            codexSyncedCount: syncedCount
+        )
+        saved.lastCodexSend = decodeLastCodexSend(from: raw)
+        return saved
+    }
+
+    private static func persistedState(from saved: SavedConversation) -> PersistedState {
         var state = PersistedState(
             version: PersistedState.currentVersion,
+            conversationId: saved.id,
+            title: saved.title,
+            createdAt: saved.createdAt,
+            threadId: saved.threadId,
+            model: saved.model,
+            updatedAt: saved.updatedAt,
+            messages: saved.messages,
+            codexSyncedCount: saved.codexSyncedCount
+        )
+        state.lastCodexSend = saved.lastCodexSend
+        return state
+    }
+
+    private struct StateLocation {
+        let stateURL: URL
+
+        init(stateURL url: URL? = nil, env: [String: String] = ProcessInfo.processInfo.environment) {
+            self.stateURL = url ?? StateStore.stateURL(env: env)
+        }
+
+        init(resolved stateURL: URL) {
+            self.stateURL = stateURL
+        }
+
+        var stateDirectory: URL {
+            stateURL.deletingLastPathComponent()
+        }
+
+        var conversationsDirectory: URL {
+            stateDirectory.appendingPathComponent("conversations", isDirectory: true)
+        }
+
+        func conversationURL(id: String) -> URL? {
+            guard StateStore.isValidConversationId(id) else { return nil }
+            return conversationsDirectory.appendingPathComponent("\(id).json")
+        }
+
+        func readActiveStateRecord() -> ActiveStateRecord? {
+            guard let data = try? Data(contentsOf: stateURL),
+                  let record = try? JSONDecoder().decode(ActiveStateRecord.self, from: data),
+                  record.version == PersistedState.currentVersion else {
+                return nil
+            }
+            return record
+        }
+
+        @discardableResult
+        func migrateLegacyIfNeeded() -> PersistedState? {
+            guard let data = try? Data(contentsOf: stateURL),
+                  let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let version = raw["version"] as? Int, version == PersistedState.legacyVersion else {
+                return nil
+            }
+            return migrateLegacyV3(raw: raw)
+        }
+
+        func migrateLegacyV3(raw: [String: Any]) -> PersistedState? {
+            guard let threadId = raw["threadId"] as? String, !threadId.isEmpty,
+                  let model = raw["model"] as? String, !model.isEmpty,
+                  let updatedAt = raw["updatedAt"] as? String, !updatedAt.isEmpty else {
+                return nil
+            }
+            let codexSyncedCount = raw["codexSyncedCount"] as? Int
+            let lastCodexSend = StateStore.decodeLastCodexSend(from: raw)
+            if let rawMessages = raw["messages"] as? [[String: Any]] {
+                let validMessages = StateStore.parseMessages(rawMessages)
+                if validMessages.isEmpty {
+                    try? saveBlankActiveState(
+                        threadId: "",
+                        model: model,
+                        updatedAt: updatedAt,
+                        needsLegacyHistory: false
+                    )
+                    return PersistedState(
+                        version: PersistedState.currentVersion,
+                        conversationId: nil,
+                        threadId: "",
+                        model: model,
+                        updatedAt: updatedAt,
+                        messages: [],
+                        codexSyncedCount: 0
+                    )
+                }
+                let id = UUID().uuidString.lowercased()
+                var record = SavedConversation(
+                    id: id,
+                    title: StateStore.derivedTitle(from: validMessages),
+                    createdAt: updatedAt,
+                    updatedAt: updatedAt,
+                    model: model,
+                    threadId: threadId,
+                    messages: validMessages,
+                    codexSyncedCount: min(max(codexSyncedCount ?? 0, 0), validMessages.count)
+                )
+                record.lastCodexSend = lastCodexSend
+                try? saveActiveConversation(record)
+                return StateStore.persistedState(from: record)
+            }
+
+            // Legacy pre-ADR-0001 v3 state without saved messages: preserve threadId for one-time Codex backfill.
+            try? saveBlankActiveState(
+                threadId: threadId,
+                model: model,
+                updatedAt: updatedAt,
+                needsLegacyHistory: true
+            )
+            var state = PersistedState(
+                version: PersistedState.currentVersion,
+                conversationId: nil,
+                threadId: threadId,
+                model: model,
+                updatedAt: updatedAt,
+                messages: nil,
+                codexSyncedCount: codexSyncedCount
+            )
+            state.lastCodexSend = lastCodexSend
+            return state
+        }
+
+        func loadConversation(id: String) -> SavedConversation? {
+            _ = migrateLegacyIfNeeded()
+            guard let fileURL = conversationURL(id: id) else { return nil }
+            return StateStore.decodeConversation(from: fileURL)
+        }
+
+        func readConversations() -> [SavedConversation] {
+            guard let entries = try? FileManager.default.contentsOfDirectory(
+                at: conversationsDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else {
+                return []
+            }
+            let records = entries
+                .filter { $0.pathExtension == "json" }
+                .compactMap { StateStore.decodeConversation(from: $0) }
+            return records.sorted { lhs, rhs in
+                let lDate = StateStore.parseTimestamp(lhs.updatedAt) ?? .distantPast
+                let rDate = StateStore.parseTimestamp(rhs.updatedAt) ?? .distantPast
+                if lDate != rDate { return lDate > rDate }
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.id < rhs.id
+            }
+        }
+
+        func loadConversations() -> [SavedConversation] {
+            _ = migrateLegacyIfNeeded()
+            return readConversations()
+        }
+
+        func clearActiveStateIfNeeded(_ activeRecord: ActiveStateRecord?, removedActive: Bool, now: Date) throws {
+            guard removedActive, let activeRecord else { return }
+            try saveBlankActiveState(
+                threadId: "",
+                model: activeRecord.model,
+                updatedAt: StateStore.formatTimestamp(now),
+                needsLegacyHistory: false
+            )
+        }
+
+        func pruneExpiredConversations(retention: HistoryRetention, now: Date) throws -> (removedIds: Set<String>, removedActive: Bool) {
+            guard retention.days != nil else { return ([], false) }
+            _ = migrateLegacyIfNeeded()
+            let activeRecord = readActiveStateRecord()
+            let conversations = readConversations()
+            var removedIds = Set<String>()
+            for conversation in conversations where retention.isExpired(updatedAt: conversation.updatedAt, relativeTo: now) {
+                if let fileURL = conversationURL(id: conversation.id) {
+                    try StateStore.removeFileIfExists(at: fileURL)
+                    removedIds.insert(conversation.id)
+                }
+            }
+            let removedActive = activeRecord?.activeConversationId.map { removedIds.contains($0) } ?? false
+            try clearActiveStateIfNeeded(activeRecord, removedActive: removedActive, now: now)
+            return (removedIds, removedActive)
+        }
+
+        func clearAllConversations(now: Date) throws -> (removedIds: Set<String>, removedActive: Bool) {
+            _ = migrateLegacyIfNeeded()
+            let activeRecord = readActiveStateRecord()
+            let conversations = readConversations()
+            var removedIds = Set<String>()
+            for conversation in conversations {
+                if let fileURL = conversationURL(id: conversation.id) {
+                    try StateStore.removeFileIfExists(at: fileURL)
+                    removedIds.insert(conversation.id)
+                }
+            }
+            // Also remove any stray/corrupt .json files in conversations/ so Clear All leaves the directory clean.
+            if let entries = try? FileManager.default.contentsOfDirectory(
+                at: conversationsDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) {
+                for entry in entries where entry.pathExtension == "json" {
+                    try StateStore.removeFileIfExists(at: entry)
+                }
+            }
+            let removedActive = activeRecord?.activeConversationId != nil
+            try clearActiveStateIfNeeded(activeRecord, removedActive: removedActive, now: now)
+            return (removedIds, removedActive)
+        }
+
+        func deleteConversation(id: String, now: Date) throws -> (removed: Bool, removedActive: Bool) {
+            _ = migrateLegacyIfNeeded()
+            guard let fileURL = conversationURL(id: id) else {
+                return (false, false)
+            }
+            let activeRecord = readActiveStateRecord()
+            let existed = FileManager.default.fileExists(atPath: fileURL.path)
+            if existed {
+                try StateStore.removeFileIfExists(at: fileURL)
+            }
+            let removedActive = activeRecord?.activeConversationId == id
+            try clearActiveStateIfNeeded(activeRecord, removedActive: removedActive, now: now)
+            return (existed, removedActive)
+        }
+
+        func load() -> PersistedState? {
+            guard let data = try? Data(contentsOf: stateURL),
+                  let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let version = raw["version"] as? Int else {
+                return nil
+            }
+
+            if version == PersistedState.legacyVersion {
+                return migrateLegacyV3(raw: raw)
+            }
+
+            guard version == PersistedState.currentVersion,
+                  let model = raw["model"] as? String, !model.isEmpty,
+                  let updatedAt = raw["updatedAt"] as? String, !updatedAt.isEmpty else {
+                return nil
+            }
+
+            if let activeId = raw["activeConversationId"] as? String, StateStore.isValidConversationId(activeId) {
+                if let fileURL = conversationURL(id: activeId),
+                   let saved = StateStore.decodeConversation(from: fileURL) {
+                    return StateStore.persistedState(from: saved)
+                }
+                return PersistedState(
+                    version: PersistedState.currentVersion,
+                    conversationId: nil,
+                    threadId: "",
+                    model: model,
+                    updatedAt: updatedAt,
+                    messages: [],
+                    codexSyncedCount: 0
+                )
+            }
+
+            let threadId = (raw["threadId"] as? String) ?? ""
+            let needsLegacy = (raw["needsLegacyHistory"] as? Bool) == true
+            if needsLegacy && threadId.isEmpty { return nil }
+            return PersistedState(
+                version: PersistedState.currentVersion,
+                conversationId: nil,
+                threadId: threadId,
+                model: model,
+                updatedAt: updatedAt,
+                messages: needsLegacy ? nil : [],
+                codexSyncedCount: needsLegacy ? nil : 0
+            )
+        }
+
+        func saveActiveConversation(_ record: SavedConversation) throws {
+            guard let destURL = conversationURL(id: record.id) else {
+                throw NSError(domain: "SpeedChat.Persistence", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "Invalid conversation identifier.",
+                ])
+            }
+            try StateStore.ensurePrivateDirectory(stateDirectory)
+            try StateStore.ensurePrivateDirectory(conversationsDirectory)
+
+            let conversationData = try StateStore.encodeJSON(record)
+            let activeState = ActiveStateRecord(
+                version: PersistedState.currentVersion,
+                activeConversationId: record.id,
+                threadId: record.threadId,
+                model: record.model,
+                updatedAt: record.updatedAt,
+                needsLegacyHistory: nil
+            )
+            let activeData = try StateStore.encodeJSON(activeState)
+
+            // Stage conversation file first, then commit state.json before replacing the
+            // saved conversation so a failed state.json write never mutates the last
+            // readable conversation journal on disk.
+            let convTempURL = try StateStore.writeStagedTempFile(conversationData, in: conversationsDirectory)
+            var convCommitted = false
+            defer {
+                if !convCommitted { try? FileManager.default.removeItem(at: convTempURL) }
+            }
+            try StateStore.writePrivateFile(activeData, to: stateURL)
+            try StateStore.replaceFile(at: destURL, withTemp: convTempURL)
+            convCommitted = true
+        }
+
+        func setActiveConversation(_ record: SavedConversation, model: String) throws {
+            guard StateStore.isValidConversationId(record.id) else {
+                throw NSError(domain: "SpeedChat.Persistence", code: 2, userInfo: [
+                    NSLocalizedDescriptionKey: "Invalid conversation identifier.",
+                ])
+            }
+            let activeState = ActiveStateRecord(
+                version: PersistedState.currentVersion,
+                activeConversationId: record.id,
+                threadId: record.threadId,
+                model: model,
+                updatedAt: record.updatedAt,
+                needsLegacyHistory: nil
+            )
+            let activeData = try StateStore.encodeJSON(activeState)
+            try StateStore.writePrivateFile(activeData, to: stateURL)
+        }
+
+        func saveBlankActiveState(
+            threadId: String,
+            model: String,
+            updatedAt: String,
+            needsLegacyHistory: Bool
+        ) throws {
+            let activeState = ActiveStateRecord(
+                version: PersistedState.currentVersion,
+                activeConversationId: nil,
+                threadId: threadId,
+                model: model,
+                updatedAt: updatedAt,
+                needsLegacyHistory: needsLegacyHistory ? true : nil
+            )
+            let activeData = try StateStore.encodeJSON(activeState)
+            try StateStore.writePrivateFile(activeData, to: stateURL)
+        }
+    }
+
+    public static func loadConversation(
+        id: String,
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> SavedConversation? {
+        StateLocation(stateURL: url, env: env).loadConversation(id: id)
+    }
+
+    public static func loadConversations(
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [SavedConversation] {
+        StateLocation(stateURL: url, env: env).loadConversations()
+    }
+
+    public static func countSavedConversations(
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        StateLocation(stateURL: url, env: env).loadConversations().count
+    }
+
+    public static func countExpiredConversations(
+        retention: HistoryRetention,
+        now: Date = Date(),
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        guard retention.days != nil else { return 0 }
+        return StateLocation(stateURL: url, env: env).loadConversations().filter {
+            retention.isExpired(updatedAt: $0.updatedAt, relativeTo: now)
+        }.count
+    }
+
+    private static func removeFileIfExists(at url: URL) throws {
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            return
+        }
+    }
+
+    @discardableResult
+    public static func pruneExpiredConversations(
+        retention: HistoryRetention,
+        now: Date = Date(),
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (removedIds: Set<String>, removedActive: Bool) {
+        try StateLocation(stateURL: url, env: env).pruneExpiredConversations(retention: retention, now: now)
+    }
+
+    @discardableResult
+    public static func clearAllConversations(
+        now: Date = Date(),
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (removedIds: Set<String>, removedActive: Bool) {
+        try StateLocation(stateURL: url, env: env).clearAllConversations(now: now)
+    }
+
+    @discardableResult
+    public static func deleteConversation(
+        id: String,
+        now: Date = Date(),
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (removed: Bool, removedActive: Bool) {
+        try StateLocation(stateURL: url, env: env).deleteConversation(id: id, now: now)
+    }
+
+    public static func load(from url: URL? = nil, env: [String: String] = ProcessInfo.processInfo.environment) -> PersistedState? {
+        StateLocation(stateURL: url, env: env).load()
+    }
+
+    private static func ensurePrivateDirectory(_ dir: URL) throws {
+        try FileManager.default.createDirectory(
+            at: dir,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+    }
+
+    private static func encodeJSON<T: Encodable>(_ value: T) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        var data = try encoder.encode(value)
+        data.append(10)
+        return data
+    }
+
+    private static func writeStagedTempFile(_ data: Data, in directory: URL) throws -> URL {
+        let tempURL = directory.appendingPathComponent(".tmp-\(UUID().uuidString.lowercased())")
+        guard FileManager.default.createFile(
+            atPath: tempURL.path,
+            contents: data,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            let code = errno != 0 ? errno : EIO
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
+        return tempURL
+    }
+
+    private static func replaceFile(at destination: URL, withTemp tempURL: URL) throws {
+        if Darwin.rename(tempURL.path, destination.path) != 0 {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+
+    private static func writePrivateFile(_ data: Data, to target: URL) throws {
+        let dir = target.deletingLastPathComponent()
+        try ensurePrivateDirectory(dir)
+        let tempURL = try writeStagedTempFile(data, in: dir)
+        var committed = false
+        defer {
+            if !committed { try? FileManager.default.removeItem(at: tempURL) }
+        }
+        try replaceFile(at: target, withTemp: tempURL)
+        committed = true
+    }
+
+    static func saveActiveConversation(_ record: SavedConversation, to target: URL) throws {
+        try StateLocation(resolved: target).saveActiveConversation(record)
+    }
+
+    static func setActiveConversation(_ record: SavedConversation, model: String, to target: URL) throws {
+        try StateLocation(resolved: target).setActiveConversation(record, model: model)
+    }
+
+    static func saveBlankActiveState(
+        threadId: String,
+        model: String,
+        updatedAt: String,
+        needsLegacyHistory: Bool,
+        to target: URL
+    ) throws {
+        try StateLocation(resolved: target).saveBlankActiveState(
             threadId: threadId,
             model: model,
             updatedAt: updatedAt,
-            messages: validMessages,
-            codexSyncedCount: codexSyncedCount
+            needsLegacyHistory: needsLegacyHistory
         )
-        if let attempt = raw["lastCodexSend"], JSONSerialization.isValidJSONObject(attempt),
-           let data = try? JSONSerialization.data(withJSONObject: attempt) {
-            state.lastCodexSend = try? JSONDecoder().decode(CodexSendAttempt.self, from: data)
-        }
-        return state
     }
 
     public static func save(
@@ -100,26 +678,30 @@ public enum StateStore {
         lastCodexSend: CodexSendAttempt?,
         env: [String: String]
     ) throws {
-        let target = url ?? stateURL(env: env)
-        let dir = target.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
-
-        var payload = PersistedState(
-            version: PersistedState.currentVersion,
-            threadId: threadId,
-            model: model,
-            updatedAt: ISO8601DateFormatter().string(from: Date()),
-            messages: messages,
-            codexSyncedCount: codexSyncedCount
-        )
-        payload.lastCodexSend = lastCodexSend
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        var data = try encoder.encode(payload)
-        data.append(10)
-        try data.write(to: target, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        let location = StateLocation(stateURL: url, env: env)
+        let now = formatTimestamp(Date())
+        if let messages, !messages.isEmpty {
+            let id = UUID().uuidString.lowercased()
+            var record = SavedConversation(
+                id: id,
+                title: derivedTitle(from: messages),
+                createdAt: now,
+                updatedAt: now,
+                model: model,
+                threadId: threadId,
+                messages: messages,
+                codexSyncedCount: min(max(codexSyncedCount ?? 0, 0), messages.count)
+            )
+            record.lastCodexSend = lastCodexSend
+            try location.saveActiveConversation(record)
+        } else {
+            try location.saveBlankActiveState(
+                threadId: threadId,
+                model: model,
+                updatedAt: now,
+                needsLegacyHistory: messages == nil
+            )
+        }
     }
 
     public static func messagesFromTurns(_ turns: [[String: Any]]) -> [ChatMessage] {
