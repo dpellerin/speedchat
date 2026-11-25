@@ -12,8 +12,11 @@ import ChatCore
  @Published var coldStarts=0
  @Published var warmReopens=0
  @Published var showingHistory=false
+ @Published var historyQuery=""
  @Published var historyEntries=[HistoryEntry]()
  @Published var selectedHistoryIndex=0
+ @Published var historyFocusToken=0
+ var hasActiveHistoryQuery:Bool {!historyQuery.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
  private var draftsByConversation=[String:String]()
  private var blankDraft=""
  var bridge:(any ChatBackend)?
@@ -43,7 +46,7 @@ import ChatCore
   if bridge != nil {warmReopens += 1} else if !fixtureMode {connect()}
   if !showingHistory {focusToken += 1}
  }
- func hide() {showingHistory=false;hiddenAt=Date();scheduleIdle()}
+ func hide() {showingHistory=false;historyQuery="";hiddenAt=Date();scheduleIdle()}
  private func scheduleIdle() {
   idleTimer?.invalidate()
   idleTimer=Timer.scheduledTimer(withTimeInterval:15,repeats:true) { [weak self] _ in Task { @MainActor in
@@ -53,7 +56,7 @@ import ChatCore
  }
  func connect() {
   guard !quitting else {return}
-  showingHistory=false
+  showingHistory=false;historyQuery=""
   stop();session.connecting()
   guard let teardown else {startBridge();return}
   let current=generation
@@ -88,9 +91,13 @@ import ChatCore
  }
  func receive(_ event:BridgeEvent) {
   if event.type == "history" {
+   if let eventQuery=event.query,eventQuery != historyQuery {
+    if event.clearedActiveConversation != nil {onHistoryChanged?()}
+    return
+   }
    historyEntries=event.history ?? []
    selectedHistoryIndex=historyEntries.isEmpty ? 0 : min(max(selectedHistoryIndex,0),historyEntries.count-1)
-   if historyEntries.isEmpty && event.clearedActiveConversation == true {
+   if !hasActiveHistoryQuery && historyEntries.isEmpty && event.clearedActiveConversation == true {
     draftsByConversation.removeAll()
    }
    changed?()
@@ -152,17 +159,35 @@ import ChatCore
    if draft.isEmpty {draftsByConversation.removeValue(forKey:cid)}
    else {draftsByConversation[cid]=draft}
   }
-  blankDraft="";draft="";showingHistory=false;followBottom=true;command(["type":"newChat"])
+  blankDraft="";draft="";showingHistory=false;historyQuery="";followBottom=true;command(["type":"newChat"])
  }
  func openHistory() {
   guard session.canOpenHistory else {return}
   showingHistory=true
+  historyQuery=""
   selectedHistoryIndex=0
+  historyFocusToken += 1
   command(["type":"listHistory"])
+ }
+ func updateHistoryQuery(_ query:String) {
+  guard showingHistory else {return}
+  historyQuery=query
+  selectedHistoryIndex=0
+  if query.isEmpty {
+   command(["type":"listHistory"])
+  } else {
+   command(["type":"listHistory","query":query])
+  }
+ }
+ func clearHistoryQuery() {
+  guard showingHistory else {return}
+  updateHistoryQuery("")
+  historyFocusToken += 1
  }
  func closeHistory() {
   guard showingHistory else {return}
   showingHistory=false
+  historyQuery=""
   if shouldFocusComposer() {focusToken += 1}
  }
  func toggleHistory() {
@@ -174,15 +199,23 @@ import ChatCore
  }
  func openSelectedHistoryConversation() {
   guard showingHistory,historyEntries.indices.contains(selectedHistoryIndex) else {return}
-  openHistoryConversation(id:historyEntries[selectedHistoryIndex].id)
+  let entry=historyEntries[selectedHistoryIndex]
+  openHistoryConversation(id:entry.id,scrollToMessageId:hasActiveHistoryQuery ? entry.firstMatchingMessageId : nil)
  }
- func openHistoryConversation(id:String) {
+ func openHistoryConversation(id:String,scrollToMessageId:String?=nil) {
   guard session.canOpenHistory else {return}
-  saveDraftForCurrentConversation()
-  draft=draftsByConversation[id] ?? ""
+  if id != session.conversationId {
+   saveDraftForCurrentConversation()
+   draft=draftsByConversation[id] ?? ""
+  }
   showingHistory=false
-  followBottom=true
-  command(["type":"openConversation","conversationId":id])
+  historyQuery=""
+  followBottom=(scrollToMessageId == nil)
+  var cmd=["type":"openConversation","conversationId":id]
+  if let scrollToMessageId,!scrollToMessageId.isEmpty {
+   cmd["scrollToMessageId"]=scrollToMessageId
+  }
+  command(cmd)
  }
  func countSavedHistory()->Int {
   if fixtureMode {return historyEntries.count}
@@ -198,15 +231,17 @@ import ChatCore
  func applyHistoryRetention(_ policy:HistoryRetention) {
   historyRetention=policy
   if bridge != nil || fixtureMode {
-   command(["type":"applyRetention","retention":policy.rawValue])
+   var cmd=["type":"applyRetention","retention":policy.rawValue]
+   if !historyQuery.isEmpty {cmd["query"]=historyQuery}
+   command(cmd)
   } else if let pruned=try? StateStore.pruneExpiredConversations(retention:policy,now:now(),stateURL:stateURL,env:environment) {
    for removedId in pruned.removedIds {draftsByConversation.removeValue(forKey:removedId)}
-   let remaining=ConversationHistory.entries(from:StateStore.loadConversations(stateURL:stateURL,env:environment))
+   let remaining=ConversationHistory.search(StateStore.loadConversations(stateURL:stateURL,env:environment),query:historyQuery)
    let activeRemoved=session.conversationId.map {pruned.removedIds.contains($0)} ?? false
    if activeRemoved {
     receive(BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true))
    }
-   receive(BridgeEvent(type:"history",history:remaining,clearedActiveConversation:activeRemoved))
+   receive(BridgeEvent(type:"history",history:remaining,clearedActiveConversation:activeRemoved,query:historyQuery))
   }
  }
  func clearAllHistory() {

@@ -14,6 +14,13 @@ extension AppDelegate {
     if let text=view as? ComposerTextView {return text}
     return view.subviews.lazy.compactMap(composerIn).first
    }
+   func findSearchBar(_ view:NSView)->HistorySearchBarNSView? {
+    if let bar=view as? HistorySearchBarNSView {return bar}
+    return view.subviews.lazy.compactMap(findSearchBar).first
+   }
+   func findSearchField(_ view:NSView)->HistorySearchTextField? {
+    findSearchBar(view)?.field
+   }
    let coldComposer=panel.contentView.flatMap(composerIn)
    check("Opening focuses editable composer before backend ready",coldComposer != nil && panel.firstResponder === coldComposer && coldComposer?.isEditable == true)
    let ready=try JSONDecoder().decode(BridgeEvent.self,from:Data(fixture.utf8));store.session.receive(ready)
@@ -238,6 +245,9 @@ extension AppDelegate {
     try? await Task.sleep(for:.milliseconds(150))
     self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
     let emptyHistoryRendered=self.panel.contentView.map{!hasScrollView($0) && composerIn($0) == nil} ?? false
+    let searchFieldOnOpen=self.panel.contentView.flatMap(findSearchField)
+    check("History search bar receives keyboard focus automatically when History opens",
+          searchFieldOnOpen != nil && searchFieldOnOpen?.isFocusedInWindow == true)
     self.store.receive(BridgeEvent(type:"history",history:[historyA,historyB]))
     try? await Task.sleep(for:.milliseconds(150))
     self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
@@ -251,8 +261,11 @@ extension AppDelegate {
 
     self.store.moveHistorySelection(1)
     self.store.openSelectedHistoryConversation()
-    let offlineResumedMessages=(0..<10).map {idx in
-     ChatMessage(id:"lisbon-\(idx)",role:idx.isMultiple(of:2) ? "user" : "assistant",text:idx == 9 ? "Final Lisbon recommendation at bottom." : String(repeating:"Lisbon notes paragraph. ",count:12))
+    let offlineResumedMessages=(0..<14).map {idx in
+     if idx == 1 {
+      return ChatMessage(id:"lisbon-1",role:"assistant",text:"Ride Tram 28 through historic Alfama at sunrise.")
+     }
+     return ChatMessage(id:"lisbon-\(idx)",role:idx.isMultiple(of:2) ? "user" : "assistant",text:idx == 13 ? "Final Lisbon recommendation at bottom." : String(repeating:"Lisbon notes paragraph \(idx). ",count:14))
     }
     self.store.receive(BridgeEvent(type:"offlineConversation",conversationId:historyB.id,messages:offlineResumedMessages,models:[],model:"gpt-6-sol",notice:offlineNotice))
     try? await Task.sleep(for:.milliseconds(200))
@@ -262,18 +275,94 @@ extension AppDelegate {
           self.store.fixtureCommands.last == ["type":"openConversation","conversationId":historyB.id] &&
           (self.panel.contentView.map(findProse) ?? []).contains {$0.storage.string == "Final Lisbon recommendation at bottom." && !$0.visibleRect.isEmpty})
 
-    // Online ready mode: draft preservation, Esc abandon, hide abandon with composer focus, and active-turn gating.
+    // Online ready mode: search bar no-match empty state, inline clear, Esc with query text,
+    // and selecting a search match (including re-selecting the active conversation) scrolling to the matched message with Latest pill available.
     self.store.receive(BridgeEvent(type:"ready",conversationId:historyB.id,messages:offlineResumedMessages,models:ready.models,model:"gpt-6-sol"))
     self.store.draft="Unsent Lisbon note"
     self.store.openHistory()
-    self.store.receive(BridgeEvent(type:"history",history:[historyA,historyB]))
+    try? await Task.sleep(for:.milliseconds(150))
+    let searchBarWhenEmpty=self.panel.contentView.flatMap(findSearchBar)
+    let clearHiddenWhenEmpty=searchBarWhenEmpty?.clearButton.isHidden == true
+    self.store.updateHistoryQuery("nonexistent xylophone")
+    self.store.receive(BridgeEvent(type:"history",history:[],query:"nonexistent xylophone"))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    let noMatchElements=self.panel.flatMap{accessibleElements($0)} ?? []
+    let noMatchStateRendered=noMatchElements.contains {
+     $0.accessibilityIdentifier() == "speedchat-history-no-matches" ||
+     $0.accessibilityLabel() == "No matching conversations" ||
+     ($0.accessibilityValue() as? String) == "No matching conversations" ||
+     $0.accessibilityTitle() == "No matching conversations"
+    }
+    if let content=self.panel.contentView,let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) {content.cacheDisplay(in:content.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/history-no-matches.png"))}
+    let noMatchNoScrollView=self.panel.contentView.map{!hasScrollView($0)} ?? false
+    let searchBarWithQuery=self.panel.contentView.flatMap(findSearchBar)
+    let clearVisibleWhenNonEmpty=searchBarWithQuery?.clearButton.isHidden == false
+    searchBarWithQuery?.clearButton.performClick(nil)
     try? await Task.sleep(for:.milliseconds(100))
-    self.store.closeHistory()
+    let searchFieldAfterClear=self.panel.contentView.flatMap(findSearchField)
+    check("History search shows No matching conversations empty state",
+          noMatchStateRendered && noMatchNoScrollView)
+    check("History search inline clear button appears when non-empty and clears while keeping focus",
+          clearHiddenWhenEmpty && clearVisibleWhenNonEmpty &&
+          self.store.historyQuery.isEmpty && searchBarWithQuery?.clearButton.isHidden == true &&
+          searchFieldAfterClear?.isFocusedInWindow == true)
+
+    // Press Esc while query text is in the search bar: closes History in one keypress, keeping draft & composer focus.
+    self.store.updateHistoryQuery("alfama")
+    let matchedLisbon=HistoryEntry(
+     id:historyB.id,
+     title:historyB.title,
+     updatedAt:historyB.updatedAt,
+     preview:"Ride Tram 28 through historic Alfama at sunrise.",
+     model:historyB.model,
+     messageCount:offlineResumedMessages.count,
+     previewMatchRanges:[HistoryMatchRange(start:30,end:36)],
+     firstMatchingMessageId:"lisbon-1"
+    )
+    self.store.receive(BridgeEvent(type:"history",history:[matchedLisbon],query:"alfama"))
+    try? await Task.sleep(for:.milliseconds(150))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    if let content=self.panel.contentView,let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) {content.cacheDisplay(in:content.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/history-search.png"))}
+    if let escEvent=NSEvent.keyEvent(with:.keyDown,location:.zero,modifierFlags:[],timestamp:0,windowNumber:self.panel.windowNumber,context:nil,characters:"\u{1b}",charactersIgnoringModifiers:"\u{1b}",isARepeat:false,keyCode:53) {
+     if let field=self.panel.contentView.flatMap(findSearchField),let editor=field.currentEditor() {
+      editor.doCommand(by:#selector(NSResponder.cancelOperation(_:)))
+     } else {
+      self.panel.sendEvent(escEvent)
+     }
+    }
     try? await Task.sleep(for:.milliseconds(150))
     let composerAfterEsc=self.panel.contentView.flatMap(composerIn)
-    check("Abandoning History returns to active conversation with draft intact and composer focused",
-          !self.store.showingHistory && self.store.session.conversationId == historyB.id &&
+    check("Pressing Esc with text in History search closes History in one keypress with draft intact and composer focused",
+          !self.store.showingHistory && self.store.historyQuery.isEmpty && self.store.session.conversationId == historyB.id &&
           self.store.draft == "Unsent Lisbon note" && composerAfterEsc != nil && self.panel.firstResponder === composerAfterEsc)
+
+    // Re-selecting the currently active conversation from a non-empty search query closes History,
+    // scrolls directly to the first matching message near the top, and leaves the Latest pill available!
+    self.store.openHistory()
+    self.store.updateHistoryQuery("alfama")
+    self.store.receive(BridgeEvent(type:"history",history:[matchedLisbon],query:"alfama"))
+    try? await Task.sleep(for:.milliseconds(100))
+    self.store.openSelectedHistoryConversation()
+    let searchOpenCommand=self.store.fixtureCommands.last
+    self.store.receive(BridgeEvent(
+     type:"ready",
+     conversationId:historyB.id,
+     messages:offlineResumedMessages,
+     models:ready.models,
+     model:"gpt-6-sol",
+     scrollToMessageId:"lisbon-1"
+    ))
+    try? await Task.sleep(for:.milliseconds(250))
+    self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
+    if let content=self.panel.contentView,let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) {content.cacheDisplay(in:content.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/history-scroll-match.png"))}
+    let matchedMessageVisible=(self.panel.contentView.map(findProse) ?? []).contains {
+     $0.storage.string == "Ride Tram 28 through historic Alfama at sunrise." && !$0.visibleRect.isEmpty
+    }
+    check("Selecting a search match (including active conversation) scrolls to matching message with Latest pill available",
+          !self.store.showingHistory &&
+          searchOpenCommand == ["type":"openConversation","conversationId":historyB.id,"scrollToMessageId":"lisbon-1"] &&
+          matchedMessageVisible && !self.store.followBottom && self.store.draft == "Unsent Lisbon note")
 
     self.store.openHistory()
     self.hide()

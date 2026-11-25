@@ -383,6 +383,258 @@ import Testing
     #expect(historyCount == 2)
 }
 
+@Test func bridgeSearchesHistoryAndForwardsScrollToMessageIdOnlineAndOffline() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("bridge-history-search-" + UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let stateURL = root.appendingPathComponent("state.json")
+    let convLisbon = SavedConversation(
+        id: "conv-lisbon",
+        title: "Portugal coastal itinerary",
+        createdAt: "2026-04-01T10:00:00.000Z",
+        updatedAt: "2026-04-01T10:00:00.000Z",
+        model: "gpt-6-luna",
+        threadId: "codex-lisbon",
+        messages: [
+            ChatMessage(id: "m1", role: "user", text: "Plan a coastal trip."),
+            ChatMessage(id: "m2", role: "assistant", text: "Start in Porto."),
+            ChatMessage(id: "m3", role: "assistant", text: "Ride Tram 28 through Alfama at sunrise."),
+        ],
+        codexSyncedCount: 3
+    )
+    let convBeam = SavedConversation(
+        id: "conv-beam",
+        title: "Roasting coffee",
+        createdAt: "2026-04-02T10:00:00.000Z",
+        updatedAt: "2026-04-02T10:00:00.000Z",
+        model: "gpt-6-luna",
+        threadId: "codex-beam",
+        messages: [
+            ChatMessage(id: "b1", role: "user", text: "Medium roast advice"),
+            ChatMessage(id: "b2", role: "assistant", text: "Watch first crack.", reasoning: "SECRET ALFAMA TRAM REASONING"),
+        ],
+        codexSyncedCount: 2
+    )
+    try StateStore.saveActiveConversation(convLisbon, to: stateURL)
+    try StateStore.saveActiveConversation(convBeam, to: stateURL)
+
+    // 1. Online bridge search and open with scrollToMessageId.
+    let codex = root.appendingPathComponent("fake-codex")
+    let script = """
+    #!/usr/bin/env python3
+    import json, sys
+    for raw in sys.stdin:
+        msg = json.loads(raw)
+        if "id" not in msg:
+            continue
+        method, mid = msg["method"], msg["id"]
+        if method == "initialize":
+            print(json.dumps({"id": mid, "result": {}}), flush=True)
+        elif method == "model/list":
+            print(json.dumps({"id": mid, "result": {"data": [{"model": "gpt-6-luna", "displayName": "GPT-6 Luna", "supportedReasoningEfforts": [{"reasoningEffort": "low"}]}]}}), flush=True)
+        elif method == "thread/resume":
+            tid = msg["params"]["threadId"]
+            print(json.dumps({"id": mid, "result": {"thread": {"id": tid, "name": "Resumed", "turns": []}}}), flush=True)
+    """
+    try script.write(to: codex, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: codex.path)
+
+    let onlineBridge = BridgeProcess()
+    let (onlineEvents, onlineSink) = AsyncStream<BridgeEvent>.makeStream()
+    let onlineTimeout = Task {
+        try? await Task.sleep(for: .seconds(5))
+        onlineSink.finish()
+    }
+    defer { onlineTimeout.cancel() }
+
+    let fixtureNow = try #require(StateStore.parseTimestamp("2026-04-03T10:00:00Z"))
+    onlineBridge.start(codexOverride: codex.path, options: ChatClientOptions(
+        openRouterConfigURL: root.appendingPathComponent("openrouter.json"),
+        stateURL: stateURL,
+        env: [:],
+        now: { fixtureNow }
+    )) { onlineSink.yield($0) }
+
+    var onlineIter = onlineEvents.makeAsyncIterator()
+    let initialOnline = try #require(await onlineIter.next())
+    #expect(initialOnline.type == "ready")
+
+    onlineBridge.send(["type": "listHistory", "query": "alfama tram"])
+    let searchEvent = try #require(await onlineIter.next())
+    #expect(searchEvent.type == "history")
+    #expect(searchEvent.query == "alfama tram")
+    #expect(searchEvent.history?.map(\.id) == ["conv-lisbon"])
+    #expect(searchEvent.history?.first?.firstMatchingMessageId == "m3")
+    #expect(searchEvent.history?.first?.previewMatchRanges.isEmpty == false)
+
+    onlineBridge.send(["type": "openConversation", "conversationId": "conv-lisbon", "scrollToMessageId": "m3"])
+    let openedOnline = try #require(await onlineIter.next())
+    #expect(openedOnline.type == "ready")
+    #expect(openedOnline.conversationId == "conv-lisbon")
+    #expect(openedOnline.scrollToMessageId == "m3")
+
+    await withCheckedContinuation { cont in
+        onlineBridge.close { cont.resume() }
+    }
+
+    // 2. Offline bridge search and open with scrollToMessageId.
+    let failingCodex = root.appendingPathComponent("failing-codex")
+    try "#!/bin/sh\nexit 17\n".write(to: failingCodex, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: failingCodex.path)
+
+    let offlineBridge = BridgeProcess()
+    let (offlineEvents, offlineSink) = AsyncStream<BridgeEvent>.makeStream()
+    let offlineTimeout = Task {
+        try? await Task.sleep(for: .seconds(5))
+        offlineSink.finish()
+    }
+    defer { offlineTimeout.cancel() }
+
+    offlineBridge.start(codexOverride: failingCodex.path, options: ChatClientOptions(
+        openRouterConfigURL: root.appendingPathComponent("openrouter.json"),
+        stateURL: stateURL,
+        env: [:],
+        now: { fixtureNow }
+    )) { offlineSink.yield($0) }
+
+    var offlineIter = offlineEvents.makeAsyncIterator()
+    let initialOffline = try #require(await offlineIter.next())
+    #expect(initialOffline.type == "offlineConversation")
+
+    offlineBridge.send(["type": "listHistory", "query": "alfama"])
+    let offlineSearch = try #require(await offlineIter.next())
+    #expect(offlineSearch.type == "history")
+    #expect(offlineSearch.query == "alfama")
+    #expect(offlineSearch.history?.map(\.id) == ["conv-lisbon"])
+
+    offlineBridge.send(["type": "openConversation", "conversationId": "conv-lisbon", "scrollToMessageId": "m3"])
+    let openedOffline = try #require(await offlineIter.next())
+    #expect(openedOffline.type == "offlineConversation")
+    #expect(openedOffline.conversationId == "conv-lisbon")
+    #expect(openedOffline.scrollToMessageId == "m3")
+
+    await withCheckedContinuation { cont in
+        offlineBridge.close { cont.resume() }
+    }
+}
+
+@MainActor
+@Test func chatStoreSearchesClearsClosesWithEscAndScrollsToMatchIncludingActiveConversation() async throws {
+    let backend = RecordingHistoryBackend()
+    let store = ChatStore { backend }
+    store.shouldFocusComposer = { true }
+
+    store.connect()
+    let models = [ChatModel(model: "gpt-6-luna", displayName: "GPT-6 Luna", provider: "openai")]
+    let activeMessages = [
+        ChatMessage(id: "a-m1", role: "user", text: "Plan Lisbon"),
+        ChatMessage(id: "a-m2", role: "assistant", text: "Ride Tram 28 through Alfama."),
+        ChatMessage(id: "a-m3", role: "assistant", text: "Enjoy coastal seafood."),
+    ]
+    backend.emit(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-a",
+        messages: activeMessages,
+        models: models,
+        model: "gpt-6-luna"
+    ))
+    try await waitForCondition { store.session.phase == .ready }
+    store.draft = "Unsent draft for active chat"
+
+    // Opening History bumps historyFocusToken and clears any prior query.
+    let initialHistoryFocus = store.historyFocusToken
+    store.openHistory()
+    #expect(store.showingHistory)
+    #expect(store.historyQuery.isEmpty)
+    #expect(store.historyFocusToken == initialHistoryFocus + 1)
+    #expect(backend.commands.last == ["type": "listHistory"])
+
+    // Typing a query dispatches listHistory with query and ignores stale responses for earlier queries.
+    store.updateHistoryQuery("alf")
+    #expect(backend.commands.last == ["type": "listHistory", "query": "alf"])
+    store.updateHistoryQuery("alfama")
+    #expect(backend.commands.last == ["type": "listHistory", "query": "alfama"])
+
+    let staleEntry = HistoryEntry(id: "conv-stale", title: "Stale", updatedAt: "2026-04-01T10:00:00.000Z", preview: "Alf", model: "gpt-6-luna", messageCount: 1)
+    let matchedActive = HistoryEntry(
+        id: "conv-a",
+        title: "Plan Lisbon",
+        updatedAt: "2026-04-02T10:00:00.000Z",
+        preview: "Ride Tram 28 through Alfama.",
+        model: "gpt-6-luna",
+        messageCount: 3,
+        previewMatchRanges: [HistoryMatchRange(start: 21, end: 27)],
+        firstMatchingMessageId: "a-m2"
+    )
+    backend.emit(BridgeEvent(type: "history", history: [staleEntry], query: "alf"))
+    backend.emit(BridgeEvent(type: "history", history: [matchedActive], query: "alfama"))
+    try await waitForCondition { store.historyEntries == [matchedActive] }
+    #expect(store.historyEntries.map(\.id) == ["conv-a"])
+
+    // Pressing Esc (closeHistory) while query text is present immediately closes History in one action,
+    // clears historyQuery, keeps the active conversation & draft intact, and refocuses composer.
+    let composerFocusBeforeEsc = store.focusToken
+    store.closeHistory()
+    #expect(!store.showingHistory)
+    #expect(store.historyQuery.isEmpty)
+    #expect(store.session.conversationId == "conv-a")
+    #expect(store.draft == "Unsent draft for active chat")
+    #expect(store.focusToken == composerFocusBeforeEsc + 1)
+
+    // Reopen History, type a query, then clear with inline × (clearHistoryQuery) -> stays in History and keeps search focused.
+    store.openHistory()
+    store.updateHistoryQuery("alfama")
+    let focusBeforeClear = store.historyFocusToken
+    store.clearHistoryQuery()
+    #expect(store.showingHistory)
+    #expect(store.historyQuery.isEmpty)
+    #expect(store.historyFocusToken == focusBeforeClear + 1)
+    #expect(backend.commands.last == ["type": "listHistory"])
+
+    // Search again and re-select the CURRENTLY ACTIVE conversation from a non-empty query ->
+    // closes History, preserves its draft, sends scrollToMessageId, and updates session.scrollTargetMessageId!
+    store.updateHistoryQuery("alfama")
+    backend.emit(BridgeEvent(type: "history", history: [matchedActive], query: "alfama"))
+    try await waitForCondition { store.historyEntries == [matchedActive] }
+    let transcriptBeforeReselect = store.session.transcriptID
+    store.openSelectedHistoryConversation()
+    #expect(!store.showingHistory)
+    #expect(store.historyQuery.isEmpty)
+    #expect(store.draft == "Unsent draft for active chat")
+    #expect(backend.commands.last == ["type": "openConversation", "conversationId": "conv-a", "scrollToMessageId": "a-m2"])
+    backend.emit(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-a",
+        messages: activeMessages,
+        models: models,
+        model: "gpt-6-luna",
+        scrollToMessageId: "a-m2"
+    ))
+    try await waitForCondition { store.session.transcriptID != transcriptBeforeReselect }
+    #expect(store.session.scrollTargetMessageId == "a-m2")
+
+    // Opening a conversation when the search bar is empty omits scrollToMessageId and scrolls to bottom.
+    let emptyQueryEntry = HistoryEntry(id: "conv-b", title: "Other chat", updatedAt: "2026-04-01T10:00:00.000Z", preview: "Latest", model: "gpt-6-luna", messageCount: 1)
+    store.openHistory()
+    backend.emit(BridgeEvent(type: "history", history: [emptyQueryEntry], query: ""))
+    try await waitForCondition { store.historyEntries == [emptyQueryEntry] }
+    store.openSelectedHistoryConversation()
+    #expect(backend.commands.last == ["type": "openConversation", "conversationId": "conv-b"])
+    #expect(store.followBottom)
+    backend.emit(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-b",
+        messages: [ChatMessage(id: "b-m1", role: "user", text: "Latest")],
+        models: models,
+        model: "gpt-6-luna"
+    ))
+    try await waitForCondition { store.session.conversationId == "conv-b" }
+    #expect(store.session.scrollTargetMessageId == nil)
+
+    store.stop()
+}
+
 @MainActor
 private func waitForCondition(timeout: Duration = .seconds(2), _ predicate: () -> Bool) async throws {
     let deadline = ContinuousClock.now + timeout

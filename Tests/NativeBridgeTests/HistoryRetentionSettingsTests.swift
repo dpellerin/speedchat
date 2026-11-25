@@ -184,6 +184,63 @@ import Testing
     store.stop()
 }
 
+@MainActor
+@Test func applyRetentionAndClearHistoryRespectActiveHistorySearchQuery() async throws {
+    let backend = RecordingRetentionBackend()
+    let store = ChatStore { backend }
+    store.connect()
+
+    let models = [ChatModel(model: "gpt-6-luna", displayName: "GPT-6 Luna", provider: "openai")]
+    backend.emit(BridgeEvent(
+        type: "ready",
+        conversationId: "conv-fresh",
+        messages: [ChatMessage(id: "f-u1", role: "user", text: "Visit Alfama")],
+        models: models,
+        model: "gpt-6-luna"
+    ))
+    try await waitUntil { store.session.conversationId == "conv-fresh" }
+
+    store.openHistory()
+    store.updateHistoryQuery("alfama")
+    let matchedOld = HistoryEntry(
+        id: "conv-old",
+        title: "Old Lisbon notes",
+        updatedAt: "2026-04-01T10:00:00.000Z",
+        preview: "Walk through Alfama.",
+        model: "gpt-6-luna",
+        messageCount: 1,
+        previewMatchRanges: [HistoryMatchRange(start: 13, end: 19)],
+        firstMatchingMessageId: "o-u1"
+    )
+    let matchedFresh = HistoryEntry(
+        id: "conv-fresh",
+        title: "Fresh Lisbon notes",
+        updatedAt: "2026-05-14T10:00:00.000Z",
+        preview: "Visit Alfama.",
+        model: "gpt-6-luna",
+        messageCount: 1,
+        previewMatchRanges: [HistoryMatchRange(start: 6, end: 12)],
+        firstMatchingMessageId: "f-u1"
+    )
+    backend.emit(BridgeEvent(type: "history", history: [matchedFresh, matchedOld], query: "alfama"))
+    try await waitUntil { store.historyEntries.count == 2 }
+
+    // Pruning while a search query is active forwards the active query and updates filtered results.
+    store.applyHistoryRetention(.days7)
+    #expect(backend.commands.last == ["type": "applyRetention", "retention": "7d", "query": "alfama"])
+    backend.emit(BridgeEvent(type: "history", history: [matchedFresh], clearedActiveConversation: false, query: "alfama"))
+    try await waitUntil { store.historyEntries == [matchedFresh] }
+    #expect(store.historyQuery == "alfama")
+
+    // Clear All empties History even while a non-empty search query is active.
+    store.clearAllHistory()
+    #expect(backend.commands.last == ["type": "clearHistory"])
+    backend.emit(BridgeEvent(type: "history", history: [], clearedActiveConversation: true))
+    try await waitUntil { store.historyEntries.isEmpty }
+
+    store.stop()
+}
+
 @Test func bridgeProcessPrunesOnLaunchAndHandlesApplyRetentionAndClearHistory() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("bridge-retention-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
