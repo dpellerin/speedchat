@@ -25,6 +25,7 @@ import ChatCore
  var fixtureCommands=[[String:String]]()
  var fixtureStatusNotice=""
  var changed:(()->Void)?
+ var shouldFocusComposer:()->Bool={true}
  init(makeBridge:@escaping ()->any ChatBackend={BridgeProcess()}) {self.makeBridge=makeBridge}
  func show() {
   hiddenAt=nil;idleTimer?.invalidate();idleTimer=nil
@@ -59,9 +60,9 @@ import ChatCore
   eventTask=Task { @MainActor [weak self] in
    for await event in events {
     guard let self,!Task.isCancelled,self.generation == current else {return}
-    if event.type == "ready" {if self.session.phase == .connecting {self.readyMs=Date().timeIntervalSince(self.startedAt)*1000};self.focusToken += 1}
+    if event.type == "ready" {if self.session.phase == .connecting {self.readyMs=Date().timeIntervalSince(self.startedAt)*1000};if self.shouldFocusComposer() {self.focusToken += 1}}
     self.session.receive(event);self.changed?()
-    if event.type == "done" {self.focusToken += 1}
+    if event.type == "done",self.shouldFocusComposer() {self.focusToken += 1}
    }
   }
   backend.start(codexOverride:codexOverride,options:ChatClientOptions()) {event in

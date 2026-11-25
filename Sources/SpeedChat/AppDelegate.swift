@@ -12,6 +12,7 @@ import ChatCore
  let scroll=TranscriptScroll()
  let hotkey=GlobalHotKey()
  var panel:FloatingPanel!
+ var windowCoordinator:WindowCoordinator!
  var settingsWindow:NSWindow?
  var aboutWindow:NSWindow?
  var statusItem:NSStatusItem?
@@ -25,11 +26,27 @@ import ChatCore
   panel=FloatingPanel(contentRect:NSRect(x:0,y:0,width:790,height:740),styleMask:[.titled,.closable,.resizable,.fullSizeContentView,.nonactivatingPanel],backing:.buffered,defer:false)
   panel.title="SpeedChat";panel.titleVisibility = .hidden;panel.titlebarAppearsTransparent=true
   panel.isFloatingPanel=false;panel.level = .normal;panel.hidesOnDeactivate=false;panel.isReleasedWhenClosed=false
-  panel.collectionBehavior=[.canJoinAllSpaces,.fullScreenAuxiliary];panel.minSize=NSSize(width:580,height:480)
+  panel.collectionBehavior=WindowCoordinator.panelCollectionBehavior;panel.minSize=NSSize(width:580,height:480)
   panel.delegate=self
   panel.contentView=NSHostingView(rootView:PanelView(store:store,preferences:preferences,scroll:scroll,settings:{[weak self] in self?.showSettings()},dismiss:{[weak self] in self?.hide()}))
+  windowCoordinator=WindowCoordinator(
+   workspace:AppKitWindowWorkspace(
+    panel:panel,
+    secondaryWindow:{ [weak self] kind in
+     switch kind {
+     case .settings:self?.settingsWindow
+     case .about:self?.aboutWindow
+     }
+    },
+    focusComposer:{ [weak self] in self?.focusComposer() }
+   ),
+   onShow:{ [weak self] in self?.store.show() },
+   onHide:{ [weak self] in self?.store.hide() },
+   onNewChat:{ [weak self] in self?.store.newChat() }
+  )
+  store.shouldFocusComposer={ [weak self] in self?.windowCoordinator.canFocusComposerOnActiveSpace() ?? false }
   if !fixture {panel.setFrameAutosaveName("SpeedChat.Panel");if !panel.setFrameUsingName("SpeedChat.Panel") {panel.center()}} else {panel.center()}
-  hotkey.action={ [weak self] in self?.show() }
+  hotkey.action={ [weak self] in self?.toggleFromHotKey() }
   preferences.updateHotkey={ [weak self] binding in try self?.hotkey.register(binding) }
   preferences.reconnect={ [weak self] in self?.applyPreferences();self?.store.connect() }
   preferences.reloadConfig={ [weak self] in
@@ -109,18 +126,9 @@ import ChatCore
   }
   statusItem?.menu=menu
  }
- @objc func showFromMenu() {show()}
- func show() {
-  // Put the all-Spaces panel in front before activating the app. Activating
-  // first can switch to the Space containing another SpeedChat window.
-  store.show();panel.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
-  panel.contentView?.layoutSubtreeIfNeeded()
-  focusComposer()
-  DispatchQueue.main.async { [weak self] in
-   guard let self,self.panel.isVisible,self.panel.isKeyWindow else {return}
-   self.focusComposer()
-  }
- }
+ @objc func showFromMenu() {windowCoordinator.showPanel()}
+ func toggleFromHotKey() {windowCoordinator.togglePanelFromHotKey()}
+ func show() {windowCoordinator.showPanel()}
  private func focusComposer() {
   func find(_ view:NSView)->ComposerTextView? {
    if let composer=view as? ComposerTextView {return composer}
@@ -131,8 +139,8 @@ import ChatCore
    panel.makeFirstResponder(composer)
   }
  }
- func hide() {panel.orderOut(nil);store.hide()}
- @objc func newChat() {show();store.newChat()}
+ func hide() {windowCoordinator.hidePanel()}
+ @objc func newChat() {windowCoordinator.newChatFromMenu()}
  @objc func showSettings() {
   preferences.refreshLogin()
   if settingsWindow == nil {
@@ -140,11 +148,11 @@ import ChatCore
    hosting.layoutSubtreeIfNeeded()
    let size=hosting.fittingSize
    let window=NSWindow(contentRect:NSRect(origin:.zero,size:size),styleMask:[.titled,.closable],backing:.buffered,defer:false)
-   window.title="SpeedChat Settings";window.isReleasedWhenClosed=false;window.contentView=hosting;window.setContentSize(size);window.center();settingsWindow=window
+   window.title="SpeedChat Settings";window.isReleasedWhenClosed=false;window.collectionBehavior=WindowCoordinator.secondaryWindowCollectionBehavior;window.contentView=hosting;window.setContentSize(size);window.center();settingsWindow=window
   } else if let hosting=settingsWindow?.contentView {
    hosting.layoutSubtreeIfNeeded();settingsWindow?.setContentSize(hosting.fittingSize)
   }
-  NSApp.activate(ignoringOtherApps:true);settingsWindow?.makeKeyAndOrderFront(nil)
+  windowCoordinator.showSecondaryWindow(.settings)
  }
  @objc func showAbout() {
   if aboutWindow == nil {
@@ -152,13 +160,14 @@ import ChatCore
    hosting.layoutSubtreeIfNeeded()
    let size=hosting.fittingSize
    let window=NSWindow(contentRect:NSRect(origin:.zero,size:size),styleMask:[.titled,.closable],backing:.buffered,defer:false)
-   window.title="About SpeedChat";window.isReleasedWhenClosed=false;window.isRestorable=false;window.contentView=hosting;window.setContentSize(size);window.center();aboutWindow=window
+   window.title="About SpeedChat";window.isReleasedWhenClosed=false;window.isRestorable=false;window.collectionBehavior=WindowCoordinator.secondaryWindowCollectionBehavior;window.contentView=hosting;window.setContentSize(size);window.center();aboutWindow=window
   }
-  NSApp.activate(ignoringOtherApps:true);aboutWindow?.makeKeyAndOrderFront(nil)
+  windowCoordinator.showSecondaryWindow(.about)
  }
  @objc func quit() {NSApp.terminate(nil)}
  func windowShouldClose(_ sender:NSWindow)->Bool {if sender === panel {hide();return false};return true}
  func applicationShouldTerminate(_ sender:NSApplication)->NSApplication.TerminateReply {
+  windowCoordinator?.stop()
   hotkey.remove();if let keyMonitor {NSEvent.removeMonitor(keyMonitor)}
   store.quit {Task { @MainActor in NSApp.reply(toApplicationShouldTerminate:true) }}
   return .terminateLater

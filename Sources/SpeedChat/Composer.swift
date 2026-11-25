@@ -42,7 +42,10 @@ struct Composer:NSViewRepresentable {
   view.isEditable=enabled;view.send=send
   if context.coordinator.focusToken != focusToken {
    context.coordinator.focusToken=focusToken
-   DispatchQueue.main.async {if enabled {view.window?.makeFirstResponder(view)}}
+   DispatchQueue.main.async {
+    guard enabled,let window=view.window,WindowCoordinator.canFocusComposer(isVisible:window.isVisible,isOnActiveSpace:window.isOnActiveSpace,isKey:window.isKeyWindow) else {return}
+    window.makeFirstResponder(view)
+   }
   }
  }
  @MainActor final class Coordinator:NSObject,NSTextViewDelegate {

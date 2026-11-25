@@ -6,7 +6,7 @@ Use the [glossary](../../GLOSSARY.md) for conversation and provider terms.
 
 | Change | Start here |
 | --- | --- |
-| App launch, panel visibility, shortcuts, menus | [Entry.swift](../../Sources/SpeedChat/Entry.swift) starts AppKit. [AppDelegate.swift](../../Sources/SpeedChat/AppDelegate.swift) owns the panel and wires [HotKey.swift](../../Sources/SpeedChat/HotKey.swift) and `KeyboardPolicy`. |
+| App launch, panel visibility, shortcuts, menus | [Entry.swift](../../Sources/SpeedChat/Entry.swift) starts AppKit. [AppDelegate.swift](../../Sources/SpeedChat/AppDelegate.swift) owns the panel and wires [WindowCoordinator.swift](../../Sources/SpeedChat/WindowCoordinator.swift), [HotKey.swift](../../Sources/SpeedChat/HotKey.swift), and `KeyboardPolicy`. |
 | Composer, transcript, model picker, error details | [PanelView.swift](../../Sources/SpeedChat/PanelView.swift) and [Composer.swift](../../Sources/SpeedChat/Composer.swift). [ChatStore.swift](../../Sources/SpeedChat/ChatStore.swift) holds the draft and drives [ChatSession](../../Sources/ChatCore/Session.swift), the UI state machine. |
 | Model availability and settings | [Settings.swift](../../Sources/SpeedChat/Settings.swift) saves preferences and triggers reconnect or config reload. [Runtime.swift](../../Sources/ChatCore/Runtime.swift) resolves the Codex executable. [ChatClient.swift](../../Sources/ChatCore/ChatClient.swift) builds the model catalog. |
 | Conversation resume, provider switches, and saved history | `ChatClient.connect`, `newChat`, and `send` in [ChatClient.swift](../../Sources/ChatCore/ChatClient.swift). [StateStore.swift](../../Sources/ChatCore/StateStore.swift) handles local persistence and reads Codex turn history. |

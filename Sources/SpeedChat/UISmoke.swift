@@ -65,9 +65,10 @@ extension AppDelegate {
     return cursor == NSCursor.pointingHand && link?.absoluteString == "https://example.com"
    }
    check("Links configure pointing-hand cursor and validated URL",linkCursorConfigured)
+   check("App stays in Accessory activation policy",NSApp.activationPolicy() == .accessory)
    check("Panel is visible, normal-level and resizable",panel.isVisible && panel.level == .normal && !panel.isFloatingPanel && panel.styleMask.contains(.resizable))
    check("Panel stays visible when app deactivates",!panel.hidesOnDeactivate)
-   check("Panel joins Spaces and fullscreen",panel.collectionBehavior.contains(.canJoinAllSpaces) && panel.collectionBehavior.contains(.fullScreenAuxiliary))
+   check("Panel uses single-Space, Mission Control, and fullscreen auxiliary behavior",panel.collectionBehavior.contains(.moveToActiveSpace) && panel.collectionBehavior.contains(.managed) && panel.collectionBehavior.contains(.fullScreenAuxiliary) && !panel.collectionBehavior.contains(.canJoinAllSpaces))
    func findComposer(_ view:NSView)->ComposerTextView? {if let text=view as? ComposerTextView {return text};for child in view.subviews {if let found=findComposer(child) {return found}};return nil}
    if let view=panel.contentView.flatMap(findComposer) {
     check("Native composer can receive focus",panel.makeFirstResponder(view))
@@ -85,6 +86,7 @@ extension AppDelegate {
    check("Unsafe URL is never opened",!NativeActions.open(URL(fileURLWithPath:"/tmp/blocked")))
    showSettings()
    check("Panel stays visible when another window receives focus",panel.isVisible && settingsWindow?.isKeyWindow == true)
+   check("Settings window uses single-Space move-to-active-Space behavior",settingsWindow?.collectionBehavior.contains(.moveToActiveSpace) == true && settingsWindow?.collectionBehavior.contains(.canJoinAllSpaces) == false)
    func hasScrollView(_ view:NSView)->Bool {if view is NSScrollView {return true};return view.subviews.contains(where:hasScrollView)}
    if let settingsContent=settingsWindow?.contentView {
     settingsContent.layoutSubtreeIfNeeded()
@@ -92,8 +94,12 @@ extension AppDelegate {
     let hasPasteMenu=NSApp.mainMenu?.items.compactMap{$0.submenu}.flatMap{$0.items}.contains{$0.keyEquivalent == "v" && $0.action == #selector(NSText.paste(_:))} ?? false
     check("Edit menu enables Command-V paste in Settings fields",hasPasteMenu)
    } else {check("Settings window has no scroll bar and fits content",false)}
+   toggleFromHotKey()
+   let raisedComposer=panel.contentView.flatMap(composerIn)
+   check("Smart-toggle raises and focuses unfocused panel on current Space",panel.isVisible && panel.isKeyWindow && raisedComposer != nil && panel.firstResponder === raisedComposer)
    settingsWindow?.orderOut(nil)
    showAbout()
+   check("About window uses single-Space move-to-active-Space behavior",aboutWindow?.collectionBehavior.contains(.moveToActiveSpace) == true && aboutWindow?.collectionBehavior.contains(.canJoinAllSpaces) == false)
    let about=AboutInfo.current()
    let bundleVersion=(Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String) ?? ""
    let bundleBuild=(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String) ?? ""
@@ -104,6 +110,15 @@ extension AppDelegate {
    check("About window shows the bundled version, local build time, and copyright",aboutWindow?.isVisible == true && aboutWindow?.isKeyWindow == true && aboutWindow?.title == "About SpeedChat" && !bundleVersion.isEmpty && about.versionLine.contains(bundleVersion) && about.versionLine.contains("(\(bundleBuild))") && built != nil && about.buildDateLine.hasPrefix("Built ") && !zone.isEmpty && about.buildDateLine.contains(zone) && !copyright.isEmpty && about.copyright == copyright)
    aboutWindow?.orderOut(nil)
    show()
+   try await Task.sleep(for:.milliseconds(100))
+   showFromMenu()
+   let keptOpenFromMenu=panel.isVisible && panel.isKeyWindow
+   toggleFromHotKey()
+   let hiddenBySmartToggle = !panel.isVisible
+   toggleFromHotKey()
+   let reopenedComposer=panel.contentView.flatMap(composerIn)
+   let reopenedBySmartToggle=panel.isVisible && panel.isKeyWindow && reopenedComposer != nil && panel.firstResponder === reopenedComposer
+   check("Menu bar Show keeps focused panel open and smart-toggle hides then reopens with composer focus",keptOpenFromMenu && hiddenBySmartToggle && reopenedBySmartToggle)
    let warm=store.warmReopens;store.bridge=BridgeProcess();hide();show();check("Reopen reuses bridge",store.warmReopens == warm+1);store.stop()
    store.session.receive(ready);store.focusToken += 1
    Task { @MainActor in
@@ -251,7 +266,7 @@ extension AppDelegate {
      if let content=window.contentView,let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) {content.cacheDisplay(in:content.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/error-details.png"))}
     }
     let failures=checks.filter{($0["passed"] as? Bool) != true}.count
-    let report:[String:Any]=["checks":checks,"passed":checks.count-failures,"failed":failures,"note":"Fixture UI harness. Does not verify physical hotkey, all Spaces, login-item changes, or live response rendering." ]
+    let report:[String:Any]=["checks":checks,"passed":checks.count-failures,"failed":failures,"note":"Fixture UI harness. Does not verify physical hotkey, Space switches, login-item changes, or live response rendering." ]
     if let data=try? JSONSerialization.data(withJSONObject:report,options:[.prettyPrinted,.sortedKeys]) {try? data.write(to:URL(fileURLWithPath:path+"/report.json"))}
     self.hotkey.remove();exit(failures == 0 ? 0 : 1)
    }
