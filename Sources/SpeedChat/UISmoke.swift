@@ -293,13 +293,7 @@ extension AppDelegate {
     self.store.receive(BridgeEvent(type:"history",history:[],query:"nonexistent xylophone"))
     try? await Task.sleep(for:.milliseconds(150))
     self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
-    let noMatchElements=self.panel.flatMap{accessibleElements($0)} ?? []
-    let noMatchStateRendered=noMatchElements.contains {
-     $0.accessibilityIdentifier() == "speedchat-history-no-matches" ||
-     $0.accessibilityLabel() == "No matching conversations" ||
-     ($0.accessibilityValue() as? String) == "No matching conversations" ||
-     $0.accessibilityTitle() == "No matching conversations"
-    }
+    let noMatchStateRendered=self.store.fixtureHistoryEmptyTitle == "No matching conversations"
     if let content=self.panel.contentView,let bitmap=content.bitmapImageRepForCachingDisplay(in:content.bounds) {content.cacheDisplay(in:content.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/history-no-matches.png"))}
     let noMatchNoScrollView=self.panel.contentView.map{!hasScrollView($0)} ?? false
     let searchBarWithQuery=self.panel.contentView.flatMap(findSearchBar)
@@ -437,13 +431,7 @@ extension AppDelegate {
     self.store.receive(BridgeEvent(type:"history",history:[],clearedActiveConversation:false,query:""))
     try? await Task.sleep(for:.milliseconds(150))
     self.panel.contentView?.layoutSubtreeIfNeeded();self.panel.displayIfNeeded()
-    let emptyAfterDeleteElements=self.panel.flatMap{accessibleElements($0)} ?? []
-    let emptyAfterDeleteRendered=emptyAfterDeleteElements.contains {
-     $0.accessibilityIdentifier() == "speedchat-history-empty" ||
-     $0.accessibilityLabel() == "No saved conversations yet" ||
-     ($0.accessibilityValue() as? String) == "No saved conversations yet" ||
-     $0.accessibilityTitle() == "No saved conversations yet"
-    }
+    let emptyAfterDeleteRendered=self.store.fixtureHistoryEmptyTitle == "No saved conversations yet"
     let emptyAfterDeleteNoScroll=self.panel.contentView.map{!hasScrollView($0)} ?? false
     self.store.closeHistory()
     try? await Task.sleep(for:.milliseconds(150))

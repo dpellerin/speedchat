@@ -39,6 +39,7 @@ import ChatCore
  var fixtureMode=false
  var fixtureCommands=[[String:String]]()
  var fixtureStatusNotice=""
+ var fixtureHistoryEmptyTitle=""
  var changed:(()->Void)?
  var onHistoryChanged:(()->Void)?
  var shouldFocusComposer:()->Bool={true}

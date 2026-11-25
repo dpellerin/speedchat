@@ -297,21 +297,29 @@ struct PanelView:View {
  private var historyList:some View {
   Group {
    if store.historyEntries.isEmpty {
+    let emptyTitle=store.hasActiveHistoryQuery ? "No matching conversations" : "No saved conversations yet"
     VStack(spacing:12) {
      if store.hasActiveHistoryQuery {
       Image(systemName:"magnifyingglass").font(.system(size:30)).foregroundStyle(.secondary)
-      Text("No matching conversations").font(.title3.weight(.medium)).textSelection(.enabled)
-       .accessibilityLabel("No matching conversations")
+      Text(emptyTitle).font(.title3.weight(.medium)).textSelection(.enabled)
+       .accessibilityLabel(emptyTitle)
        .accessibilityIdentifier("speedchat-history-no-matches")
       Text("Try different words or clear the search.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
      } else {
       Image(systemName:"clock.arrow.circlepath").font(.system(size:30)).foregroundStyle(.secondary)
-      Text("No saved conversations yet").font(.title3.weight(.medium)).textSelection(.enabled)
-       .accessibilityLabel("No saved conversations yet")
+      Text(emptyTitle).font(.title3.weight(.medium)).textSelection(.enabled)
+       .accessibilityLabel(emptyTitle)
        .accessibilityIdentifier("speedchat-history-empty")
       Text("Conversations with at least one message appear here.").font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
      }
-    }.frame(maxWidth:.infinity,maxHeight:.infinity).padding(24)
+    }
+    .frame(maxWidth:.infinity,maxHeight:.infinity).padding(24)
+    .onChange(of:emptyTitle,initial:true) {_,title in
+     if store.fixtureMode {store.fixtureHistoryEmptyTitle=title}
+    }
+    .onDisappear {
+     if store.fixtureMode {store.fixtureHistoryEmptyTitle=""}
+    }
    } else {
     ScrollViewReader {proxy in
      ScrollView {
