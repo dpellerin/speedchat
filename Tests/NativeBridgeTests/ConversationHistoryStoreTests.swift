@@ -77,10 +77,12 @@ import Testing
     }
     defer { timeout.cancel() }
 
+    let fixtureNow = try #require(StateStore.parseTimestamp("2026-04-03T10:00:00Z"))
     bridge.start(codexOverride: codex.path, options: ChatClientOptions(
         openRouterConfigURL: root.appendingPathComponent("openrouter.json"),
         stateURL: stateURL,
-        env: [:]
+        env: [:],
+        now: { fixtureNow }
     )) { sink.yield($0) }
 
     var iter = events.makeAsyncIterator()
@@ -163,10 +165,12 @@ import Testing
     }
     defer { timeout.cancel() }
 
+    let fixtureNow = try #require(StateStore.parseTimestamp("2026-04-03T10:00:00Z"))
     bridge.start(codexOverride: failingCodex.path, options: ChatClientOptions(
         openRouterConfigURL: root.appendingPathComponent("openrouter.json"),
         stateURL: stateURL,
-        env: [:]
+        env: [:],
+        now: { fixtureNow }
     )) { sink.yield($0) }
 
     var iter = events.makeAsyncIterator()

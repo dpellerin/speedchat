@@ -287,6 +287,71 @@ final class BridgeProcess: ChatBackend, @unchecked Sendable {
                 }
                 return
             }
+            if type == "applyRetention" {
+                let policy = command["retention"].flatMap(HistoryRetention.init(rawValue:)) ?? .defaultPolicy
+                do {
+                    let result = try chatClient.applyHistoryRetention(policy)
+                    if result.clearedActiveConversation, let ready = result.readyState {
+                        let offlineReason = ready.offlineReason
+                        onEvent?(BridgeEvent(
+                            type: offlineReason == nil ? "ready" : "offlineConversation",
+                            conversationId: ready.conversationId,
+                            messages: ready.messages,
+                            models: offlineReason == nil ? ready.models : [],
+                            model: ready.model,
+                            notice: offlineReason.map { "Offline · \($0)" } ?? "New chat",
+                            stateSaveError: ready.stateSaveError,
+                            codexRetry: ready.codexRetry,
+                            clearedActiveConversation: true
+                        ))
+                    }
+                    onEvent?(BridgeEvent(
+                        type: "history",
+                        history: chatClient.listHistory(),
+                        clearedActiveConversation: result.clearedActiveConversation
+                    ))
+                } catch {
+                    onEvent?(BridgeEvent(
+                        type: "error",
+                        message: StateStore.friendlyError(error),
+                        busy: chatClient.busy,
+                        codexRetry: chatClient.codexRetry
+                    ))
+                }
+                return
+            }
+            if type == "clearHistory" {
+                do {
+                    let result = try chatClient.clearHistory()
+                    if result.clearedActiveConversation, let ready = result.readyState {
+                        let offlineReason = ready.offlineReason
+                        onEvent?(BridgeEvent(
+                            type: offlineReason == nil ? "ready" : "offlineConversation",
+                            conversationId: ready.conversationId,
+                            messages: ready.messages,
+                            models: offlineReason == nil ? ready.models : [],
+                            model: ready.model,
+                            notice: offlineReason.map { "Offline · \($0)" } ?? "New chat",
+                            stateSaveError: ready.stateSaveError,
+                            codexRetry: ready.codexRetry,
+                            clearedActiveConversation: true
+                        ))
+                    }
+                    onEvent?(BridgeEvent(
+                        type: "history",
+                        history: [],
+                        clearedActiveConversation: result.clearedActiveConversation
+                    ))
+                } catch {
+                    onEvent?(BridgeEvent(
+                        type: "error",
+                        message: StateStore.friendlyError(error),
+                        busy: chatClient.busy,
+                        codexRetry: chatClient.codexRetry
+                    ))
+                }
+                return
+            }
             if type == "interrupt" {
                 if let executionID = requestedExecutionID ?? activeExecutionID {
                     chatClient.requestStop(executionID: executionID)

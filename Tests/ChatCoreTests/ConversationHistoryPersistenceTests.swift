@@ -139,7 +139,8 @@ private func completeCodexTurn(
         let legacyData = try JSONSerialization.data(withJSONObject: legacyPayload, options: [.prettyPrinted, .sortedKeys])
         try legacyData.write(to: stateURL)
 
-        let options = ChatClientOptions(openRouterConfigURL: configURL, stateURL: stateURL, env: [:])
+        let fixtureNow = try #require(StateStore.parseTimestamp("2026-04-03T10:00:00Z"))
+        let options = ChatClientOptions(openRouterConfigURL: configURL, stateURL: stateURL, env: [:], now: { fixtureNow })
         let rpc = FakeCodexTransport()
         rpc.resumeResult = .failure(NSError(domain: "SpeedChat.Codex", code: -2))
         let client = ChatClient(rpc: rpc, options: options)
@@ -195,7 +196,8 @@ private func completeCodexTurn(
         ]
         try JSONSerialization.data(withJSONObject: emptyLegacy).write(to: stateURL)
 
-        let options = ChatClientOptions(openRouterConfigURL: configURL, stateURL: stateURL, env: [:])
+        let fixtureNow = try #require(StateStore.parseTimestamp("2026-04-03T10:00:00Z"))
+        let options = ChatClientOptions(openRouterConfigURL: configURL, stateURL: stateURL, env: [:], now: { fixtureNow })
         let rpc = FakeCodexTransport()
         let client = ChatClient(rpc: rpc, options: options)
         let ready = try await client.connect()

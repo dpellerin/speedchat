@@ -53,11 +53,15 @@ import ChatCore
   preferences.reloadConfig={ [weak self] in
    guard let self else {return}
    self.store.reloadConfig()
-   if let hosting=self.settingsWindow?.contentView {
-    hosting.layoutSubtreeIfNeeded()
-    self.settingsWindow?.setContentSize(hosting.fittingSize)
-   }
+   self.resizeSettingsWindow()
   }
+  preferences.countSavedHistory={ [weak self] in self?.store.countSavedHistory() ?? 0 }
+  preferences.countExpiredHistory={ [weak self] policy in self?.store.countExpiredHistory(for:policy) ?? 0 }
+  preferences.isChatBusy={ [weak self] in self?.store.session.busy ?? false }
+  preferences.applyHistoryRetention={ [weak self] policy in self?.store.applyHistoryRetention(policy) }
+  preferences.clearAllHistory={ [weak self] in self?.store.clearAllHistory() }
+  preferences.onLayoutChanged={ [weak self] in self?.resizeSettingsWindow() }
+  store.onHistoryChanged={ [weak self] in self?.preferences.refreshHistoryCount() }
   createMainMenu()
   if !fixture {do {try hotkey.register(preferences.hotkey)} catch {preferences.error=error.localizedDescription};createMenu()}
   keyMonitor=NSEvent.addLocalMonitorForEvents(matching:.keyDown) { [weak self] event in
@@ -84,7 +88,17 @@ import ChatCore
   show()
   if fixture {Task { @MainActor in try? await Task.sleep(for:.milliseconds(700));await self.runUISmoke() }}
  }
- func applyPreferences() {store.codexOverride=preferences.codexPath;store.developerMetrics=preferences.metrics}
+ func applyPreferences() {
+  store.codexOverride=preferences.codexPath
+  store.developerMetrics=preferences.metrics
+  store.historyRetention=preferences.historyRetention
+ }
+ func resizeSettingsWindow() {
+  if let hosting=settingsWindow?.contentView {
+   hosting.layoutSubtreeIfNeeded()
+   settingsWindow?.setContentSize(hosting.fittingSize)
+  }
+ }
  func createMainMenu() {
   let mainMenu=NSMenu()
   let appItem=NSMenuItem();mainMenu.addItem(appItem)
@@ -156,6 +170,7 @@ import ChatCore
  @objc func showHistory() {windowCoordinator.showHistoryFromMenu()}
  @objc func showSettings() {
   preferences.refreshLogin()
+  preferences.refreshHistoryCount()
   if settingsWindow == nil {
    let hosting=NSHostingView(rootView:SettingsView(preferences:preferences))
    hosting.layoutSubtreeIfNeeded()

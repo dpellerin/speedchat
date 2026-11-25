@@ -46,19 +46,22 @@ public struct ChatClientOptions: Sendable {
     public var stateURL: URL?
     public var env: [String: String]
     public var now: @Sendable () -> Date
+    public var historyRetention: HistoryRetention
 
     public init(
         openRouterFetch: OpenRouterFetch? = nil,
         openRouterConfigURL: URL? = nil,
         stateURL: URL? = nil,
         env: [String: String] = ProcessInfo.processInfo.environment,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        historyRetention: HistoryRetention = .defaultPolicy
     ) {
         self.openRouterFetch = openRouterFetch
         self.openRouterConfigURL = openRouterConfigURL
         self.stateURL = stateURL
         self.env = env
         self.now = now
+        self.historyRetention = historyRetention
     }
 }
 
@@ -123,6 +126,7 @@ public final class ChatClient: @unchecked Sendable {
     private let rpc: CodexTransport
     private let options: ChatClientOptions
     private let lock = NSRecursiveLock()
+    private var retention: HistoryRetention
 
     private func sync<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock()
@@ -199,6 +203,120 @@ public final class ChatClient: @unchecked Sendable {
 
     public func listHistory() -> [HistoryEntry] {
         ConversationHistory.entries(from: savedConversations())
+    }
+
+    public func countSavedConversations() -> Int {
+        sync { StateStore.countSavedConversations(stateURL: options.stateURL, env: options.env) }
+    }
+
+    public func countExpiredConversations(for policy: HistoryRetention) -> Int {
+        sync {
+            StateStore.countExpiredConversations(
+                retention: policy,
+                now: options.now(),
+                stateURL: options.stateURL,
+                env: options.env
+            )
+        }
+    }
+
+    private func resetToBlankConversationLocked(now: Date) -> ReadyState {
+        checkedCodexSendId = nil
+        undispatchedCodexMessage = nil
+        uncheckedCodexReply = nil
+        citationSources.removeAll()
+        citationOrder.removeAll()
+        citationStream.reset()
+        linkStream.reset()
+
+        let target = options.stateURL ?? StateStore.stateURL(env: options.env)
+        let offlineReason = models.isEmpty ? (lastOfflineReason ?? "Codex is offline.") : nil
+        var saveError: String?
+        if offlineReason == nil {
+            let thread = ConversationContinuity.Thread.standalone("openrouter-\(UUID().uuidString.lowercased())")
+            conversation = ConversationContinuity(thread: thread, titleNeeded: codexAvailable)
+            do {
+                try conversation.save(model: model, to: target, env: options.env, now: now, touchActivity: false)
+            } catch {
+                saveError = "SpeedChat couldn’t update the active conversation on disk."
+            }
+        } else {
+            conversation = ConversationContinuity(thread: nil, titleNeeded: false)
+            do {
+                try StateStore.saveBlankActiveState(
+                    threadId: "",
+                    model: model,
+                    updatedAt: StateStore.formatTimestamp(now),
+                    needsLegacyHistory: false,
+                    to: target
+                )
+            } catch {
+                saveError = "SpeedChat couldn’t update the active conversation on disk."
+            }
+        }
+        return readyStateLocked(resumed: false, offlineReason: offlineReason, stateSaveError: saveError)
+    }
+
+    public func applyHistoryRetention(_ policy: HistoryRetention) throws -> HistoryMutationResult {
+        try sync {
+            try requireOpen()
+            let now = options.now()
+            let target = options.stateURL ?? StateStore.stateURL(env: options.env)
+            if activeExecution != nil || mutationPending {
+                let expired = StateStore.countExpiredConversations(retention: policy, now: now, stateURL: target, env: options.env)
+                if expired > 0 {
+                    throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [
+                        NSLocalizedDescriptionKey: "Wait for the current response or change to finish.",
+                    ])
+                }
+                retention = policy
+                return HistoryMutationResult(removedCount: 0, clearedActiveConversation: false, readyState: nil)
+            }
+            retention = policy
+            let pruned = try StateStore.pruneExpiredConversations(retention: policy, now: now, stateURL: target, env: options.env)
+            let activeRemoved = conversation.conversationId.map { pruned.removedIds.contains($0) } ?? false
+            if activeRemoved {
+                let ready = resetToBlankConversationLocked(now: now)
+                return HistoryMutationResult(
+                    removedCount: pruned.removedIds.count,
+                    clearedActiveConversation: true,
+                    readyState: ready
+                )
+            }
+            return HistoryMutationResult(
+                removedCount: pruned.removedIds.count,
+                clearedActiveConversation: false,
+                readyState: nil
+            )
+        }
+    }
+
+    public func clearHistory() throws -> HistoryMutationResult {
+        try sync {
+            try requireOpen()
+            if activeExecution != nil || mutationPending {
+                throw NSError(domain: "SpeedChat.Client", code: 4, userInfo: [
+                    NSLocalizedDescriptionKey: "Wait for the current response or change to finish.",
+                ])
+            }
+            let now = options.now()
+            let target = options.stateURL ?? StateStore.stateURL(env: options.env)
+            let cleared = try StateStore.clearAllConversations(now: now, stateURL: target, env: options.env)
+            let activeRemoved = conversation.conversationId != nil || !conversation.messages.isEmpty
+            if activeRemoved {
+                let ready = resetToBlankConversationLocked(now: now)
+                return HistoryMutationResult(
+                    removedCount: cleared.removedIds.count,
+                    clearedActiveConversation: true,
+                    readyState: ready
+                )
+            }
+            return HistoryMutationResult(
+                removedCount: cleared.removedIds.count,
+                clearedActiveConversation: false,
+                readyState: nil
+            )
+        }
     }
 
     public func openConversation(id: String) throws -> ReadyState {
@@ -289,6 +407,7 @@ public final class ChatClient: @unchecked Sendable {
     public init(rpc: CodexTransport = JsonRpcProcess(), options: ChatClientOptions = ChatClientOptions()) {
         self.rpc = rpc
         self.options = options
+        self.retention = options.historyRetention
         self.rpc.onNotification = { [weak self] notification in
             self?.handleNotification(notification)
         }
@@ -468,6 +587,13 @@ public final class ChatClient: @unchecked Sendable {
         let (currentModels, state) = try sync {
             try requireOpen()
             rebuildModelCatalog()
+            let target = options.stateURL ?? StateStore.stateURL(env: options.env)
+            _ = try? StateStore.pruneExpiredConversations(
+                retention: retention,
+                now: options.now(),
+                stateURL: target,
+                env: options.env
+            )
             return (models, StateStore.load(from: options.stateURL, env: options.env))
         }
         if currentModels.isEmpty {

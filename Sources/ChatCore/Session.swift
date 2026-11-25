@@ -34,6 +34,7 @@ public struct BridgeEvent: Codable, Sendable {
     public var codexRetry: CodexRetry?
     public var executionID: UUID?
     public var history: [HistoryEntry]?
+    public var clearedActiveConversation: Bool?
     public init(
         type: String,
         conversationId: String? = nil,
@@ -51,7 +52,8 @@ public struct BridgeEvent: Codable, Sendable {
         stateSaveError: String? = nil,
         codexRetry: CodexRetry? = nil,
         executionID: UUID? = nil,
-        history: [HistoryEntry]? = nil
+        history: [HistoryEntry]? = nil,
+        clearedActiveConversation: Bool? = nil
     ) {
         self.type = type
         self.conversationId = conversationId
@@ -70,6 +72,7 @@ public struct BridgeEvent: Codable, Sendable {
         self.codexRetry = codexRetry
         self.executionID = executionID
         self.history = history
+        self.clearedActiveConversation = clearedActiveConversation
     }
 }
 public struct ChatSession: Sendable {

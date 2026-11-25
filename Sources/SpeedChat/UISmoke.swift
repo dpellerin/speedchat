@@ -88,6 +88,10 @@ extension AppDelegate {
    check("Panel stays visible when another window receives focus",panel.isVisible && settingsWindow?.isKeyWindow == true)
    check("Settings window uses single-Space move-to-active-Space behavior",settingsWindow?.collectionBehavior.contains(.moveToActiveSpace) == true && settingsWindow?.collectionBehavior.contains(.canJoinAllSpaces) == false)
    func hasScrollView(_ view:NSView)->Bool {if view is NSScrollView {return true};return view.subviews.contains(where:hasScrollView)}
+   func accessibleElements(_ element:Any,depth:Int=0)->[any NSAccessibilityProtocol] {
+    guard depth < 30,let node=element as? any NSAccessibilityProtocol else {return []}
+    return [node]+(node.accessibilityChildren() ?? []).flatMap{accessibleElements($0,depth:depth+1)}
+   }
    if let settingsContent=settingsWindow?.contentView {
     settingsContent.layoutSubtreeIfNeeded()
     check("Settings window has no scroll bar and fits content",!hasScrollView(settingsContent) && abs(settingsContent.bounds.height - settingsContent.fittingSize.height) <= 2)
@@ -157,10 +161,6 @@ extension AppDelegate {
       $0.storage.string == "New chat response is visible." && !$0.visibleRect.isEmpty
      })
      if let view=self.panel.contentView,let bitmap=view.bitmapImageRepForCachingDisplay(in:view.bounds) {view.cacheDisplay(in:view.bounds,to:bitmap);try? bitmap.representation(using:.png,properties:[:])?.write(to:URL(fileURLWithPath:path+"/new-chat-\(reset).png"))}
-    }
-    func accessibleElements(_ element:Any,depth:Int=0)->[any NSAccessibilityProtocol] {
-     guard depth < 30,let node=element as? any NSAccessibilityProtocol else {return []}
-     return [node]+(node.accessibilityChildren() ?? []).flatMap{accessibleElements($0,depth:depth+1)}
     }
     let pending=ChatMessage(id:"delivery-prompt",role:"user",text:"When does the orchard open?")
     self.store.session.receive(BridgeEvent(type:"ready",messages:[pending],models:ready.models,model:"gpt-6-luna",
@@ -290,6 +290,31 @@ extension AppDelegate {
     let blockedWhileStreaming = !self.store.showingHistory && self.store.session.streaming
     self.store.receive(BridgeEvent(type:"done",conversationId:historyB.id,executionID:self.store.session.executionID))
     check("History is blocked while an active turn is streaming",blockedWhileStreaming && self.store.session.canOpenHistory)
+
+    // Settings History retention & Clear All History wiring in fixture mode (restoring UserDefaults afterward).
+    let savedRetentionRaw=self.preferences.defaults.object(forKey:"historyRetention")
+    let savedRetentionPolicy=self.preferences.historyRetention
+    let fifteenDaysAgo=HistoryEntry(id:"conv-15d",title:"Fifteen days ago",updatedAt:iso.string(from:smokeNow.addingTimeInterval(-15*86_400)),preview:"Older reply.",model:"gpt-6-luna",messageCount:2)
+    self.store.receive(BridgeEvent(type:"history",history:[historyA,fifteenDaysAgo]))
+    self.preferences.historyRetention = .days30
+    self.preferences.refreshHistoryCount()
+    let countRefreshed=self.preferences.savedHistoryCount == 2
+    self.preferences.requestHistoryRetention(.days7)
+    let promptedShrink=self.preferences.pendingHistoryConfirmation == .shortenRetention(target:.days7,previous:.days30,affectedCount:1)
+    self.preferences.cancelHistoryConfirmation()
+    let cancelledReverted=self.preferences.pendingHistoryConfirmation == nil && self.preferences.historyRetention == .days30
+    self.preferences.requestHistoryRetention(.days7)
+    self.preferences.confirmHistoryConfirmation()
+    let confirmedPrune=self.store.fixtureCommands.last == ["type":"applyRetention","retention":"7d"]
+    self.preferences.requestClearAllHistory()
+    let promptedClearAll=self.preferences.pendingHistoryConfirmation == .clearAll(affectedCount:2)
+    self.preferences.confirmHistoryConfirmation()
+    let confirmedClearAll=self.store.fixtureCommands.last == ["type":"clearHistory"]
+    self.preferences.historyRetention=savedRetentionPolicy
+    if let savedRetentionRaw {self.preferences.defaults.set(savedRetentionRaw,forKey:"historyRetention")}
+    else {self.preferences.defaults.removeObject(forKey:"historyRetention")}
+    check("Settings History retention confirms shrink, reverts on cancel, and dispatches prune and Clear All",
+          countRefreshed && promptedShrink && cancelledReverted && confirmedPrune && promptedClearAll && confirmedClearAll)
 
     if CommandLine.arguments.contains("--new-chat-smoke") {
      let failures=checks.filter{($0["passed"] as? Bool) != true}.count

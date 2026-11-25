@@ -231,6 +231,115 @@ public enum StateStore {
         }
     }
 
+    public static func countSavedConversations(
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        loadConversations(stateURL: url, env: env).count
+    }
+
+    public static func countExpiredConversations(
+        retention: HistoryRetention,
+        now: Date = Date(),
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Int {
+        guard retention.days != nil else { return 0 }
+        return loadConversations(stateURL: url, env: env).filter {
+            retention.isExpired(updatedAt: $0.updatedAt, relativeTo: now)
+        }.count
+    }
+
+    private static func readActiveStateRecord(from target: URL) -> ActiveStateRecord? {
+        guard let data = try? Data(contentsOf: target),
+              let record = try? JSONDecoder().decode(ActiveStateRecord.self, from: data),
+              record.version == PersistedState.currentVersion else {
+            return nil
+        }
+        return record
+    }
+
+    private static func removeFileIfExists(at url: URL) throws {
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            return
+        }
+    }
+
+    @discardableResult
+    public static func pruneExpiredConversations(
+        retention: HistoryRetention,
+        now: Date = Date(),
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (removedIds: Set<String>, removedActive: Bool) {
+        guard retention.days != nil else { return ([], false) }
+        let target = url ?? stateURL(env: env)
+        _ = migrateLegacyIfNeeded(target: target)
+        let activeRecord = readActiveStateRecord(from: target)
+        let conversations = loadConversations(stateURL: target, env: [:])
+        var removedIds = Set<String>()
+        for conversation in conversations where retention.isExpired(updatedAt: conversation.updatedAt, relativeTo: now) {
+            if let fileURL = conversationURL(id: conversation.id, stateURL: target) {
+                try removeFileIfExists(at: fileURL)
+                removedIds.insert(conversation.id)
+            }
+        }
+        let removedActive = activeRecord?.activeConversationId.map { removedIds.contains($0) } ?? false
+        if removedActive, let activeRecord {
+            try saveBlankActiveState(
+                threadId: "",
+                model: activeRecord.model,
+                updatedAt: formatTimestamp(now),
+                needsLegacyHistory: false,
+                to: target
+            )
+        }
+        return (removedIds, removedActive)
+    }
+
+    @discardableResult
+    public static func clearAllConversations(
+        now: Date = Date(),
+        stateURL url: URL? = nil,
+        env: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (removedIds: Set<String>, removedActive: Bool) {
+        let target = url ?? stateURL(env: env)
+        _ = migrateLegacyIfNeeded(target: target)
+        let activeRecord = readActiveStateRecord(from: target)
+        let conversations = loadConversations(stateURL: target, env: [:])
+        var removedIds = Set<String>()
+        for conversation in conversations {
+            if let fileURL = conversationURL(id: conversation.id, stateURL: target) {
+                try removeFileIfExists(at: fileURL)
+                removedIds.insert(conversation.id)
+            }
+        }
+        // Also remove any stray/corrupt .json files in conversations/ so Clear All leaves the directory clean.
+        let dir = conversationsDirectory(stateURL: target)
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            for entry in entries where entry.pathExtension == "json" {
+                try removeFileIfExists(at: entry)
+            }
+        }
+        let removedActive = activeRecord?.activeConversationId != nil
+        if removedActive, let activeRecord {
+            try saveBlankActiveState(
+                threadId: "",
+                model: activeRecord.model,
+                updatedAt: formatTimestamp(now),
+                needsLegacyHistory: false,
+                to: target
+            )
+        }
+        return (removedIds, removedActive)
+    }
+
     @discardableResult
     private static func migrateLegacyIfNeeded(target: URL) -> PersistedState? {
         guard let data = try? Data(contentsOf: target),

@@ -27,10 +27,15 @@ import ChatCore
  var idleTimer:Timer?
  var startedAt=Date()
  var codexOverride=""
+ var historyRetention:HistoryRetention = .defaultPolicy
+ var stateURL:URL?
+ var environment:[String:String]=ProcessInfo.processInfo.environment
+ var now:@Sendable ()->Date=Date.init
  var fixtureMode=false
  var fixtureCommands=[[String:String]]()
  var fixtureStatusNotice=""
  var changed:(()->Void)?
+ var onHistoryChanged:(()->Void)?
  var shouldFocusComposer:()->Bool={true}
  init(makeBridge:@escaping ()->any ChatBackend={BridgeProcess()}) {self.makeBridge=makeBridge}
  func show() {
@@ -71,7 +76,13 @@ import ChatCore
     self.receive(event)
    }
   }
-  backend.start(codexOverride:codexOverride,options:ChatClientOptions()) {event in
+  let options=ChatClientOptions(
+   stateURL:stateURL,
+   env:environment,
+   now:now,
+   historyRetention:historyRetention
+  )
+  backend.start(codexOverride:codexOverride,options:options) {event in
    continuation.yield(event)
   }
  }
@@ -79,17 +90,30 @@ import ChatCore
   if event.type == "history" {
    historyEntries=event.history ?? []
    selectedHistoryIndex=historyEntries.isEmpty ? 0 : min(max(selectedHistoryIndex,0),historyEntries.count-1)
+   if historyEntries.isEmpty && event.clearedActiveConversation == true {
+    draftsByConversation.removeAll()
+   }
    changed?()
+   onHistoryChanged?()
    return
   }
-  if event.type == "ready" {
-   if session.phase == .connecting {readyMs=Date().timeIntervalSince(startedAt)*1000}
-   if shouldFocusComposer() && !showingHistory {focusToken += 1}
-  } else if event.type == "offlineConversation" {
+  if event.type == "ready" || event.type == "offlineConversation" {
+   if event.clearedActiveConversation == true {
+    if let oldId=session.conversationId {draftsByConversation.removeValue(forKey:oldId)}
+    draft="";blankDraft="";followBottom=true
+   }
+   if event.type == "ready" {
+    if session.phase == .connecting {readyMs=Date().timeIntervalSince(startedAt)*1000}
+   }
    if shouldFocusComposer() && !showingHistory {focusToken += 1}
   }
   session.receive(event);changed?()
-  if event.type == "done",shouldFocusComposer() && !showingHistory {focusToken += 1}
+  if event.type == "done" {
+   onHistoryChanged?()
+   if shouldFocusComposer() && !showingHistory {focusToken += 1}
+  } else if event.type == "ready" || event.type == "offlineConversation" || event.type == "conversationUpdated" {
+   onHistoryChanged?()
+  }
  }
  func stop(completion:(()->Void)?=nil) {
   generation += 1;eventContinuation?.finish();eventContinuation=nil;eventTask?.cancel();eventTask=nil;idleTimer?.invalidate();idleTimer=nil
@@ -159,6 +183,43 @@ import ChatCore
   showingHistory=false
   followBottom=true
   command(["type":"openConversation","conversationId":id])
+ }
+ func countSavedHistory()->Int {
+  if fixtureMode {return historyEntries.count}
+  return StateStore.countSavedConversations(stateURL:stateURL,env:environment)
+ }
+ func countExpiredHistory(for policy:HistoryRetention)->Int {
+  if fixtureMode {
+   let current=now()
+   return historyEntries.filter {policy.isExpired(updatedAt:$0.updatedAt,relativeTo:current)}.count
+  }
+  return StateStore.countExpiredConversations(retention:policy,now:now(),stateURL:stateURL,env:environment)
+ }
+ func applyHistoryRetention(_ policy:HistoryRetention) {
+  historyRetention=policy
+  if bridge != nil || fixtureMode {
+   command(["type":"applyRetention","retention":policy.rawValue])
+  } else if let pruned=try? StateStore.pruneExpiredConversations(retention:policy,now:now(),stateURL:stateURL,env:environment) {
+   for removedId in pruned.removedIds {draftsByConversation.removeValue(forKey:removedId)}
+   let remaining=ConversationHistory.entries(from:StateStore.loadConversations(stateURL:stateURL,env:environment))
+   let activeRemoved=session.conversationId.map {pruned.removedIds.contains($0)} ?? false
+   if activeRemoved {
+    receive(BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true))
+   }
+   receive(BridgeEvent(type:"history",history:remaining,clearedActiveConversation:activeRemoved))
+  }
+ }
+ func clearAllHistory() {
+  draftsByConversation.removeAll()
+  if bridge != nil || fixtureMode {
+   command(["type":"clearHistory"])
+  } else if let cleared=try? StateStore.clearAllConversations(now:now(),stateURL:stateURL,env:environment) {
+   let activeRemoved=session.conversationId != nil || !session.messages.isEmpty || cleared.removedActive
+   if activeRemoved {
+    receive(BridgeEvent(type:"offlineConversation",conversationId:nil,messages:[],models:[],model:session.selectedModel,notice:session.notice,clearedActiveConversation:true))
+   }
+   receive(BridgeEvent(type:"history",history:[],clearedActiveConversation:activeRemoved))
+  }
  }
  func selectModel(_ model:String) {guard session.beginModelChange(model) else {return};command(["type":"selectModel","model":model])}
  func reloadConfig() {
